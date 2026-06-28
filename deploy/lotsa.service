@@ -1,0 +1,31 @@
+[Unit]
+Description=Lotsa dashboard (CE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lotsa
+Group=lotsa
+# Docker mode (ADR-038): the agent runs in a container; the service shells out to
+# `docker run`, so it needs docker socket access.
+SupplementaryGroups=docker
+# Home must be writable — claude CLI and git write here (sessions, config).
+Environment=HOME=/var/lib/lotsa
+Environment=PATH=/opt/lotsa/venv/bin:/usr/local/bin:/usr/bin:/bin
+# Secrets (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / GITHUB_TOKEN) + LOTSA_ASSUME_YES.
+EnvironmentFile=/etc/lotsa/lotsa.env
+WorkingDirectory=/var/lib/lotsa
+# Bind loopback only — Caddy is the sole public listener (TLS + basic auth).
+# --yes clears the headless GITHUB_TOKEN confirm so the daemon starts unattended.
+ExecStart=/opt/lotsa/venv/bin/lotsa serve --host 127.0.0.1 --port 8420 --data-dir /var/lib/lotsa --yes
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+# NOTE: agent isolation is the Docker container (ADR-038), not this unit's hardening.
+# The orchestrator process itself runs unconfined here (it manages git/worktrees in
+# /var/lib/lotsa); the agent — the untrusted part — runs inside `docker run`.
+
+[Install]
+WantedBy=multi-user.target

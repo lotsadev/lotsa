@@ -1,0 +1,48 @@
+name: Claude Code Review
+
+# Automated AI code review on every pull request, checking the diff against the
+# project's own rules in CONSTITUTION.md and the per-directory CLAUDE.md files.
+#
+# Setup required (one-time, by a maintainer):
+#   1. Install the Claude GitHub App: https://github.com/apps/claude
+#   2. Add a CLAUDE_CODE_OAUTH_TOKEN repository secret — generate it locally with
+#      `claude setup-token` (or swap the input below for an ANTHROPIC_API_KEY).
+#      Settings → Secrets and variables → Actions.
+# The `if:` guard below restricts the job to same-repo PRs, so fork PRs (which
+# never receive secrets) don't trip a failing required check.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Review this pull request as a senior engineer on the Lotsa project.
+
+            Check the diff against the project's own rules in CONSTITUTION.md and
+            the relevant CLAUDE.md files — especially: no secrets/PII in logs,
+            DB, or errors; injection safety; atomic compare-and-swap for state
+            transitions (check `result.won` before side effects); async hygiene;
+            orchestrator-owned git authority; and append-only audit tables.
+
+            Flag correctness bugs, logic errors, security issues, missing test
+            coverage, and any violation of those invariants. Only report issues
+            you are confident are real (cite file:line and suggest a fix). If the
+            diff is clean, say so briefly.
+          claude_args: "--max-turns 12"

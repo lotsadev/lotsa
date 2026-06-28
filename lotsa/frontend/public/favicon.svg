@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- Paper plane: top facet (lit), bottom facet (fold shadow). -->
+  <path d="M44 4 L4 24 L22 28 Z" fill="#863bff"/>
+  <path d="M44 4 L22 28 L30 44 Z" fill="#5a1ec2"/>
+</svg>

@@ -1,0 +1,12 @@
+process: simple
+description: |
+  Small build where the operator knows what they want but the agent should
+  think through the implementation. Differs from quickfix in coder framing:
+  "build this thing" rather than "execute this instruction."
+jobs:
+  - name: coding
+    type: agent
+    prompt: coding
+flows:
+  main:
+    steps: [coding]

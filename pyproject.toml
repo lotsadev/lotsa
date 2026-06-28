@@ -1,0 +1,81 @@
+[project]
+name = "lotsa"
+version = "0.1.0"
+description = "Lotsa — a local task runner and web dashboard for Claude Code"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8,<9",
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "pyyaml>=6,<7",
+    "uvicorn[standard]>=0.34,<1",
+    # ADR-028: SDK-shaped agent runner (ClaudeAgentSDKRunner). Imported
+    # lazily inside run(), so operators who don't select the SDK runner
+    # incur no runtime cost. Not a pure-API client: it drives the Claude
+    # Code CLI/Node runtime under the hood (honours ANTHROPIC_BASE_URL, no
+    # mandatory outbound calls beyond the configured endpoint). Self-hostable
+    # footnote in CLAUDE.md; full notes in ADR-028.
+    "claude-agent-sdk>=0.1,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.25,<1",
+    "pytest-playwright>=0.5,<1",
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+    "build>=1,<2",
+]
+
+[project.scripts]
+lotsa = "lotsa.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Build the dashboard bundle at packaging time (hatch_build.py) and include the
+# gitignored output in the wheel, so `pip install lotsa` needs no Node (ADR-036).
+[tool.hatch.build]
+artifacts = ["lotsa/server/static/dist/**"]
+
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lotsa", "rigg"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = []
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "*.tests.*"]
+disallow_untyped_defs = false
+
+# claude-agent-sdk (ADR-028) ships no type stubs as of this writing.
+[[tool.mypy.overrides]]
+module = ["claude_agent_sdk.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["lotsa/tests", "rigg/tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"

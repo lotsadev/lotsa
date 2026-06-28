@@ -1,0 +1,29 @@
+# Reference Caddyfile — install.sh generates the live /etc/caddy/Caddyfile with
+# your domain, basic-auth user, and a bcrypt password hash substituted in.
+#
+# With a real domain pointed at this box, Caddy obtains a Let's Encrypt cert
+# automatically (no extra config). Basic auth sits in front of the loopback-bound
+# Lotsa dashboard.
+
+your-domain.example.com {
+    encode zstd gzip
+
+    basic_auth {
+        # `caddy hash-password --plaintext '<pass>'` produces the bcrypt hash.
+        your-user $2a$14$REPLACED_WITH_BCRYPT_HASH
+    }
+
+    # flush_interval -1 keeps the dashboard's live updates (SSE) unbuffered.
+    reverse_proxy 127.0.0.1:8420 {
+        flush_interval -1
+    }
+}
+
+# IP-only fallback (no domain): replace the site address with `https://` and add
+# `tls internal` for a self-signed cert:
+#
+# https:// {
+#     tls internal
+#     basic_auth { your-user $2a$14$... }
+#     reverse_proxy 127.0.0.1:8420 { flush_interval -1 }
+# }

@@ -1,0 +1,8 @@
+{"type":"queue-operation","timestamp":"2026-06-14T10:00:00.000Z","operation":"enqueue"}
+{"type":"assistant","timestamp":"2026-06-14T10:00:01.000Z","sessionId":"sess-fixture-001","uuid":"u2","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me start by analyzing the problem.\nI need to read the config first.","signature":"sig"}]}}
+{"type":"assistant","timestamp":"2026-06-14T10:00:02.000Z","sessionId":"sess-fixture-001","uuid":"u3","message":{"role":"assistant","content":[{"type":"text","text":"I'll read the config file first."}]}}
+{"type":"assistant","timestamp":"2026-06-14T10:00:03.000Z","sessionId":"sess-fixture-001","uuid":"u4","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pytest -q tests/test_foo.py","description":"run tests"}}]}}
+{"type":"user","timestamp":"2026-06-14T10:00:04.000Z","sessionId":"sess-fixture-001","uuid":"u5","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"All tests passed","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-06-14T10:00:05.000Z","sessionId":"sess-fixture-001","uuid":"u6","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/repo/config.py"}}]}}
+{"type":"user","timestamp":"2026-06-14T10:00:06.000Z","sessionId":"sess-fixture-001","uuid":"u7","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"FileNotFoundError: /repo/config.py","is_error":true}]}}
+{"type":"attachment","timestamp":"2026-06-14T10:00:07.000Z","attachment":{"kind":"image"}}

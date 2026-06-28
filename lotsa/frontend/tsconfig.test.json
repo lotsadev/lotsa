@@ -1,0 +1,20 @@
+{
+  // Type-checks the whole src tree *including* test files. The production
+  // build (tsconfig.app.json, run via `tsc -b`) excludes `*.test.ts(x)` so
+  // they never reach the bundle; Vitest then runs them through esbuild,
+  // which strips types without checking them. That leaves test files with
+  // no compile-time safety. This config closes that gap: `npm run typecheck`
+  // type-checks production and test code together.
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo",
+    "noEmit": true
+  },
+  // `src/test/setup.ts` imports `@testing-library/jest-dom/vitest`, which
+  // augments Vitest's `Assertion` type with the jest-dom matchers
+  // (`toBeInTheDocument`, etc.). It lives under `src`, so the include below
+  // already pulls it into the compilation and the augmentation applies to
+  // every test file.
+  "include": ["src"],
+  "exclude": []
+}

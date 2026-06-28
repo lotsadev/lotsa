@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-06-14T11:00:00.000Z","sessionId":"sess-complete-001","uuid":"c1","message":{"role":"assistant","content":[{"type":"text","text":"Done implementing."}]}}
+{"type":"summary","summary":"Implemented feature X","leafUuid":"c1"}

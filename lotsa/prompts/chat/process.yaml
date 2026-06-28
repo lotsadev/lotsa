@@ -1,0 +1,16 @@
+process: chat
+description: |
+  Exploration and triage. Talk through an idea with the operator until the
+  next step is clear, then suggest promoting to the matching process. One
+  conversational step that runs as a REPL — no completion marker, no commit
+  pressure. Stays open until the operator promotes or abandons it.
+jobs:
+  - name: chat
+    type: agent
+    prompt: chat
+    conversational: true
+    # No output rule / completion marker: the chat step never self-completes.
+    # It runs as a REPL until the operator promotes (ADR-027) or abandons it.
+flows:
+  main:
+    steps: [chat]
