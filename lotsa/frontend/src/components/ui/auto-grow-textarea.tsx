@@ -9,6 +9,8 @@ interface AutoGrowTextareaProps
   onSubmit: () => void
   /** Max visible rows before the field scrolls internally. Default 10. */
   maxRows?: number
+  /** Min visible rows the field renders at rest. Default 1. */
+  minRows?: number
 }
 
 /**
@@ -24,6 +26,7 @@ interface AutoGrowTextareaProps
 function AutoGrowTextarea({
   onSubmit,
   maxRows = 10,
+  minRows = 1,
   className,
   value,
   ...props
@@ -50,6 +53,7 @@ function AutoGrowTextarea({
       (parseFloat(styles.borderTopWidth) || 0) +
       (parseFloat(styles.borderBottomWidth) || 0)
     const maxHeight = lineHeight * maxRows + paddingTop + paddingBottom
+    const minHeight = lineHeight * minRows + paddingTop + paddingBottom
 
     // ``scrollHeight`` excludes the border, but ``box-sizing: border-box``
     // (the Tailwind default, and this field has a 1px border) means the
@@ -57,9 +61,14 @@ function AutoGrowTextarea({
     // content + padding exactly instead of clipping the bottom ~2px. The
     // overflow comparison stays in border-excluded terms (both sides exclude
     // it), so the cap still triggers at maxRows lines of content.
-    el.style.height = `${Math.min(el.scrollHeight, maxHeight) + borderY}px`
+    //
+    // Floor at ``minRows`` first, then cap at ``maxRows``, so the field rests
+    // at minRows height and grows with content up to the cap. ``minHeight``
+    // never affects the overflow toggle (a field padded up to its floor still
+    // has scrollHeight < maxHeight), so the cap still triggers at maxRows.
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, minHeight), maxHeight) + borderY}px`
     el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden"
-  }, [maxRows])
+  }, [maxRows, minRows])
 
   // useLayoutEffect (not useEffect) avoids a one-frame flash of the wrong
   // height. Re-runs on every controlled-value change, so grow/shrink/reset

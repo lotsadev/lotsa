@@ -185,3 +185,131 @@ describe('AutoGrowTextarea — auto-grow height', () => {
     expect(field.style.overflowY).toBe('hidden')
   })
 })
+
+describe('AutoGrowTextarea — minRows floor', () => {
+  // Same deterministic layout stubs as the auto-grow-height suite: line-height
+  // 20px + 8px top/bottom padding. So a minRows floor of N is 20*N + 16 px, and
+  // the default 10-line cap stays 20*10 + 16 = 216px.
+  let mockScrollHeight = 0
+
+  beforeEach(() => {
+    Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => mockScrollHeight,
+    })
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      lineHeight: '20px',
+      paddingTop: '8px',
+      paddingBottom: '8px',
+      fontSize: '16px',
+    } as unknown as CSSStyleDeclaration)
+  })
+
+  afterEach(() => {
+    delete (HTMLTextAreaElement.prototype as unknown as { scrollHeight?: unknown }).scrollHeight
+    vi.restoreAllMocks()
+  })
+
+  it('floors the field at minRows when the content is shorter', () => {
+    // Content height 40px is well below the 7-row floor (20*7 + 16 = 156px),
+    // so the field renders at the floor, not at the content height.
+    mockScrollHeight = 40
+    render(
+      <AutoGrowTextarea value="x" onChange={() => {}} onSubmit={() => {}} minRows={7} />,
+    )
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+
+    expect(field.style.height).toBe('156px')
+    // Below the cap, so no internal scroll.
+    expect(field.style.overflowY).toBe('hidden')
+  })
+
+  it('honours a minRows floor other than the new-task page default', () => {
+    // minRows=3 -> floor = 20*3 + 16 = 76px. Content of 20px is below it.
+    mockScrollHeight = 20
+    render(
+      <AutoGrowTextarea value="x" onChange={() => {}} onSubmit={() => {}} minRows={3} />,
+    )
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+
+    expect(field.style.height).toBe('76px')
+    expect(field.style.overflowY).toBe('hidden')
+  })
+
+  it('grows past the floor when content exceeds minRows but stays under the cap', () => {
+    // Content 180px sits between the 7-row floor (156px) and the 10-row cap
+    // (216px): the field tracks the content, not the floor.
+    mockScrollHeight = 180
+    render(
+      <AutoGrowTextarea value={'a\nb\nc'} onChange={() => {}} onSubmit={() => {}} minRows={7} />,
+    )
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+
+    expect(field.style.height).toBe('180px')
+    expect(field.style.overflowY).toBe('hidden')
+  })
+
+  it('still caps at maxRows and scrolls when content exceeds the cap, floor notwithstanding', () => {
+    // The floor must never suppress the existing maxRows cap / overflow trigger.
+    mockScrollHeight = 1000
+    render(
+      <AutoGrowTextarea value={'many\nlines'} onChange={() => {}} onSubmit={() => {}} minRows={7} />,
+    )
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+
+    expect(field.style.height).toBe('216px')
+    expect(field.style.overflowY).toBe('auto')
+  })
+
+  it('shrinks back to the floor (never below) as content is removed', () => {
+    mockScrollHeight = 1000
+    const { rerender } = render(
+      <AutoGrowTextarea value={'lots\nof\ntext'} onChange={() => {}} onSubmit={() => {}} minRows={7} />,
+    )
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+    expect(field.style.height).toBe('216px')
+
+    mockScrollHeight = 30
+    rerender(
+      <AutoGrowTextarea value={'x'} onChange={() => {}} onSubmit={() => {}} minRows={7} />,
+    )
+
+    // Shrinks toward the floor, not down to the 30px content height.
+    expect(field.style.height).toBe('156px')
+    expect(field.style.overflowY).toBe('hidden')
+  })
+
+  it('keeps the border-box correction when flooring (border added on top of the floor)', () => {
+    // 1px top + 1px bottom border + box-sizing: border-box. Floor of 7 rows is
+    // 156px in border-excluded terms; the height we set adds the 2px border so
+    // the interior isn't clipped: 156 + 2 = 158px.
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      lineHeight: '20px',
+      paddingTop: '8px',
+      paddingBottom: '8px',
+      borderTopWidth: '1px',
+      borderBottomWidth: '1px',
+      fontSize: '16px',
+    } as unknown as CSSStyleDeclaration)
+    mockScrollHeight = 40
+    render(
+      <AutoGrowTextarea value="x" onChange={() => {}} onSubmit={() => {}} minRows={7} />,
+    )
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+
+    expect(field.style.height).toBe('158px')
+    expect(field.style.overflowY).toBe('hidden')
+  })
+
+  it('defaults to a single-row floor so the chat-bar surface is unchanged', () => {
+    // No minRows -> default of 1 -> floor = 20*1 + 16 = 36px, below the 40px
+    // content, so the field tracks the content exactly as it did before the
+    // floor existed. This guards the chat-bar consumer from regressing.
+    mockScrollHeight = 40
+    render(<AutoGrowTextarea value="x" onChange={() => {}} onSubmit={() => {}} />)
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+
+    expect(field.style.height).toBe('40px')
+    expect(field.style.overflowY).toBe('hidden')
+  })
+})

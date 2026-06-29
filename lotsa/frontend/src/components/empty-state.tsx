@@ -74,31 +74,35 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
 
       <form
         onSubmit={handleSubmit}
-        className="flex w-full max-w-lg items-end gap-2"
+        className="flex w-full max-w-2xl flex-col gap-2"
       >
-        <ProjectPicker
-          value={project}
-          onChange={setProjectOverride}
-          disabled={isCreating}
-          className="w-40 shrink-0"
-        />
-        <ProcessPicker
-          value={process}
-          onChange={setProcess}
-          disabled={isCreating}
-          className="w-40 shrink-0"
-        />
         <AutoGrowTextarea
           value={message}
           onChange={(e) => setMessage(e.target.value)}
           onSubmit={() => handleSubmit()}
           placeholder="Describe your task..."
           disabled={isCreating}
-          className="flex-1"
+          minRows={7}
+          className="w-full"
         />
-        <Button type="submit" size="icon" disabled={!message.trim() || isCreating}>
-          <Send className="size-4" />
-        </Button>
+        <div className="flex items-center gap-2">
+          <ProjectPicker
+            value={project}
+            onChange={setProjectOverride}
+            disabled={isCreating}
+            className="w-40 shrink-0"
+          />
+          <ProcessPicker
+            value={process}
+            onChange={setProcess}
+            disabled={isCreating}
+            className="w-40 shrink-0"
+          />
+          <div className="flex-1" />
+          <Button type="submit" size="icon" disabled={!message.trim() || isCreating}>
+            <Send className="size-4" />
+          </Button>
+        </div>
       </form>
     </div>
   )
