@@ -120,8 +120,10 @@ export function StageBar({ task, flow, totals }: StageBarProps) {
         )}
       </div>
 
-      {/* Row 2: Project + branch + worktree (click to copy) + PR badge */}
-      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+      {/* Row 2: Project + branch + worktree (click to copy) + PR badge.
+          ``overflow-x-auto`` lets the long branch/worktree metadata scroll
+          rather than overflow the viewport on narrow screens. */}
+      <div className="flex items-center gap-3 overflow-x-auto text-xs text-muted-foreground">
         {task.project_name && (
           <span className="flex items-center gap-1" title={task.project_path}>
             <Boxes className="size-3.5" />
@@ -160,7 +162,7 @@ export function StageBar({ task, flow, totals }: StageBarProps) {
       {/* Row 4: Workflow steps (monospace) + jump selector */}
       {steps.length > 0 && (
         <div className="flex items-center gap-2 font-mono text-xs">
-          <div className="flex items-center gap-1 overflow-x-auto">
+          <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
             {steps.map((step, i) => {
               const isActive = i === activeIndex
               const isCompleted = activeIndex >= 0 && i < activeIndex
