@@ -139,10 +139,14 @@ export function ChatInput({ data }: ChatInputProps) {
   // approve() enforces — rather than proxying via "has an output artifact",
   // so a future non-evaluate step that declares an output can't flash Accept
   // and then 400.
-  // Accept only appears at a GATE: a step with an output artifact to accept, or
-  // an evaluate gate. A plain conversational REPL (chat) has neither and is ended
-  // by Promote/Abandon, not Accept — so no button there (matches approve()).
-  const isGate = (requiredArtifact !== null && requiredArtifact in artifacts) || currentStep?.evaluate === true
+  // Accept only appears at a GATE — the backend's ResolvedJob.is_approval_gate:
+  // a step with an output artifact, an evaluate gate, or a conversational step
+  // with a forward advance rule (e.g. verify). A plain conversational REPL (chat)
+  // has none and is ended by Promote/Abandon, not Accept (matches approve()).
+  // When the gate produces an output artifact, also require it present so Accept
+  // can't fire before e.g. the spec exists; evaluate/verify gates have no artifact.
+  const isGate =
+    currentStep?.is_gate === true && (requiredArtifact === null || requiredArtifact in artifacts)
   const canApprove =
     task.current_step !== null &&
     data.flow !== null &&

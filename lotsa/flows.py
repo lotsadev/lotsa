@@ -181,6 +181,28 @@ class ResolvedJob:
         """Backward compat alias — used as the ``job_type`` discriminator for events."""
         return self.name
 
+    @property
+    def is_approval_gate(self) -> bool:
+        """Whether the operator can **Accept** this step to advance it.
+
+        True for a step that produces an ``output`` artifact (e.g. spec), an
+        ``evaluate`` gate (e.g. plan), or a *conversational* step with a forward
+        (``next``) advance rule (e.g. verify). A plain conversational REPL
+        (``chat``) has none of these — it is ended by promote/abandon, not
+        Accept.
+
+        Regression note: the Accept-on-chat fix narrowed the gate test to
+        ``output or evaluate``, which also excluded verify (conversational, no
+        output, not evaluate) and removed its Accept button. The
+        ``conversational + next-rule`` clause restores verify without
+        re-showing Accept on the rule-less chat REPL.
+        """
+        return (
+            self.output is not None
+            or self.evaluate
+            or (self.conversational and any(r.target == "next" for r in self.rules))
+        )
+
 
 # Backward compat alias for the orchestrator's import surface.
 FlowStep = ResolvedJob

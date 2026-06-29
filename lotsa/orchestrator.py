@@ -1751,11 +1751,14 @@ class OrchestratorService:
         if row.status == "needs_input" and not step.evaluate:
             raise ApproveNotAllowed("approve() from needs_input is only valid at an evaluate gate")
         # Approve only applies at a GATE — a step with an ``output`` artifact to
-        # accept or an ``evaluate`` gate. A plain conversational REPL (``chat``)
-        # has neither and is ended by promoting or abandoning it (ADR-034/027),
-        # not by approval — approving it would just complete the task with nothing
-        # to accept. (This is why the chat panel must not show an Accept button.)
-        if not step.output and not step.evaluate:
+        # accept, an ``evaluate`` gate, or a conversational step with a forward
+        # (``next``) advance rule (e.g. verify). A plain conversational REPL
+        # (``chat``) has none of these and is ended by promoting or abandoning it
+        # (ADR-034/027), not by approval — approving it would just complete the
+        # task with nothing to accept. (This is why the chat panel must not show
+        # an Accept button there.) Predicate lives on ResolvedJob.is_approval_gate
+        # so this guard and the FlowStep API serialization can never diverge.
+        if not step.is_approval_gate:
             raise ApproveNotAllowed(
                 "This step is not an approval gate — nothing to accept. End a chat task by promoting or abandoning it."
             )

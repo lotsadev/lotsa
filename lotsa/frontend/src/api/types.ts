@@ -49,6 +49,10 @@ export interface FlowStep {
   evaluate: boolean
   output: string | null
   inputs: string[]
+  // Operator can Accept this step to advance it (output artifact, evaluate gate,
+  // or a conversational step with a forward advance rule, e.g. verify). Backend
+  // is the source of truth (ResolvedJob.is_approval_gate).
+  is_gate: boolean
 }
 
 export interface Flow {

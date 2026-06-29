@@ -535,6 +535,36 @@ class TestApprove:
         with pytest.raises(ApproveNotAllowed, match="not an approval gate"):
             run(service.approve(task.id))
 
+    def test_approve_advances_conversational_verify_gate(self, service, run):
+        """Regression: verify is conversational with a forward (^VERIFIED:→next)
+        rule but no output artifact and is not an evaluate gate. The Accept-on-chat
+        fix narrowed the gate test to ``output or evaluate``, which dropped verify's
+        Accept button and made approve() reject it. A conversational step with a
+        next-rule IS an accept-gate — approve() must advance it (it used to raise)."""
+        from lotsa.flows import OutputRule
+
+        task = run(service.db.create_task("Verify Gate", state="coding"))
+        step = FlowStep(
+            name="verify",
+            prompt_name="verify",
+            resume_session=False,
+            evaluate=False,  # not an evaluate gate
+            queue_state="backlog",
+            active_state="coding",
+            success_state="complete",
+            conversational=True,
+            rules=[OutputRule(source="stdout", pattern="^VERIFIED:", target="next")],
+            # no output artifact — gates on the forward rule alone
+        )
+        service.flow.jobs.append(step)
+        run(service.db.update_task(task.id, status="waiting", current_step="verify", state="coding"))
+
+        run(service.approve(task.id))  # must NOT raise (the regression made it reject)
+
+        updated = run(service.db.get_task(task.id))
+        assert updated is not None
+        assert updated.status != "waiting", "Accept must advance past the conversational verify gate"
+
 
 class TestRevise:
     def test_revise_re_dispatches(self, service, run):

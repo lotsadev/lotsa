@@ -107,6 +107,10 @@ class FlowStepResponse(BaseModel):
     evaluate: bool = False
     output: str | None = None
     inputs: list[str] = []
+    # Whether the operator can Accept this step to advance it (output artifact,
+    # evaluate gate, or a conversational step with a forward advance rule, e.g.
+    # verify). The chat panel shows the Accept button iff this is true.
+    is_gate: bool = False
 
 
 class FlowResponse(BaseModel):

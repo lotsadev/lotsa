@@ -175,6 +175,7 @@ async def _build_task_detail(service: OrchestratorService, task_id: str) -> Task
                     evaluate=s.evaluate,
                     output=s.output,
                     inputs=s.inputs,
+                    is_gate=s.is_approval_gate,
                 )
                 for s in steps
             ],
@@ -339,6 +340,7 @@ async def get_flow(request: Request) -> FlowResponse:
                 evaluate=s.evaluate,
                 output=s.output,
                 inputs=s.inputs,
+                is_gate=s.is_approval_gate,
             )
             for s in flow.steps
         ],

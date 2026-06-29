@@ -1119,3 +1119,34 @@ def test_model_resolved_in_subflow_step(tmp_path):
     )
     review = process.flows["pr_fix"].steps[0]
     assert review.model == "opus"
+
+
+def _gate_job(**kw: object) -> ResolvedJob:
+    base = dict(
+        name="x", prompt_name="x", resume_session=False, evaluate=False,
+        queue_state="q", active_state="a", success_state="s",
+    )
+    base.update(kw)
+    return ResolvedJob(**base)  # type: ignore[arg-type]
+
+
+def test_is_approval_gate():
+    """The operator-Accept predicate: an output artifact, an evaluate gate, OR a
+    conversational step with a forward (next) rule (verify). A rule-less chat REPL
+    and a non-conversational auto-routing step are NOT gates. Regression guard for
+    the Accept-on-chat narrowing that dropped verify's Accept button."""
+    nxt = OutputRule(source="stdout", pattern="^VERIFIED:", target="next")
+    back = OutputRule(source="stdout", pattern="^NEEDS_CODE:", target="code")
+    # verify: conversational + forward rule, no output, not evaluate
+    assert _gate_job(conversational=True, rules=[nxt, back]).is_approval_gate is True
+    # spec: produces an output artifact
+    assert _gate_job(conversational=True, output="spec", rules=[nxt]).is_approval_gate is True
+    # plan: evaluate gate
+    assert _gate_job(evaluate=True).is_approval_gate is True
+    # chat REPL: conversational, no rules → not a gate
+    assert _gate_job(conversational=True, rules=[]).is_approval_gate is False
+    # non-conversational agent step (code/review): auto-routes on its rule, not an
+    # operator gate even though it has a next-rule
+    assert _gate_job(conversational=False, rules=[nxt]).is_approval_gate is False
+    # conversational step whose only rule routes backward → no forward accept
+    assert _gate_job(conversational=True, rules=[back]).is_approval_gate is False
