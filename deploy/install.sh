@@ -19,6 +19,22 @@ die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo ./install.sh)"
 
+# ── Platform preflight — fail fast, before any mutation ───────────────────────
+# The installer targets Debian/Ubuntu (apt) on a systemd host. Detect and refuse
+# on anything else rather than half-applying apt/systemctl/ufw commands and
+# leaving a confusing partial state. (ADR-042 — `lotsa deploy` surfaces this up
+# front; other platforms are designed-for but not yet shipped.)
+[ "$(uname -s)" = "Linux" ] || die "lotsa deploy targets a Linux server (Debian/Ubuntu + systemd); detected $(uname -s)."
+# shellcheck disable=SC1091
+. /etc/os-release 2>/dev/null || true
+case " ${ID:-} ${ID_LIKE:-} " in
+  *" debian "* | *" ubuntu "*) : ;;
+  *) die "unsupported distro '${ID:-unknown}' — the installer targets Debian/Ubuntu (apt + systemd). See the README for the manual path on other systems." ;;
+esac
+command -v apt-get >/dev/null || die "apt-get not found — the installer requires a Debian/Ubuntu (apt) host."
+command -v systemctl >/dev/null || die "systemd (systemctl) not found — the installer manages lotsa as a systemd unit."
+ok "platform: ${PRETTY_NAME:-Debian/Ubuntu} (apt + systemd)"
+
 # ── Config ──────────────────────────────────────────────────────────────────
 HERE="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$HERE/deploy.env" ]; then
@@ -35,9 +51,8 @@ LOTSA_ADMIN_EMAIL="${LOTSA_ADMIN_EMAIL:-}"
 if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   die "set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in deploy.env"
 fi
-if [ -z "${LOTSA_WHEEL:-}" ] && [ -z "${LOTSA_GIT:-}" ]; then
-  die "set LOTSA_WHEEL (path to a built wheel) or LOTSA_GIT (repo url) in deploy.env"
-fi
+# Install source is optional: default to PyPI (`pip install lotsa`); LOTSA_WHEEL /
+# LOTSA_GIT override it for dev/source deploys (see the install block below).
 
 LOTSA_USER=lotsa
 APP_DIR=/opt/lotsa
@@ -108,14 +123,21 @@ log "Installing Lotsa"
 if [ ! -d "$VENV" ]; then
   "$PYBIN" -m venv "$VENV"
 fi
+# Install source precedence: an explicit local wheel (dev / `lotsa deploy
+# --wheel`), then an explicit git url, then PyPI (the default — what a
+# `pip install lotsa` user gets). LOTSA_VERSION pins the PyPI release.
 "$VENV/bin/pip" install --quiet --upgrade pip
 if [ -n "${LOTSA_WHEEL:-}" ]; then
   [ -f "$LOTSA_WHEEL" ] || die "LOTSA_WHEEL not found: $LOTSA_WHEEL"
   "$VENV/bin/pip" install --quiet --force-reinstall "$LOTSA_WHEEL"
   ok "installed from wheel ($(basename "$LOTSA_WHEEL"))"
-else
+elif [ -n "${LOTSA_GIT:-}" ]; then
   "$VENV/bin/pip" install --quiet --force-reinstall "git+$LOTSA_GIT"
   ok "installed from git ($LOTSA_GIT)"
+else
+  spec="lotsa${LOTSA_VERSION:+==$LOTSA_VERSION}"
+  "$VENV/bin/pip" install --quiet --force-reinstall "$spec"
+  ok "installed from PyPI ($spec)"
 fi
 chown -R "$LOTSA_USER:$LOTSA_USER" "$APP_DIR"
 

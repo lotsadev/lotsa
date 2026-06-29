@@ -128,6 +128,7 @@ contract or introduces a new top-level dependency.
 | 039 | Outcome-based step advancement — evaluate the agent's result against the step goal when no stdout marker matched, instead of silently parking (**Proposed** — post-launch; mandatory-marker prompt footer shipped as the stopgap) | CE |
 | 040 | Restart-resilient orchestration — the DB is the state of record; resume in-flight agents (and idempotent step re-runs) instead of blocking on restart (**Proposed** — post-launch, high priority; ships paired with ADR-033) | CE |
 | 041 | Project toolchain & environment provisioning — declared `setup`/`test`/`build`/`lint` + per-project cache + optional per-project `image:`; egress Open by default and pluggable (ADR-031's upstream Layer 0) (**Proposed** — post-launch) | CE |
+| 042 | `lotsa deploy` CLI — bundle the deploy assets in the wheel, ship + run the installer over ssh from a declarative `deploy.yaml`; PyPI install by default; Debian/Ubuntu + systemd target with a fail-fast platform preflight (**Implemented**) | CE |
 
 Design rationale for a specific area belongs in that directory's `CLAUDE.md`
 or in an ADR. This index is the registry.
