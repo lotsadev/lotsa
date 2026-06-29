@@ -1123,8 +1123,13 @@ def test_model_resolved_in_subflow_step(tmp_path):
 
 def _gate_job(**kw: object) -> ResolvedJob:
     base = dict(
-        name="x", prompt_name="x", resume_session=False, evaluate=False,
-        queue_state="q", active_state="a", success_state="s",
+        name="x",
+        prompt_name="x",
+        resume_session=False,
+        evaluate=False,
+        queue_state="q",
+        active_state="a",
+        success_state="s",
     )
     base.update(kw)
     return ResolvedJob(**base)  # type: ignore[arg-type]
