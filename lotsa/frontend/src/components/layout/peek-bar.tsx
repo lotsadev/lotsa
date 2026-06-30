@@ -13,7 +13,7 @@ interface PeekBarProps {
 // needs no data fetching of its own.
 export function PeekBar({ data, onOpen }: PeekBarProps) {
   const step = data.task.current_step
-  const artifactCount = Object.keys(data.artifacts ?? {}).length
+  const artifactCount = Object.keys(data.artifacts).length
 
   return (
     <button

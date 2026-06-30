@@ -88,9 +88,13 @@ function MobileShell(props: AppLayoutProps) {
   // mobile; its open state is owned here and shared by the header button and
   // the peek bar. ``h-dvh`` tracks the dynamic viewport so the layout shrinks
   // when the on-screen keyboard opens, keeping the chat input visible (AC#6).
+  // ``!min-h-0`` overrides SidebarProvider's base ``min-h-svh``: otherwise CSS
+  // resolves the height to ``max(100dvh, 100svh)`` and the container stays at
+  // ``100svh`` when the keyboard shrinks ``dvh``, hiding the input. Same
+  // override the DesktopShell SidebarProvider uses.
   const [rightOpen, setRightOpen] = useState(false)
   return (
-    <SidebarProvider className="h-dvh flex-col overflow-hidden">
+    <SidebarProvider className="h-dvh !min-h-0 flex-col overflow-hidden">
       <MobileShellInner {...props} rightOpen={rightOpen} setRightOpen={setRightOpen} />
     </SidebarProvider>
   )
