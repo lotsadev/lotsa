@@ -155,9 +155,14 @@ function MobileShellInner({
       {/* Right panel as a tap-to-open bottom sheet (~85vh). */}
       <Sheet open={rightOpen} onOpenChange={setRightOpen}>
         <SheetContent side="bottom" className="flex h-[85vh] flex-col gap-0 p-0">
-          <SheetHeader className="sr-only">
-            <SheetTitle>Task panel</SheetTitle>
-            <SheetDescription>Artifacts, changes, and activity</SheetDescription>
+          {/* Visible header bar so the Sheet's built-in close button (absolute
+              right-4 top-4) has its own row instead of overlapping RightPanel's
+              full-width tab bar. The description stays sr-only for a11y. */}
+          <SheetHeader className="flex shrink-0 flex-row items-center justify-between space-y-0 border-b border-border px-4 py-3 pr-12 text-left">
+            <SheetTitle className="text-sm font-medium">Task panel</SheetTitle>
+            <SheetDescription className="sr-only">
+              Artifacts, changes, and activity
+            </SheetDescription>
           </SheetHeader>
           <div className="min-h-0 flex-1">
             <RightPanel taskId={selectedTaskId} />
