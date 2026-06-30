@@ -85,21 +85,28 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
           minRows={7}
           className="w-full"
         />
-        <div className="flex items-center gap-2">
+        {/* Below 768px the pickers stack full-width so they + Send don't
+            overflow; at md they return to the side-by-side fixed-width row. */}
+        <div className="flex flex-col gap-2 md:flex-row md:items-center">
           <ProjectPicker
             value={project}
             onChange={setProjectOverride}
             disabled={isCreating}
-            className="w-40 shrink-0"
+            className="w-full md:w-40 md:shrink-0"
           />
           <ProcessPicker
             value={process}
             onChange={setProcess}
             disabled={isCreating}
-            className="w-40 shrink-0"
+            className="w-full md:w-40 md:shrink-0"
           />
-          <div className="flex-1" />
-          <Button type="submit" size="icon" disabled={!message.trim() || isCreating}>
+          <div className="hidden md:block md:flex-1" />
+          <Button
+            type="submit"
+            size="icon"
+            disabled={!message.trim() || isCreating}
+            className="shrink-0 self-end md:self-auto"
+          >
             <Send className="size-4" />
           </Button>
         </div>

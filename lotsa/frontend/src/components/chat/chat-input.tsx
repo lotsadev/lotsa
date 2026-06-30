@@ -256,12 +256,16 @@ export function ChatInput({ data }: ChatInputProps) {
         </div>
       )}
 
+      {/* ``flex-wrap`` lets the action button group drop below the textarea on
+          narrow screens instead of overflowing a single line; ``min-w-0`` on
+          the textarea lets it shrink. On desktop there's room, so it stays on
+          one line — unchanged. */}
       <form
         onSubmit={(e) => {
           e.preventDefault()
           submitForStatus()
         }}
-        className="flex items-end gap-2"
+        className="flex flex-wrap items-end gap-2"
       >
         <AutoGrowTextarea
           value={inputValue}
@@ -269,72 +273,74 @@ export function ChatInput({ data }: ChatInputProps) {
           onSubmit={submitForStatus}
           placeholder={placeholders[task.status] ?? ''}
           disabled={isPending || task.status === 'complete' || task.status === 'abandoned'}
-          className="flex-1"
+          className="min-w-0 flex-1"
         />
-        <Button type="submit" size="sm" disabled={submitDisabled}>
-          Send
-        </Button>
-        {task.status === 'working' && (
-          <Button
-            type="button"
-            size="sm"
-            variant="destructive"
-            onClick={() => stopMutation.mutate()}
-            disabled={isPending}
-          >
-            Stop
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="submit" size="sm" disabled={submitDisabled}>
+            Send
           </Button>
-        )}
-        {canApprove && (
-          <Button
-            type="button"
-            size="sm"
-            variant="secondary"
-            onClick={() => approveMutation.mutate()}
-            disabled={isPending}
-          >
-            Accept
-          </Button>
-        )}
-        {/* Bare Retry is for plain blocks (crash, sync, agent error). When a
-            guard override is available, its "Acknowledge & continue" button
-            both clears the guard AND resumes (ADR-019 revised) — showing Retry
-            too would be the redundant two-button confusion we removed. */}
-        {task.status === 'blocked' && !isRebasing && availableOverrides.length === 0 && (
-          <Button
-            type="button"
-            size="sm"
-            variant="destructive"
-            onClick={() => retryMutation.mutate()}
-            disabled={isPending}
-          >
-            Retry
-          </Button>
-        )}
-        {availableOverrides.map((ov) => (
-          <Button
-            key={ov.guard_name}
-            type="button"
-            size="sm"
-            variant="secondary"
-            title={ov.description}
-            onClick={() => overrideMutation.mutate(ov.guard_name)}
-            disabled={isPending}
-          >
-            {ov.label}
-          </Button>
-        ))}
-        {canPromote && (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => setPromoteOpen(true)}
-            disabled={isPending}
-          >
-            Promote
-          </Button>
-        )}
+          {task.status === 'working' && (
+            <Button
+              type="button"
+              size="sm"
+              variant="destructive"
+              onClick={() => stopMutation.mutate()}
+              disabled={isPending}
+            >
+              Stop
+            </Button>
+          )}
+          {canApprove && (
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={() => approveMutation.mutate()}
+              disabled={isPending}
+            >
+              Accept
+            </Button>
+          )}
+          {/* Bare Retry is for plain blocks (crash, sync, agent error). When a
+              guard override is available, its "Acknowledge & continue" button
+              both clears the guard AND resumes (ADR-019 revised) — showing Retry
+              too would be the redundant two-button confusion we removed. */}
+          {task.status === 'blocked' && !isRebasing && availableOverrides.length === 0 && (
+            <Button
+              type="button"
+              size="sm"
+              variant="destructive"
+              onClick={() => retryMutation.mutate()}
+              disabled={isPending}
+            >
+              Retry
+            </Button>
+          )}
+          {availableOverrides.map((ov) => (
+            <Button
+              key={ov.guard_name}
+              type="button"
+              size="sm"
+              variant="secondary"
+              title={ov.description}
+              onClick={() => overrideMutation.mutate(ov.guard_name)}
+              disabled={isPending}
+            >
+              {ov.label}
+            </Button>
+          ))}
+          {canPromote && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setPromoteOpen(true)}
+              disabled={isPending}
+            >
+              Promote
+            </Button>
+          )}
+        </div>
       </form>
 
       <PromoteDialog taskId={task.id} open={promoteOpen} onOpenChange={setPromoteOpen} />

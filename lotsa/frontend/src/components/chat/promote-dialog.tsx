@@ -71,7 +71,10 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      {/* On mobile the centered dialog caps to the viewport width and scrolls
+          vertically so the destination picker + per-input fields never
+          overflow a narrow screen. */}
+      <DialogContent className="max-h-[85dvh] overflow-y-auto max-md:max-w-[calc(100vw-1rem)]">
         <DialogHeader>
           <DialogTitle>Promote task to another process</DialogTitle>
           <DialogDescription>

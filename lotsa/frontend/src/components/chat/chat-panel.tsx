@@ -3,12 +3,16 @@ import { useTask } from '@/hooks/use-task'
 import { ChatMessage } from './chat-message'
 import { StageBar } from './stage-bar'
 import { ChatInput } from './chat-input'
+import { PeekBar } from '@/components/layout/peek-bar'
 
 interface ChatPanelProps {
   taskId: string
+  // Mobile-only: opens the right-panel bottom sheet. When provided, the peek
+  // bar renders above the chat input. Omitted on desktop → render unchanged.
+  onOpenPanel?: () => void
 }
 
-export function ChatPanel({ taskId }: ChatPanelProps) {
+export function ChatPanel({ taskId, onOpenPanel }: ChatPanelProps) {
   const { data, isLoading, error } = useTask(taskId)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -63,6 +67,7 @@ export function ChatPanel({ taskId }: ChatPanelProps) {
         </div>
       </div>
 
+      {onOpenPanel && <PeekBar data={data} onOpen={onOpenPanel} />}
       <ChatInput data={data} />
     </div>
   )
