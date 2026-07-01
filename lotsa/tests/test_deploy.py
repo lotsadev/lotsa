@@ -55,6 +55,22 @@ def test_config_to_env_full() -> None:
     assert env["LOTSA_GIT"] == "https://github.com/lotsadev/lotsa.git"
 
 
+def test_config_to_env_budget_unset_is_omitted() -> None:
+    # Unset budget → no LOTSA_BUDGET, so the installer leaves lotsa.yaml's value alone.
+    assert "LOTSA_BUDGET" not in dep.config_to_env(_base_cfg())
+
+
+def test_config_to_env_budget_set() -> None:
+    assert dep.config_to_env(_base_cfg() | {"budget": 25})["LOTSA_BUDGET"] == "25.0"
+    assert dep.config_to_env(_base_cfg() | {"budget": 12.5})["LOTSA_BUDGET"] == "12.5"
+
+
+@pytest.mark.parametrize("bad", ["lots", -1, 0])
+def test_config_to_env_budget_invalid(bad) -> None:
+    with pytest.raises(dep.DeployError, match="budget"):
+        dep.config_to_env(_base_cfg() | {"budget": bad})
+
+
 def test_config_to_env_oauth_instead_of_api_key() -> None:
     cfg = _base_cfg()
     del cfg["anthropic_api_key"]

@@ -96,6 +96,8 @@ projects:
   - id: demo
     repo:                       # empty → seeds an empty demo repo so doctor passes
 model: sonnet
+# budget: 25                    # optional; USD cap per agent dispatch (default 5).
+                                # A task spends a multiple of this across its steps.
 
 # ── Install source (optional). Default: PyPI, pinned to this CLI's version. ──
 # version: 0.1.0                # pin a specific PyPI release
@@ -180,6 +182,14 @@ def config_to_env(cfg: dict[str, Any]) -> dict[str, str]:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = str(oauth)
     if cfg.get("github_token"):
         env["GITHUB_TOKEN"] = str(cfg["github_token"])
+    if cfg.get("budget") is not None:
+        try:
+            budget = float(cfg["budget"])
+        except (TypeError, ValueError) as exc:
+            raise DeployError(f"`budget` must be a number (USD per agent dispatch), got {cfg['budget']!r}.") from exc
+        if budget <= 0:
+            raise DeployError(f"`budget` must be greater than 0, got {budget}.")
+        env["LOTSA_BUDGET"] = repr(budget)
     if cfg.get("version"):
         env["LOTSA_VERSION"] = str(cfg["version"])
     if cfg.get("git"):

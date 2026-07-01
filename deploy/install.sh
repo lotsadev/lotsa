@@ -226,9 +226,13 @@ fi
 chown "$LOTSA_USER:$LOTSA_USER" "$YAML"
 # Apply the configured model (lotsa init writes a default; honour LOTSA_MODEL).
 sed -i "s/^model:.*/model: $LOTSA_MODEL/" "$YAML"
+# Optional per-agent-dispatch budget cap (USD). Only applied when LOTSA_BUDGET is
+# set, so leaving it unset preserves the value lotsa init wrote (or a hand-edit on
+# the box) rather than resetting it every deploy.
+[ -n "${LOTSA_BUDGET:-}" ] && sed -i "s/^budget:.*/budget: $LOTSA_BUDGET/" "$YAML"
 # Docker mode: the agent runs in a container (the isolation boundary on Linux).
 grep -q "^docker:" "$YAML" || echo "docker: true" >> "$YAML"
-ok "projects: ${PROJ_IDS[*]} (model=$LOTSA_MODEL, docker mode; under $DATA_DIR/projects/)"
+ok "projects: ${PROJ_IDS[*]} (model=$LOTSA_MODEL${LOTSA_BUDGET:+, budget=\$$LOTSA_BUDGET}, docker mode; under $DATA_DIR/projects/)"
 
 # ── 6. systemd daemon ────────────────────────────────────────────────────────
 log "Installing systemd service"
