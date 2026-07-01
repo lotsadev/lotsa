@@ -151,6 +151,48 @@ def build(tag: str) -> None:
 
 
 @cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default="deploy.yaml",
+    type=click.Path(path_type=Path),
+    help="Path to deploy.yaml (default: ./deploy.yaml)",
+)
+@click.option("--init", "do_init", is_flag=True, default=False, help="Scaffold a commented deploy.yaml and exit")
+@click.option("--host", default=None, help="Override the ssh target from deploy.yaml (user@host)")
+@click.option(
+    "--wheel",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Deploy a local wheel instead of installing from PyPI (dev/contributor path)",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Print the ssh/scp commands without running them")
+def deploy(config_path: Path, do_init: bool, host: str | None, wheel: Path | None, dry_run: bool) -> None:
+    """Deploy Lotsa to a single Debian/Ubuntu + systemd host (ADR-042).
+
+    Reads ``deploy.yaml``, ships the bundled installer + a rendered ``deploy.env``
+    to the target over ssh/scp, and runs the installer (PyPI install by default).
+    """
+    from lotsa import deploy as deploy_mod
+
+    if do_init:
+        if config_path.exists():
+            click.echo(f"{config_path} already exists — not overwriting.", err=True)
+            raise SystemExit(1)
+        config_path.write_text(deploy_mod.init_template())
+        config_path.chmod(0o600)
+        click.echo(f"Wrote {config_path} (chmod 600). Fill it in, then run `lotsa deploy`.")
+        return
+
+    try:
+        cfg = deploy_mod.load_config(config_path)
+        deploy_mod.run_deploy(cfg, host=host, wheel=wheel, dry_run=dry_run, echo=click.echo)
+    except deploy_mod.DeployError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+
+@cli.command()
 @click.argument("task_id")
 @click.argument("process")
 @click.option("--context", default=None, help="Free-text context seeded as the generic 'promotion_context' artifact")

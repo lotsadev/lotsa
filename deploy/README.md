@@ -22,51 +22,61 @@ providers — it's just a Linux box with SSH.
 - Agent credentials: `ANTHROPIC_API_KEY`, or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`.
 - A `GITHUB_TOKEN` (scope it to a throwaway repo) if you want the push/PR demo.
 
-## Steps
+## Steps (`lotsa deploy` — the supported path, ADR-042)
 
-**1. Configure locally, once.** Copy the example and fill it in (it's gitignored;
-keep it out of version control):
+You don't need a repo checkout. `pip install lotsa` bundles the installer, and
+`lotsa deploy` ships it to your box over SSH and runs it.
+
+**1. Scaffold and fill in the config, once** (it holds secrets — keep it out of
+git; `--init` writes it `chmod 600`):
 ```bash
-cp deploy/deploy.env.example deploy/deploy.env
-chmod 600 deploy/deploy.env
-nano deploy/deploy.env          # domain, email, basic-auth creds, API key, token, LOTSA_WHEEL
+pip install lotsa
+lotsa deploy --init             # writes ./deploy.yaml
+nano deploy.yaml                # host, domain, basic-auth, API key/token, projects
 ```
 
-**2. Deploy in one command** — builds the wheel, ships it + `deploy/` (including
-your filled-in `deploy.env`), and runs the installer on the box:
+**2. Deploy:**
 ```bash
-make deploy VPS=root@YOUR_VPS
+lotsa deploy                    # reads ./deploy.yaml, installs from PyPI on the box
 ```
-(Or split it: `make deploy-wheel VPS=root@YOUR_VPS` to only build + ship, then
-`ssh root@YOUR_VPS 'cd deploy && ./install.sh'`.)
+Add `--dry-run` to print the `ssh`/`scp` commands without running them, or
+`--host user@box` to override the target. The box installs Lotsa **from PyPI**
+(the same version as your local CLI) — no Node, no local build.
 
 **3. Open `https://your-domain`** and log in with the basic-auth credentials.
 
-The wheel install is used because it bundles the dashboard — the box needs no
-Node build. (Once the repo is public, set `LOTSA_GIT=` instead of `LOTSA_WHEEL=`
-in `deploy.env` to install from git.)
+> **Contributors** deploying an unreleased local build: `make deploy` builds the
+> dashboard-bundled wheel and runs `lotsa deploy --wheel dist/lotsa-*.whl`, so the
+> box runs *your* wheel instead of PyPI. It still reads `./deploy.yaml`.
+
+> **Manual fallback** (no CLI): `scp` the `deploy/` directory to the box, write a
+> `deploy.env` next to `install.sh` (see `deploy.env.example`), and
+> `ssh box 'cd deploy && ./install.sh'`. `lotsa deploy` just automates exactly this.
 
 ## Adding your real repos
-Set `PROJECT_REPOS` in `deploy.env` to a space-separated list of `id=url` pairs
-before deploying:
+List them under `projects:` in `deploy.yaml` (each an `id` + `repo`):
+```yaml
+projects:
+  - id: api
+    repo: https://github.com/you/api.git
+  - id: web
+    repo: https://github.com/you/web.git
 ```
-PROJECT_REPOS="api=https://github.com/you/api.git web=https://github.com/you/web.git"
-```
-Private repos are cloned with `GITHUB_TOKEN` (scope it to read — and write, if you
+Private repos are cloned with `github_token` (scope it to read — and write, if you
 want the PR demo — on those repos). They register as Lotsa projects automatically.
 
-To add or remove repos later, edit `PROJECT_REPOS` in `deploy.env` and re-run
-`make deploy` — the installer **reconciles** the `projects:` block from
-`PROJECT_REPOS` on every deploy (it owns that block, so manage repos there rather
-than hand-editing `lotsa.yaml`).
+To add or remove repos later, edit `projects:` and re-run `lotsa deploy` — the
+installer **reconciles** the `projects:` block on every deploy (it owns that
+block, so manage repos there rather than hand-editing `lotsa.yaml`).
 
 > The agent runs inside a Docker container (ADR-038), so it can't touch the host
 > outside its task worktree. Still scope the token to the repos you register, and
 > prefer a disposable box for anything sensitive.
 
 ## Updating
-Re-run `make deploy VPS=root@YOUR_VPS` — it rebuilds the wheel, re-ships, and
-re-runs the idempotent installer (reinstalls the package, restarts the daemon).
+Re-run `lotsa deploy` — it re-ships and re-runs the idempotent installer
+(reinstalls the package, restarts the daemon). Pin a release with `version:` in
+`deploy.yaml`, or omit it to track the latest CLI's version.
 
 ## Operating
 ```bash
