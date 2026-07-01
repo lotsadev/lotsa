@@ -275,6 +275,8 @@ budget: 5.0                   # max USD per agent run
 # max_output_tokens: 128000   # cap per response — uncomment to raise the 32000 default
 flow: chat                    # default-selected process: bundled name (chat/simple/standard/full/quickfix) or an inline process name. The full catalog always loads; this only sets the picker's pre-selected default
 prompts_dir: prompts/         # custom prompt templates (optional)
+# resume_cap: 2               # ADR-040 — max auto-resume attempts per task on restart before falling back to `blocked`
+# shutdown_grace_seconds: 30  # ADR-040 — bounded window shutdown() waits for in-flight agents to drain before cancelling
 
 # Projects — the git repos Lotsa can run tasks against. Each id must match
 # [a-z0-9_-] and point at an existing git repository. The new-task picker and
@@ -311,6 +313,15 @@ processes:
 ```
 
 All fields are optional — missing fields use defaults. `lotsa init` writes a starter `lotsa.yaml` with the optional blocks commented out.
+
+**Restart resilience (ADR-040).** Lotsa runs as a long-lived daemon, and a
+deploy restarts it. On restart, tasks that were mid-run are **resumed** (the
+agent reattaches via `--resume` where the runner supports it, or the step
+re-runs idempotently), not dumped to `blocked`. On shutdown the service drains
+in-flight agents for up to `shutdown_grace_seconds` (default 30s). If you run
+Lotsa under systemd, set `TimeoutStopSec` **≥** `shutdown_grace_seconds` so
+systemd doesn't SIGKILL the service mid-drain — otherwise the drain is cut short
+and more tasks fall to the (still-safe) resume-on-next-start path.
 
 ### Projects (multi-repo)
 

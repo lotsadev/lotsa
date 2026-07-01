@@ -126,7 +126,7 @@ contract or introduces a new top-level dependency.
 | 037 | Web-UI first-run — UI-managed config, secure secrets, GitHub integration, onboarding (**Proposed** — post-launch, phased) | CE |
 | 038 | Host-sandboxed agent execution — native runs use the OS sandbox + `dontAsk` and drop `--dangerously-skip-permissions`; bypass only via container or an explicit per-launch flag (**Implemented** — Phases 0–2: native sandbox (macOS) + per-launch opt-out; Linux isolation via Docker (native sandbox doesn't start on Linux servers); Phase 3 SDK parity pending) | CE |
 | 039 | Outcome-based step advancement — evaluate the agent's result against the step goal when no stdout marker matched, instead of silently parking (**Proposed** — post-launch; mandatory-marker prompt footer shipped as the stopgap) | CE |
-| 040 | Restart-resilient orchestration — the DB is the state of record; resume in-flight agents (and idempotent step re-runs) instead of blocking on restart (**Proposed** — post-launch, high priority; ships paired with ADR-033) | CE |
+| 040 | Restart-resilient orchestration — the DB is the state of record; resume in-flight agents (and idempotent step re-runs) instead of blocking on restart (**Implemented** — phases 1–5: idempotency audit, interrupted-not-blocked startup, auto-resume dispatch via runner `supports_resume`, resumed-agent prompt note, graceful drain; phase 6 / ADR-033 deferred) | CE |
 | 041 | Project toolchain & environment provisioning — declared `setup`/`test`/`build`/`lint` + per-project cache + optional per-project `image:`; egress Open by default and pluggable (ADR-031's upstream Layer 0) (**Proposed** — post-launch) | CE |
 
 Design rationale for a specific area belongs in that directory's `CLAUDE.md`

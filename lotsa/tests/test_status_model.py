@@ -420,7 +420,11 @@ def test_retry_from_drainer_blocked_state_does_not_raise(tmp_path, _loop, run):
         run(db.close())
 
 
-def test_start_marks_working_tasks_as_blocked(tmp_path, _loop, run):
+def test_start_resumes_interrupted_working_tasks(tmp_path, _loop, run):
+    """ADR-040 — a ``working`` task on restart is treated as *interrupted* and
+    resumed, not destroyed. The sweep records ``interrupted_at`` + ``resume_count``
+    in metadata and re-dispatches the step instead of unconditionally flipping
+    the row to ``blocked`` (the pre-ADR-040 destructive behaviour)."""
     flow_yaml = tmp_path / "f.yaml"
     flow_yaml.write_text("name: t\njobs:\n  - name: coding\n    evaluate: true\n")
     config = LotsaConfig(
@@ -437,10 +441,14 @@ def test_start_marks_working_tasks_as_blocked(tmp_path, _loop, run):
     # Pre-create a "working" task simulating a server crash mid-run.
     task = run(db.create_task(title="killed", flow_name="t", status="working", current_step="coding"))
     svc = OrchestratorService(config, db)
+    # Stub the runner so the resume dispatch doesn't shell out to real claude.
+    svc.runner = FakeRunner(AgentResult(success=True, stdout="ok", stderr="", return_code=0, duration_ms=10))
     run(svc.start())
     try:
         fresh = run(db.get_task(task.id))
-        assert fresh.status == "blocked"
+        assert fresh.status != "blocked", "an interrupted working task must be resumed, not blocked"
+        assert fresh.metadata.get("interrupted_at") is not None
+        assert int(fresh.metadata.get("resume_count", 0)) >= 1
         msgs = run(db.get_messages(task.id, msg_type="status_change"))
         assert any("restart" in m.content.lower() for m in msgs)
     finally:
