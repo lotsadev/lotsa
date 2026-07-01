@@ -1,4 +1,4 @@
-.PHONY: setup dev build deploy deploy-wheel check-vps frontend test lint format typecheck frontend-install frontend-dev frontend-build
+.PHONY: setup dev build deploy frontend test lint format typecheck frontend-install frontend-dev frontend-build
 
 # ---------------------------------------------------------------------------
 # Setup — run once after cloning
@@ -17,28 +17,17 @@ build:
 	python -m build
 
 # ---------------------------------------------------------------------------
-# Deploy — build the wheel and ship it + deploy/ to a host (see deploy/README.md)
-#   make deploy-wheel VPS=root@your-server
-# Excludes deploy/deploy.env so local secrets are never copied.
+# Deploy — `lotsa deploy` (ADR-042) is the supported path; see deploy/README.md.
+#   Pip users:     pip install lotsa && lotsa deploy --init && lotsa deploy
+#   Contributors:  make deploy   (builds a local wheel and ships THAT)
+# Config lives in ./deploy.yaml (run `lotsa deploy --init` to scaffold it).
 # ---------------------------------------------------------------------------
 
-# check-vps runs first so a missing VPS= fails before the (slow) build.
-# Ships your local deploy/deploy.env too (it's gitignored) so the config travels
-# with the wheel — fill it in once locally instead of editing on the box.
-deploy-wheel: check-vps build
-	@test -f deploy/deploy.env || echo "note: no deploy/deploy.env yet — cp deploy/deploy.env.example deploy/deploy.env, fill it in (chmod 600), then re-run"
-	rsync -avz dist/lotsa-*.whl "$(VPS):/root/"
-	rsync -avz deploy/ "$(VPS):/root/deploy/"
-	@echo ""
-	@echo "Copied wheel + deploy/ (incl. deploy.env if present) to $(VPS):/root/"
-	@echo "Next: make deploy VPS=$(VPS)   (or: ssh $(VPS) ; cd deploy ; ./install.sh)"
-
-# One-shot: build, ship everything (incl. your local deploy.env), run the installer.
-deploy: deploy-wheel
-	ssh "$(VPS)" 'cd /root/deploy && ./install.sh'
-
-check-vps:
-	@test -n "$(VPS)" || { echo "set VPS=user@host, e.g. make deploy VPS=root@1.2.3.4"; exit 1; }
+# Contributor convenience: build the dashboard-bundled wheel and deploy it via
+# the CLI's --wheel override (so the box runs your local build, not PyPI).
+# Reads ./deploy.yaml for the host + config, same as a pip user.
+deploy: build
+	lotsa deploy --wheel $$(ls dist/lotsa-*.whl)
 
 # ---------------------------------------------------------------------------
 # CLI dev server

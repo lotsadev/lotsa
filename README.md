@@ -10,7 +10,9 @@ Lotsa is a self-hosted runner and dashboard that takes coding tasks from idea to
 
 It's a **complement** to the AI tools you already use, not a replacement. Your chat assistant and in-editor copilot are great at interactive, hands-on coding. Lotsa is the layer above: it takes a whole, well-defined task and runs it to completion on your own infrastructure — so you can hand off the work that doesn't need you watching, and spend your attention where it actually counts.
 
-> **tasks**, not chats · **servers**, not terminals · **async**, not synchronous · **a fleet**, not a single agent · **a pipeline**, not freeform
+**Scope it in chat. Walk away while it runs. Come back to verify.** Sync where your judgment counts, async where it doesn't.
+
+> **tasks**, not chats · **servers**, not terminals · **closed-loop**, not open-loop · **a fleet**, not a single agent · **a pipeline**, not freeform
 
 ## Your rules, enforced by the system — not the model's memory
 
@@ -26,7 +28,11 @@ And the pipeline is yours to shape — the steps, gates, and routing live in a `
 
 The point: your rules are enforced by the orchestration layer, not by the model remembering them — so task #100 gets the same rigor as task #1.
 
+**This is closing the loop.** Reliable agent work is a feedback system with two halves: *verification* — the objective checks the system runs (tests, a fresh-agent diff review, a verified build) — and a *heartbeat* — the orchestrator advancing state and deciding what runs next. Most agent setups are open-loop: they generate, and the loop only closes when you're watching. Lotsa puts the loop in the process, so it closes whether you're at the keyboard or not. ([The thinking behind it →](https://andrewcrookston.com/articles/close-the-loop.html))
+
 ## What it does
+
+Three beats: **scope it in chat, let it run, verify the result.** Everything below serves that loop.
 
 - **Runs tasks end to end.** Hand Lotsa a task and it drives your flow — chat → spec → plan → *(your approval)* → tests → code → review → verify → PR — dispatching the agent at each step.
 - **Starts as a conversation.** Every task opens in **chat**: talk the work through, then **promote** it into a structured process when you know what you want. Pick the depth per task.

@@ -7,7 +7,14 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 2000,
-      refetchOnWindowFocus: false,
+      // Refetch when the tab regains focus. Interval polling pauses while the
+      // tab is backgrounded (refetchIntervalInBackground defaults false), and
+      // Lotsa's whole workflow is "kick off a task, walk away, come back" — so
+      // without this, returning to the tab shows stale state (e.g. a verify
+      // step that finished and is now waiting at the Accept gate) until a
+      // manual reload. Focus refetch is the catch-up; background polling stays
+      // off to save resources.
+      refetchOnWindowFocus: true,
     },
   },
 })

@@ -45,6 +45,18 @@ artifacts = ["lotsa/server/static/dist/**"]
 [tool.hatch.build.targets.wheel]
 packages = ["lotsa", "rigg"]
 
+# Bundle the single-host deploy assets into the wheel (ADR-042), so a pip-only
+# user can `lotsa deploy` without a repo checkout. They land under lotsa/deploy/
+# so they're reachable via importlib.resources at runtime. deploy.env (local
+# secrets) is intentionally NOT shipped — only the .example template is.
+[tool.hatch.build.targets.wheel.force-include]
+"deploy/install.sh" = "lotsa/deploy/install.sh"
+"deploy/lotsa.service" = "lotsa/deploy/lotsa.service"
+"deploy/Caddyfile.example" = "lotsa/deploy/Caddyfile.example"
+"deploy/check-sandbox.sh" = "lotsa/deploy/check-sandbox.sh"
+"deploy/deploy.env.example" = "lotsa/deploy/deploy.env.example"
+"deploy/README.md" = "lotsa/deploy/README.md"
+
 # ---------------------------------------------------------------------------
 # Ruff
 # ---------------------------------------------------------------------------
