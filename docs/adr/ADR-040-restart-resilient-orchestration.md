@@ -1,6 +1,6 @@
 # ADR-040: Restart-resilient orchestration — the DB is the state of record; resume in-flight agents instead of blocking
 
-**Status**: Proposed — post-launch, high priority (every deploy now restarts the service, so this is a routine event, not a rare crash).
+**Status**: Implemented (phases 1–5) — idempotency audit + DB-as-truth invariant, interrupted-not-blocked startup, auto-resume dispatch (runner `supports_resume` capability), resumed-agent prompt note, and graceful drain. Phase 6 (monitor cache rebuild) and the paired ADR-033 are deferred.
 **Date**: 2026-06-27
 **Related**: ADR-014 (jobs/flow steps — the units that must be idempotent), ADR-020 (typed atomic transitions / CAS — the no-op-on-rerun mechanism), ADR-025 (layered system prompt — where the resume note attaches), ADR-028 (runner shapes — CLI/docker/SDK; resume support varies by runner), ADR-030 (PR-lifetime monitoring), ADR-033 (feedback tracking by comment identity — one application of the invariant below), and the docker agent-home mount (session-JSONL persistence). Scope: CE (orchestrator + `rigg` runner contract).
 

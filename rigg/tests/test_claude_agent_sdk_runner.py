@@ -556,3 +556,17 @@ def test_sdk_fragment_preserves_needs_input_channel():
     """NEEDS_INPUT is the blocking-question channel across every runner shape."""
     frag = _runner_cls()().dispatch_shape_prompt()
     assert "NEEDS_INPUT" in frag
+
+
+# ---------------------------------------------------------------------------
+# ADR-040 — resume-capability signal
+# ---------------------------------------------------------------------------
+
+
+def test_sdk_runner_reports_no_resume_support():
+    """Cross-restart session durability for the SDK runner is unverified
+    (ADR-028 Phase 4 deferred), so it reports *no* resume support and the
+    orchestrator routes its interrupted steps to safe idempotent re-run-from-
+    start rather than ``--resume`` (ADR-040 R3, conservative default)."""
+    runner = _runner_cls()()
+    assert runner.supports_resume is False

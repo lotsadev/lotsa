@@ -120,8 +120,11 @@ by default):
 - **Pre-pr-fix dispatch** — fetch + merge before the pr-fix agent runs (ADR-015).
 - **Pre-retry-from-blocked** and **pre-rebase-after-restart** — `retry()`'s
   push-retry branch re-runs `_sync_branch_to_main` before re-pushing. A task
-  blocked after a push failure, and a push-state task flipped to `blocked` by
-  restart recovery (which preserves `state="pushing"`), both funnel here.
+  blocked after a push failure funnels here. (Since ADR-040, a modern mid-push
+  task is no longer flipped to `blocked` by restart recovery — it is
+  *resumed*: the push action re-runs idempotently, and the push step's own
+  `NON_FAST_FORWARD → rebasing` handling covers divergence. Only a
+  cap-exceeded or legacy push-state row reaches `blocked` + `retry()`.)
 
 Sync is deterministic and orchestrator-owned — never delegated to an agent.
 Failure degrades best-effort: a fetch/merge error blocks the task with a
@@ -561,12 +564,52 @@ ADR-029). Created lazily on first dispatch by `WorktreeManager`
 (`rigg.git.WorktreeManager`). The orchestrator switches into it for
 agent dispatch, push, and rebase operations.
 
-Crash recovery: on restart, any task with `status='working'` or
-`state in ('pushing', 'rebasing')` is flipped to `blocked` with an
-explicit "Server restarted while task was X — moved to blocked. Retry
-when ready." message. We do **not** try to reconstruct in-memory dispatch
-state from the DB — restart is destructive on purpose. Tasks already at
-`status='blocked'` are skipped to avoid duplicate restart messages.
+### Restart is resumptive, not destructive (ADR-040)
+
+**The DB is the state of record; in-memory dicts/timers are caches only;
+every flow step is idempotent.** Any in-memory structure the orchestrator or
+monitor relies on for correctness must be reconstructable from the DB — dicts
+and timers are permitted only as caches of persisted state, never as the sole
+record of a decision. Every flow step is safe to execute at-least-once (a step
+that can't be made naturally idempotent is guarded by a persisted CAS marker,
+ADR-020), which is what makes at-least-once dispatch — resume / retry / crash
+recovery — safe in general.
+
+Restart recovery (deploy now always restarts the daemon, so this is routine):
+on startup a `status='working'` task is treated as **interrupted**, not failed.
+The sweep records `interrupted_at` + `resume_count` in the task `metadata` JSON
+(no new columns, no migration) and auto-dispatches a continuation:
+
+- **Resume the agent** — an agent step with a persisted `session_id` and a
+  runner that reports `supports_resume` → re-dispatch with `--resume
+  <session_id>`.
+- **Idempotent re-run** — no `session_id`, a non-resume runner, or a
+  deterministic/action step → re-dispatch the current step from its start; step
+  idempotency makes already-done work a no-op.
+- **Cap → block** — bounded by `resume_count` (default `resume_cap=2`,
+  `lotsa.yaml`-configurable). Past the cap, fall back to `blocked` with a
+  "couldn't resume after N attempts" message.
+
+Resume-vs-re-run is selected via the runner's `supports_resume` capability
+(read defensively, never `isinstance`). A resumed dispatch appends a
+resumed-agent note to the layered system prompt (ADR-025) so the agent checks
+what it already did before redoing work. Tasks already at `status='blocked'` /
+`'archived'` are skipped. Non-`working` push-state rows are pre-ADR-014 legacy
+shapes and keep today's block-with-recovery-message contract (a modern mid-push
+task is `status='working'` and takes the resume path).
+
+**Idempotency audit (ADR-040 phase 1):** commit (`commit_step.execute_commit`
+no-ops on a clean staged tree), push (`push_step.execute_push` guards PR
+creation on `pr_number is None`; push-by-SHA is a no-op if already pushed), and
+sync (`_sync_branch_to_main` returns `already_current` when `behind==0`) are all
+**naturally idempotent** — confirmed by regression tests; no new CAS marker was
+required.
+
+**Graceful drain:** on `shutdown()` the service sets `_accepting=False` (refusing
+new dispatches), awaits in-flight agents up to `shutdown_grace_seconds`
+(default 30s), then cancels survivors — which the next start()'s resume sweep
+recovers. Operators should set systemd `TimeoutStopSec` ≥ `shutdown_grace_seconds`
+so systemd doesn't SIGKILL mid-drain.
 
 ---
 
