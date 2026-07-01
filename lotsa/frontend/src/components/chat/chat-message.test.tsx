@@ -52,7 +52,9 @@ describe('ChatMessage — operator "You" bubble (R4)', () => {
     const { container } = render(<ChatMessage message={msg} />)
 
     expect(anyClass(container, /bg-primary/)).toBe(true)
-    expect(anyClass(container, /bg-muted/)).toBe(false)
+    // Standalone `bg-muted` bubble background only — not the prose
+    // `[&_code]:bg-muted` variant (preceded by `:`), which every bubble carries.
+    expect(anyClass(container, /(?:^|\s)bg-muted(?:\s|$)/)).toBe(false)
   })
 })
 
