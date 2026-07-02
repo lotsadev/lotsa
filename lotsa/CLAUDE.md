@@ -582,13 +582,22 @@ The sweep records `interrupted_at` + `resume_count` in the task `metadata` JSON
 
 - **Resume the agent** — an agent step with a persisted `session_id` and a
   runner that reports `supports_resume` → re-dispatch with `--resume
-  <session_id>`.
-- **Idempotent re-run** — no `session_id`, a non-resume runner, or a
-  deterministic/action step → re-dispatch the current step from its start; step
-  idempotency makes already-done work a no-op.
+  <session_id>`. `session_id` is a single global metadata slot, so the resume
+  is gated on `session_step` (persisted alongside `session_id` when a step
+  completes): we only reattach when the persisted session belongs to the step
+  being resumed — otherwise a step interrupted before producing its own session
+  (e.g. `plan`/`review`/`pr_summary`, none `resume: true`) would `--resume`
+  into the previous step's unrelated conversation. A mismatch falls through to
+  the re-run path.
+- **Idempotent re-run** — no `session_id`, a stale/foreign `session_step`, a
+  non-resume runner, or a deterministic/action step → re-dispatch the current
+  step from its start; step idempotency makes already-done work a no-op.
 - **Cap → block** — bounded by `resume_count` (default `resume_cap=2`,
-  `lotsa.yaml`-configurable). Past the cap, fall back to `blocked` with a
-  "couldn't resume after N attempts" message.
+  `lotsa.yaml`-configurable). The count bounds repeated failure at a *single*
+  interruption: it is cleared (`_clear_interruption_markers`) the moment a task
+  advances into a new step's active state, so routine deploys that each make
+  real forward progress don't accumulate toward the cap. Past the cap, fall
+  back to `blocked` with a "couldn't resume after N attempts" message.
 
 Resume-vs-re-run is selected via the runner's `supports_resume` capability
 (read defensively, never `isinstance`). A resumed dispatch appends a

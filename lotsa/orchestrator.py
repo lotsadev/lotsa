@@ -4084,6 +4084,15 @@ class OrchestratorService:
             return
         item.state = step.active_state
 
+        # ADR-040 — the task just advanced into a new step's active state, i.e.
+        # it made forward progress past whatever step it may have been
+        # interrupted on. ``resume_count`` bounds repeated failure at a *single*
+        # interruption, not the task's whole life; a routine deploy that
+        # interrupts a step which then completes must not accumulate toward the
+        # cap. Clear the interruption markers on this forward-progress edge.
+        if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+            await self._clear_interruption_markers(item)
+
         # Create or reuse a git worktree for this task (under the task's project)
         try:
             wt_path = await self._worktree_manager_for_task(item).create(item.id)
@@ -4201,14 +4210,19 @@ class OrchestratorService:
             )
             return
 
-        if not self._accepting:
-            return
-
         try:
             wt_path = await self._worktree_manager_for_task(item).create(item.id)
         except Exception:
             logger.warning("Worktree creation failed for %s during resume, using project work_dir", item.id)
             wt_path = self._fallback_work_dir(item)
+
+        # ADR-040 graceful drain — check ``_accepting`` immediately before the
+        # synchronous ``_in_flight`` mutation (after the last await), matching
+        # ``_dispatch_step``. Checking earlier leaves a window where a
+        # ``shutdown()`` racing this resume sweep could add a task the drain
+        # snapshot has already taken, so it gets cancelled with no grace window.
+        if not self._accepting:
+            return
 
         info = InFlightStep(item=item, step=step, step_work_dir=wt_path, is_resume=is_resume)
         self._in_flight[item.id] = info
@@ -4645,8 +4659,22 @@ class OrchestratorService:
             # support; otherwise the step re-runs from start (session_id stays
             # None). Resume-vs-re-run is selected via the capability signal, not
             # the runner's type.
+            #
+            # ``metadata["session_id"]`` is a single global slot overwritten by
+            # whichever agent step last completed (see the drainer's
+            # ``session_id`` persist). A step that is interrupted before it
+            # produces its own session — and does not declare ``resume: true``
+            # (e.g. ``plan``/``review``/``pr_summary``) — would otherwise
+            # reattach to the *previous, unrelated* step's conversation. Gate the
+            # restart-resume on ``session_step`` so we only ``--resume`` when the
+            # persisted session belongs to the step being resumed; otherwise fall
+            # through to the safe idempotent re-run-from-start.
             session_id = None
-            want_resume = info.is_resume and getattr(runner, "supports_resume", False)
+            want_resume = (
+                info.is_resume
+                and getattr(runner, "supports_resume", False)
+                and item.metadata.get("session_step") == step.name
+            )
             if (
                 step.resume_session or (step.conversational and info.feedback) or want_resume
             ) and "session_id" in item.metadata:
@@ -4774,7 +4802,13 @@ class OrchestratorService:
                 self._in_flight.pop(item.id, None)
 
                 if result.session_id:
-                    await self._merge_task_metadata(item, {"session_id": result.session_id})
+                    # Persist which step owns this session (ADR-040): the
+                    # restart-resume gate reattaches to a session only when it
+                    # belongs to the step being resumed, never a stale sibling.
+                    await self._merge_task_metadata(
+                        item,
+                        {"session_id": result.session_id, "session_step": info.step.name},
+                    )
 
                 if not result.success:
                     if self.flow is None:
@@ -5996,6 +6030,25 @@ class OrchestratorService:
         if fresh is None:
             return
         fresh.metadata.update(updates)
+        item.metadata = fresh.metadata
+        await self.db.update_task(item.id, metadata=fresh.metadata)
+
+    async def _clear_interruption_markers(self, item: Item) -> None:
+        """Drop the ADR-040 resume-cap markers once a task makes forward progress.
+
+        ``resume_count`` / ``interrupted_at`` track *repeated failure at a single
+        interruption* so a genuine crash-loop still falls back to ``blocked``.
+        They must not accumulate across the task's whole life: once the
+        interrupted step completes and the task advances, the cap resets. A fresh
+        read (like ``_merge_task_metadata``) avoids clobbering concurrent writers;
+        this is a best-effort cache reset, not a state transition, so it stays a
+        plain metadata write rather than a CAS.
+        """
+        fresh = await self.db.get_task(item.id)
+        if fresh is None:
+            return
+        fresh.metadata.pop("resume_count", None)
+        fresh.metadata.pop("interrupted_at", None)
         item.metadata = fresh.metadata
         await self.db.update_task(item.id, metadata=fresh.metadata)
 

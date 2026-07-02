@@ -219,7 +219,9 @@ def test_interrupted_agent_step_resumes_with_session_id(tmp_path, run):
         state="coding",
         status="working",
         current_step="coding",
-        metadata={"session_id": "sess-xyz"},
+        # ``session_step`` marks the persisted session as belonging to the step
+        # being resumed (``coding``), so the restart-resume reattaches to it.
+        metadata={"session_id": "sess-xyz", "session_step": "coding"},
     ) as (svc, db, task):
 
         async def _t():
@@ -227,6 +229,44 @@ def test_interrupted_agent_step_resumes_with_session_id(tmp_path, run):
             assert runner.calls, "resumed agent step was not re-dispatched"
             assert runner.calls[0].get("session_id") == "sess-xyz", (
                 "the runner must receive the persisted session id so it adds --resume"
+            )
+
+        run(_t())
+
+
+def test_interrupted_step_does_not_resume_a_prior_steps_session(tmp_path, run):
+    """A persisted ``session_id`` that belongs to a *different* (earlier) step
+    must NOT be reused when the interrupted step is resumed. ``session_id`` is a
+    single global slot overwritten by whichever step last completed; without the
+    ``session_step`` guard a step interrupted before producing its own session
+    (e.g. ``plan``/``review``/``pr_summary``, none of which set ``resume: true``)
+    would ``--resume`` into the previous step's unrelated conversation.
+
+    The interrupted step here is ``coding`` but the persisted session belongs to
+    ``planning`` → the runner must be re-dispatched from the step's start with
+    ``session_id=None`` (idempotent re-run), not resumed with the stale id.
+
+    Fails pre-fix: ``want_resume`` ignored session ownership, so the runner
+    received ``session_id='sess-planning'`` (a resume into the wrong session).
+    """
+    runner = RecordingRunner(supports_resume=True)
+    with restart_with_seed(
+        run,
+        tmp_path,
+        runner=runner,
+        title="stale session",
+        state="coding",
+        status="working",
+        current_step="coding",
+        metadata={"session_id": "sess-planning", "session_step": "planning"},
+    ) as (svc, db, task):
+
+        async def _t():
+            await _settle(lambda: len(runner.calls) >= 1)
+            assert runner.calls, "interrupted step was not re-dispatched"
+            assert runner.calls[0].get("session_id") is None, (
+                "a stale session owned by a different step must not be resumed — "
+                "the step must re-run from its start (session_id=None)"
             )
 
         run(_t())
@@ -333,6 +373,79 @@ def test_resume_cap_exceeded_blocks_and_does_not_resume(tmp_path, run):
             )
 
         run(_t())
+
+
+def test_resume_count_resets_when_task_advances_past_interrupted_step(tmp_path, run):
+    """``resume_count`` bounds repeated failure at a *single* interruption, not
+    the task's whole life. Once the interrupted step completes and the task
+    advances to the next step, the cap must reset — otherwise a long-running
+    multi-step task interrupted by ``resume_cap`` *separate, unrelated* deploys
+    (each making real forward progress) is wrongly forced to ``blocked``.
+
+    Two-step flow (code → review): seed the task interrupted at ``code`` with a
+    non-zero ``resume_count``; after the resumed ``code`` step completes and the
+    task advances into ``review``, ``resume_count`` / ``interrupted_at`` are gone.
+
+    Fails pre-fix: ``resume_count`` was never cleared, so it survives (and only
+    ever accumulates) across the task's life.
+    """
+    from lotsa.config import LotsaConfig
+
+    flow_yaml = tmp_path / "reset_flow.yaml"
+    flow_yaml.write_text(
+        "name: reset-test\njobs:\n"
+        "  - name: code\n    prompt: coding\n    resume: true\n"
+        "    queue_state: backlog\n    active_state: coding\n"
+        "  - name: review\n    prompt: review\n"
+        "    queue_state: reviewing\n    active_state: reviewing\n"
+    )
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    for name in ("coding-system", "coding-user", "review-system", "review-user"):
+        (prompts_dir / f"{name}.md").write_text(f"# {name}\n{{title}}\n{{body}}")
+    (tmp_path / "data").mkdir()
+    config = LotsaConfig(
+        data_dir=tmp_path / "data",
+        work_dir=tmp_path,
+        flow="custom",
+        flow_file=flow_yaml,
+        prompts_dir=prompts_dir,
+        model="sonnet",
+        budget=5.0,
+    )
+    db = TaskDB(config.data_dir / "lotsa.db")
+    run(db.initialize())
+    task = run(
+        db.create_task(
+            title="progress",
+            state="coding",
+            status="working",
+            current_step="code",
+            metadata={"resume_count": 1, "interrupted_at": "2026-07-02T00:00:00+00:00"},
+        )
+    )
+    runner = RecordingRunner(supports_resume=True)
+    svc = OrchestratorService(config, db)
+    svc.runner = runner
+    run(svc.start())
+    try:
+
+        async def _t():
+            # The resumed ``code`` step completes and the task advances into
+            # ``review`` — wait for that forward-progress edge.
+            await _settle(lambda: len(runner.calls) >= 2)
+            row = await db.get_task(task.id)
+            assert row.state in ("reviewing", "complete"), "task should have advanced past the interrupted step"
+            assert "resume_count" not in row.metadata, (
+                "resume_count must reset once the task advances past the interrupted step"
+            )
+            assert "interrupted_at" not in row.metadata, "interrupted_at must clear on forward progress too"
+
+        run(_t())
+    finally:
+        with contextlib.suppress(Exception):
+            run(svc.shutdown())
+        run(db.close())
 
 
 # ---------------------------------------------------------------------------
