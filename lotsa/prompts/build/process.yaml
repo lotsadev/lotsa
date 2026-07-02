@@ -1,0 +1,172 @@
+process: build
+description: |
+  Execute at full depth. Autonomous SDLC discipline: plan, failing-tests-first,
+  code, review, post-implementation verify, then open a PR and watch it to
+  terminal. The task body (or a spec carried from chat) is the brief — there is
+  no separate spec/plan gate. Reach it from chat via the "Build it" handoff, or
+  select it directly for a well-understood change.
+promotion_inputs:
+  - name: draft_spec
+    description: A discussed-and-agreed spec the operator wants built rather than
+                 re-elicited (e.g. distilled from a chat conversation). Optional —
+                 the task body is used when absent.
+jobs:
+  # ADR-022 — per-step model selection. Every step falls back to the global
+  # `model:` in lotsa.yaml; add `model: <name>` on a step to override. The
+  # bundled process deliberately ships NO per-step models — assigning them
+  # is operator policy, and bundled defaults would silently override the
+  # operator's global model on upgrade.
+  - name: plan
+    type: agent
+    prompt: planning
+    queue_state: backlog
+    active_state: planning
+
+  - name: test
+    type: agent
+    prompt: testing
+    resume: true
+    queue_state: testing
+    active_state: testing
+    posthooks: [commit]
+
+  - name: code
+    type: agent
+    prompt: coding
+    resume: true
+    queue_state: coding
+    active_state: coding
+    posthooks: [commit]
+
+  - name: review
+    type: agent
+    prompt: review
+    queue_state: reviewing
+    active_state: reviewing
+    rules:
+      - source: stdout
+        pattern: "^REVIEW_PASS"
+        target: next
+      - source: stdout
+        pattern: "^REVIEW_FAIL"
+        target: blocked
+
+  - name: pr-fix
+    type: agent
+    prompt: pr-fix
+    resume: true
+    queue_state: pr-fixing
+    active_state: pr-fixing
+    posthooks: [commit]
+    rules:
+      - source: stdout
+        pattern: "^PR_FIX_DONE:"
+        target: review
+      - source: stdout
+        pattern: "^PR_FIX_NEEDS_DECISION:"
+        target: needs_input
+      - source: stdout
+        pattern: "^PR_FIX_BLOCKED:"
+        target: blocked
+      - source: stdout
+        pattern: "^PR_FIX_SKIPPED:"
+        target: wait_for_pr_signal
+
+  - name: verify
+    type: agent
+    prompt: verify
+    conversational: true
+    posthooks: [commit]
+    rules:
+      - source: stdout
+        pattern: "^NEEDS_CODE:"
+        target: code
+      - source: stdout
+        pattern: "^NEEDS_REVIEW:"
+        target: review
+      - source: stdout
+        pattern: "^VERIFIED:"
+        target: next
+
+  - name: pr_summary
+    type: agent
+    prompt: pr_summary
+    output: pr_description
+    queue_state: summarizing
+    active_state: summarizing
+
+  - name: push_pr
+    type: action
+    tool: push_pr
+
+  - name: resolve_conflicts
+    type: agent
+    prompt: resolve_conflicts
+    resume: true
+    queue_state: resolving_conflicts
+    active_state: resolving_conflicts
+    posthooks: [commit]
+    rules:
+      - source: stdout
+        pattern: "^CONFLICTS_RESOLVED:"
+        target: pr-fix
+
+  - name: wait_for_pr_signal
+    type: monitor
+    engine: pr_monitor
+    config:
+      poll_interval_seconds: 30
+      debounce_seconds: 120
+      triggers: [human_comment, bot_comment, review_decision, failing_check, merge_conflict]
+      max_pr_fix_rounds: 10
+      max_consecutive_skipped: 3
+
+flows:
+  main:
+    steps:
+      - plan
+      - test
+      - code
+      - name: review
+        rules:
+          - source: stdout
+            pattern: "^REVIEW_PASS"
+            target: next
+          - source: stdout
+            pattern: "^REVIEW_FAIL"
+            target: code
+      - verify
+      - pr_summary
+      - push_pr
+      - wait_for_pr_signal
+
+  pr_fix:
+    steps:
+      - name: pr-fix
+        rules:
+          - source: stdout
+            pattern: "^PR_FIX_DONE:"
+            target: review
+          - source: stdout
+            pattern: "^PR_FIX_NEEDS_DECISION:"
+            target: needs_input
+          - source: stdout
+            pattern: "^PR_FIX_BLOCKED:"
+            target: blocked
+          - source: stdout
+            pattern: "^PR_FIX_SKIPPED:"
+            target: wait_for_pr_signal
+      - name: resolve_conflicts
+        rules:
+          - source: stdout
+            pattern: "^CONFLICTS_RESOLVED:"
+            target: pr-fix
+      - name: review
+        rules:
+          - source: stdout
+            pattern: "^REVIEW_PASS"
+            target: next
+          - source: stdout
+            pattern: "^REVIEW_FAIL"
+            target: pr-fix
+      - push_pr
