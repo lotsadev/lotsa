@@ -6058,3 +6058,86 @@ class TestPrLifetimeMonitoringDeferredCompletion:
             "the drainer must apply the deferred terminal after the agent's routing; "
             f"got status={fresh.status!r} state={fresh.state!r}"
         )
+
+
+class TestAttachmentMaterialization:
+    """Dispatch-time materialization of prompt attachments (Path A).
+
+    At every agent dispatch the orchestrator copies the task's durable
+    attachments into ``{work_dir}/.lotsa/attachments/``, git-excludes them, and
+    appends a prompt block listing the relative paths. Written before the
+    feature exists, so ``_run_agent`` injects nothing yet — the prompt-block
+    assertions fail as the expected red.
+    """
+
+    @staticmethod
+    def _seed_attachment(service, run, task_id, name="bug.png", data=b"PNGDATA"):
+        """Place a durable attachment on disk + in metadata, as the upload
+        endpoint would, without depending on that endpoint existing yet."""
+        attach_dir = service.config.data_dir / "attachments" / "default" / task_id
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        (attach_dir / name).write_bytes(data)
+        row = run(service.db.get_task(task_id))
+        meta = dict(row.metadata)
+        meta.setdefault("attachments", [])
+        meta["attachments"].append(
+            {
+                "filename": name,
+                "rel_path": f".lotsa/attachments/{name}",
+                "mime": "image/png",
+                "size_bytes": len(data),
+                "created_at": "2026-07-02T00:00:00+00:00",
+            }
+        )
+        run(service.db.update_task(task_id, metadata=meta))
+
+    def test_no_attachments_leaves_prompt_untouched(self, service, run):
+        run(service.create_task("Plain task"))
+        run(asyncio.sleep(0.2))
+        assert service.runner.calls, "first step should have dispatched"
+        assert ".lotsa/attachments" not in service.runner.calls[0]["user_prompt"]
+
+    def test_attachment_copied_into_worktree_and_listed_in_prompt(self, service, run):
+        run(service.create_task("Attach task"))
+        run(asyncio.sleep(0.2))
+        task_id = run(service.list_tasks_async())[0].id
+        assert run(service.db.get_task(task_id)).status == "waiting"
+
+        self._seed_attachment(service, run, task_id, data=b"PNGDATA")
+
+        before = len(service.runner.calls)
+        run(service.revise(task_id, "Please look at the screenshot"))
+        run(asyncio.sleep(0.2))
+        assert len(service.runner.calls) > before, "revise must re-dispatch the agent"
+
+        call = service.runner.calls[-1]
+        # The prompt block names the worktree-relative path for the Read tool.
+        assert ".lotsa/attachments/bug.png" in call["user_prompt"]
+        assert "Read" in call["user_prompt"]
+
+        # The file was copied into the worktree the agent actually ran in.
+        work_dir = Path(call["work_dir"])
+        copied = work_dir / ".lotsa" / "attachments" / "bug.png"
+        assert copied.exists()
+        assert copied.read_bytes() == b"PNGDATA"
+        # And the managed ignore is in place so it never gets committed.
+        assert "*" in (work_dir / ".lotsa" / ".gitignore").read_text()
+
+    def test_materialization_is_idempotent_across_redispatch(self, service, run):
+        run(service.create_task("Attach task"))
+        run(asyncio.sleep(0.2))
+        task_id = run(service.list_tasks_async())[0].id
+        self._seed_attachment(service, run, task_id, data=b"PNGDATA")
+
+        run(service.revise(task_id, "first pass"))
+        run(asyncio.sleep(0.2))
+        run(service.revise(task_id, "second pass"))
+        run(asyncio.sleep(0.2))
+
+        call = service.runner.calls[-1]
+        work_dir = Path(call["work_dir"])
+        attach_dir = work_dir / ".lotsa" / "attachments"
+        # Re-dispatch neither duplicated the file nor errored the task.
+        assert [p.name for p in attach_dir.iterdir()] == ["bug.png"]
+        assert ".lotsa/attachments/bug.png" in call["user_prompt"]
+        assert run(service.db.get_task(task_id)).status == "waiting"

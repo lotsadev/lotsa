@@ -720,3 +720,213 @@ class TestProcessesEndpointPromotionFields:
                     assert "promotion_inputs" in entry
 
         run(_test())
+
+
+class TestAttachmentsEndpoint:
+    """``POST/GET /api/tasks/{id}/attachments`` — prompt file attachments (Path A).
+
+    The raw-body upload endpoint stores bytes on disk and records only JSON
+    metadata in ``tasks.metadata``. Written before the endpoint exists, so the
+    POST/GET currently 404/405 — that is the expected red.
+    """
+
+    @staticmethod
+    async def _new_task(service):
+        task = await service.create_task("Attach task")
+        await wait_for_completion(service, task.id)
+        return task
+
+    @staticmethod
+    def _attach_dir(service, task_id, project_id="default"):
+        return service.config.data_dir / "attachments" / project_id / task_id
+
+    def test_upload_png_stores_bytes_and_lists_it(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            data = b"\x89PNG\r\n\x1a\nscreenshot-bytes"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=shot.png",
+                    content=data,
+                    headers={"content-type": "image/png"},
+                )
+                assert resp.status_code == 200
+                record = resp.json()
+                assert record["filename"] == "shot.png"
+                assert record["rel_path"] == ".lotsa/attachments/shot.png"
+                assert record["size_bytes"] == len(data)
+
+                # Bytes live under {data_dir}/attachments/{project}/{task}/.
+                stored = self._attach_dir(service, task.id) / "shot.png"
+                assert stored.exists()
+                assert stored.read_bytes() == data
+
+                # Listing endpoint surfaces it.
+                listing = await client.get(f"/api/tasks/{task.id}/attachments")
+                assert listing.status_code == 200
+                names = [a["filename"] for a in listing.json()]
+                assert names == ["shot.png"]
+
+            # Metadata carries the record (audit log does not — see below).
+            fresh = await service.db.get_task(task.id)
+            assert [a["filename"] for a in fresh.metadata["attachments"]] == ["shot.png"]
+
+        run(_test())
+
+    def test_accepts_any_file_type(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                for name, ctype in [
+                    ("doc.pdf", "application/pdf"),
+                    ("data.csv", "text/csv"),
+                    ("sheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                ]:
+                    resp = await client.post(
+                        f"/api/tasks/{task.id}/attachments?filename={name}",
+                        content=b"payload-bytes",
+                        headers={"content-type": ctype},
+                    )
+                    assert resp.status_code == 200, f"{name} should be accepted (no type filtering)"
+                    assert resp.json()["filename"] == name
+
+        run(_test())
+
+    def test_traversal_filename_is_sanitized(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=../../evil.sh",
+                    content=b"#!/bin/sh\n",
+                    headers={"content-type": "text/x-sh"},
+                )
+                assert resp.status_code == 200
+                assert resp.json()["filename"] == "evil.sh"
+
+            # Nothing escaped the task's own attachment directory.
+            assert (self._attach_dir(service, task.id) / "evil.sh").exists()
+            assert not (service.config.data_dir / "attachments" / "evil.sh").exists()
+
+        run(_test())
+
+    def test_rejects_oversized_file(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            oversized = b"\0" * (25 * 1024 * 1024 + 1)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=big.bin",
+                    content=oversized,
+                    headers={"content-type": "application/octet-stream"},
+                )
+                assert resp.status_code == 400 or resp.status_code == 413
+            # Rejected upload leaves no record.
+            fresh = await service.db.get_task(task.id)
+            assert not fresh.metadata.get("attachments")
+
+        run(_test())
+
+    def test_rejects_eleventh_file(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                for i in range(10):
+                    resp = await client.post(
+                        f"/api/tasks/{task.id}/attachments?filename=f{i}.txt",
+                        content=b"x",
+                        headers={"content-type": "text/plain"},
+                    )
+                    assert resp.status_code == 200, f"file {i} should succeed"
+                # The 11th is rejected — count cap is per task, across its lifetime.
+                overflow = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=f10.txt",
+                    content=b"x",
+                    headers={"content-type": "text/plain"},
+                )
+                assert overflow.status_code == 400
+
+            fresh = await service.db.get_task(task.id)
+            assert len(fresh.metadata["attachments"]) == 10
+
+        run(_test())
+
+    def test_duplicate_name_is_suffixed_not_overwritten(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                first = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=bug.png",
+                    content=b"AAAA",
+                    headers={"content-type": "image/png"},
+                )
+                second = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=bug.png",
+                    content=b"BBBB",
+                    headers={"content-type": "image/png"},
+                )
+                assert first.json()["filename"] == "bug.png"
+                assert second.json()["filename"] == "bug (1).png"
+
+            root = self._attach_dir(service, task.id)
+            assert (root / "bug.png").read_bytes() == b"AAAA"
+            assert (root / "bug (1).png").read_bytes() == b"BBBB"
+
+        run(_test())
+
+    def test_unknown_task_is_404(self, app_with_service, run):
+        app, _ = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                post = await client.post(
+                    "/api/tasks/deadbeef/attachments?filename=x.png",
+                    content=b"x",
+                    headers={"content-type": "image/png"},
+                )
+                assert post.status_code == 404
+                get = await client.get("/api/tasks/deadbeef/attachments")
+                assert get.status_code == 404
+
+        run(_test())
+
+    def test_attachment_bytes_absent_from_audit_log(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+            marker = b"ATTACHMENT_CONTENT_MARKER_XYZ"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=note.txt",
+                    content=marker,
+                    headers={"content-type": "text/plain"},
+                )
+                assert resp.status_code == 200
+                # The audit/message log must never carry the uploaded bytes —
+                # only tasks.metadata does (spec AC 4).
+                messages = await client.get(f"/api/tasks/{task.id}/messages")
+                assert messages.status_code == 200
+                assert all("ATTACHMENT_CONTENT_MARKER_XYZ" not in m["content"] for m in messages.json())
+
+        run(_test())
