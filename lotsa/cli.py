@@ -264,10 +264,11 @@ def promote(task_id: str, process: str, context: str | None, host: str, port: in
     "--flow",
     default=None,
     help=(
-        "Process to load. Bundled: chat/simple/standard/full/quickfix. Custom: any name "
-        "defined in lotsa.yaml's `processes:` block. Default: the inline "
-        "entry with default:true, or 'chat' if none. Free-form string — "
-        "validation happens at startup against the loaded catalog."
+        "Process the new-task picker pre-selects. Bundled (ADR-043): chat (Think) / "
+        "build (Execute, full depth) / fix (Execute, shallow). Custom: any name "
+        "defined in lotsa.yaml's `processes:` block. The full catalog always loads; "
+        "this only sets the default selection. Default: the inline entry with "
+        "default:true, or 'chat' if none."
     ),
 )
 @click.option(

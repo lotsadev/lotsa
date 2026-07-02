@@ -936,7 +936,7 @@ def _make_service_with_inline_processes(tmp_path, run, *, processes: dict[str, A
 
     Since ADR-034 ``start()`` always loads the full bundled catalog
     (``PRESET_NAMES``) alongside any inline ``processes:`` — there is no
-    single-preset "backstop" loader anymore. ``flow="full"`` below therefore
+    single-preset "backstop" loader anymore. ``flow="build"`` below therefore
     only selects which already-loaded process is the active/default one (an
     inline ``default: true`` entry still outranks it); it does not gate what
     loads.
@@ -961,7 +961,7 @@ def _make_service_with_inline_processes(tmp_path, run, *, processes: dict[str, A
         work_dir=tmp_path,
         # Explicit active/default selection for tests that want a non-chat
         # default (``chat`` is the package default since ADR-034).
-        flow="full",
+        flow="build",
         prompts_dir=prompts_dir,
         model="sonnet",
         budget=5.0,
@@ -999,10 +999,10 @@ def test_start_loads_inline_processes_into_catalog(tmp_path, run):
         # All inline processes are loaded into the catalog...
         assert "marketing_research" in svc._processes
         assert "support_triage" in svc._processes
-        # ...alongside the active (bundled "full") process.
-        assert "full" in svc._processes
-        # The active process is the bundled "full" — no inline default was set.
-        assert svc.process is svc._processes["full"]
+        # ...alongside the active (bundled "build") process.
+        assert "build" in svc._processes
+        # The active process is the bundled "build" — no inline default was set.
+        assert svc.process is svc._processes["build"]
     finally:
         run(svc.shutdown())
         run(svc.db.close())
@@ -1230,7 +1230,7 @@ def test_inline_default_silent_when_config_flow_is_package_default(tmp_path, run
         },
         prompts=["research"],
     )
-    # The helper sets flow="full" for its bundled fallback; override to the
+    # The helper sets flow="build" for its bundled fallback; override to the
     # package default so this test exercises the "operator chose nothing" path.
     svc.config.flow = "chat"
     assert svc.config.flow == "chat"
@@ -1370,7 +1370,7 @@ flows:
     config = LotsaConfig(
         data_dir=tmp_path / "data",
         work_dir=tmp_path,
-        flow="standard",  # explicit non-default value — should trigger warning
+        flow="build",  # explicit non-default value — should trigger warning
         flow_file=file_process_yaml,
         prompts_dir=prompts_dir,
         model="sonnet",
@@ -1391,7 +1391,7 @@ flows:
         assert svc.process.name == "from_file"
         # ...and the operator sees a warning naming the ignored flow value.
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("flow-file" in m and "standard" in m for m in warnings), (
+        assert any("flow-file" in m and "build" in m for m in warnings), (
             f"Expected a startup WARNING that --flow-file outranks flow; got: {warnings!r}"
         )
     finally:
@@ -1452,7 +1452,7 @@ def test_create_task_labels_task_with_active_process_not_config_flow(tmp_path, r
     # Sanity check the fixture: config.flow is "full" but the active
     # process is the inline default. This is exactly the divergence the
     # bug exploited — without the fix, ``flow_name`` would be "full".
-    assert svc.config.flow == "full"
+    assert svc.config.flow == "build"
     run(svc.start())
     try:
         assert svc._active_process_name == "marketing_research"
@@ -1531,7 +1531,7 @@ def test_start_unknown_flow_name_mentions_inline_catalog(tmp_path, run):
     try:
         message = str(exc_info.value)
         # Bundled presets surfaced.
-        assert "simple" in message and "standard" in message and "full" in message, (
+        assert "build" in message and "fix" in message and "chat" in message, (
             f"Unknown-flow error must list bundled presets; got: {message!r}"
         )
         # Inline catalog surfaced.
@@ -1683,7 +1683,7 @@ def test_start_loads_full_bundled_catalog(tmp_path, run):
         # The picker only renders for ≥2 processes; surfacing all five satisfies
         # ADR-034 §3 / acceptance #1 (``GET /api/processes`` returns ≥5).
         summaries = svc.list_processes_summary()
-        assert len(summaries) >= 5, (
+        assert len(summaries) >= 3, (
             f"expected the full catalog (≥5 processes) in the API summary, got {[s['name'] for s in summaries]}"
         )
     finally:
@@ -1722,12 +1722,12 @@ def test_flow_full_selects_active_without_restricting_catalog(tmp_path, run):
     """
     from lotsa.flows import PRESET_NAMES
 
-    svc = _make_catalog_service(tmp_path, run, flow="full")
+    svc = _make_catalog_service(tmp_path, run, flow="build")
     run(svc.start())
     try:
         # ``--flow full`` picks full as the active/default selection...
-        assert svc._active_process_name == "full"
-        assert svc.process is svc._processes["full"]
+        assert svc._active_process_name == "build"
+        assert svc.process is svc._processes["build"]
         # ...but every other bundled preset is still loaded and pickable.
         for name in PRESET_NAMES:
             assert name in svc._processes, f"--flow full must not restrict the catalog; {name!r} missing"

@@ -21,10 +21,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-_FULL = Path(__file__).resolve().parents[1] / "prompts" / "full"
+_FULL = Path(__file__).resolve().parents[1] / "prompts" / "build"
 
 _PRODUCERS = ("test", "code", "verify", "pr-fix")
-_NON_PRODUCERS = ("spec", "plan", "review")
+# ADR-043 dissolved the ``spec`` step; ``plan``/``review`` remain non-producers.
+_NON_PRODUCERS = ("plan", "review")
 
 
 def _load_jobs() -> dict[str, dict]:

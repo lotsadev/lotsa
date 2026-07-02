@@ -85,6 +85,11 @@ export const stopAgent = (taskId: string) =>
 export const archiveTask = (taskId: string) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/archive`, { method: 'POST' })
 
+// ADR-043 — operator escape hatch: drive a non-terminal task to `complete`
+// (for GitHub-less setups / a task parked at `awaiting_operator`).
+export const markCompleteTask = (taskId: string) =>
+  apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/mark-complete`, { method: 'POST' })
+
 // ADR-027 — switch a task to a different loaded process mid-life. The seeded
 // artifacts are keyed by the destination's promotion_inputs (or a generic
 // "promotion_context"), which the destination's first step reads.

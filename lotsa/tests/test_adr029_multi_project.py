@@ -205,7 +205,7 @@ class TestProjectConfig:
 
         repo = _init_git_repo(tmp_path / "repo")
         cfg = repo / "lotsa.yaml"
-        cfg.write_text(yaml.dump({"work_dir": ".", "model": "sonnet", "flow": "standard"}))
+        cfg.write_text(yaml.dump({"work_dir": ".", "model": "sonnet", "flow": "build"}))
         config = LotsaConfig.load(config_path=cfg, data_dir=tmp_path / "data")
         # ``.`` resolves against the CWD, so run the resolution from inside the repo.
         monkeypatch.chdir(repo)
@@ -770,7 +770,7 @@ class TestPromptPortability:
     """
 
     def test_review_prompt_file_uses_template(self):
-        text = (BUNDLED_PROMPTS / "full" / "review-system.md").read_text()
+        text = (BUNDLED_PROMPTS / "build" / "review-system.md").read_text()
         assert "{lotsa_prompts_dir}/review/SKILL.md" in text
         assert "{lotsa_prompts_dir}/review/checklist.md" in text
         # The old repo-relative form must be gone.
@@ -779,12 +779,12 @@ class TestPromptPortability:
     def test_build_system_prompt_injects_prompts_dir(self, tmp_path, run):
         from lotsa.flows import build_process
 
-        process = build_process("full")
+        process = build_process("build")
         review_step = next(s for s in process.flows["main"].jobs if s.prompt_name == "review")
 
         db = TaskDB(tmp_path / "lotsa.db")
         run(db.initialize())
-        config = LotsaConfig(data_dir=tmp_path, work_dir=tmp_path, flow="full")
+        config = LotsaConfig(data_dir=tmp_path, work_dir=tmp_path, flow="build")
         svc = OrchestratorService(config, db)
         svc.runner = FakeRunner()
         # Wire the active flow without a full start() (no project validation needed).

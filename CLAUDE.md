@@ -129,6 +129,7 @@ contract or introduces a new top-level dependency.
 | 040 | Restart-resilient orchestration — the DB is the state of record; resume in-flight agents (and idempotent step re-runs) instead of blocking on restart (**Proposed** — post-launch, high priority; ships paired with ADR-033) | CE |
 | 041 | Project toolchain & environment provisioning — declared `setup`/`test`/`build`/`lint` + per-project cache + optional per-project `image:`; egress Open by default and pluggable (ADR-031's upstream Layer 0) (**Proposed** — post-launch) | CE |
 | 042 | `lotsa deploy` CLI — bundle the deploy assets in the wheel, ship + run the installer over ssh from a declarative `deploy.yaml`; PyPI install by default; Debian/Ubuntu + systemd target with a fail-fast platform preflight (**Implemented**) | CE |
+| 043 | Two-phase Think→Execute task model — three-process catalog (`chat`/`build`/`fix`) replaces the flat five presets; ungated build, PR-primary Execute, operator mark-complete + `awaiting_operator` escape hatch; fixes the ADR-013 `standard` violation (**Implemented** — supersedes ADR-014's catalog; amends ADR-027/030/034) | CE |
 
 Design rationale for a specific area belongs in that directory's `CLAUDE.md`
 or in an ADR. This index is the registry.

@@ -1,1 +1,0 @@
-Review the changes on the current feature branch. Detect the default branch with `git rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's|origin/||'` (fallback: `main`), then run `git diff <default-branch>...HEAD` to see what was changed. Review for correctness, test coverage, and code quality.

@@ -270,7 +270,7 @@ def test_full_process_has_no_synthetic_pr_phase_states():
     """The new full process must NOT register ``pushing`` / ``waiting_for_pr`` / ``rebasing``."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     states = main.state_machine.states
 
@@ -283,7 +283,7 @@ def test_full_process_has_push_pr_action_state():
     """The ``push_pr`` action job contributes a state addressable by rule targets."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     push_pr = next(j for j in process.jobs if j.name == "push_pr")
     assert push_pr.type == "action"
     assert push_pr.tool == "push_pr"
@@ -294,7 +294,7 @@ def test_full_process_has_wait_for_pr_signal_monitor_state():
     by name."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     monitor = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     assert monitor.type == "monitor"
     assert monitor.engine == "pr_monitor"
@@ -306,7 +306,7 @@ def test_main_flow_review_fail_routes_to_code():
     """Per-flow override: in ``main``, REVIEW_FAIL routes to ``code``."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     review_binding = next(b for b in main.bindings if b.name == "review")
     fail_rules = [r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern]
@@ -318,7 +318,7 @@ def test_pr_fix_flow_review_fail_routes_to_pr_fix():
     """Per-flow override: in ``pr_fix``, REVIEW_FAIL routes back to ``pr-fix``."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     review_binding = next(b for b in pr_fix.bindings if b.name == "review")
     fail_rules = [r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern]
@@ -330,7 +330,7 @@ def test_pr_fix_flow_has_no_verify_step():
     """The pr_fix flow skips verify — supersedes the PR #62 stopgap heuristic."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     assert not any(b.name == "verify" for b in pr_fix.bindings)
 
@@ -407,7 +407,7 @@ def test_pr_fix_flow_skipped_targets_wait_for_pr_signal():
     """``PR_FIX_SKIPPED:`` in the pr_fix flow targets the monitor by name."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
     skipped_rules = [r for r in (pr_fix_binding.rules or []) if "SKIPPED" in r.pattern]
@@ -499,7 +499,7 @@ def test_flow_config_has_no_pr_config_attribute():
     """``FlowConfig`` no longer carries a ``pr_config`` attribute."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     assert not hasattr(main, "pr_config")
 
@@ -509,29 +509,29 @@ def test_flow_config_has_no_pr_config_attribute():
 # ---------------------------------------------------------------------------
 
 
-def test_bundled_full_process_file_exists():
-    """The ``full`` preset is loaded from ``prompts/full/process.yaml``."""
+def test_bundled_build_process_file_exists():
+    """The ``build`` preset is loaded from ``prompts/build/process.yaml`` (ADR-043)."""
     from lotsa.flows import BUNDLED_PROMPTS
 
-    assert (BUNDLED_PROMPTS / "full" / "process.yaml").is_file()
+    assert (BUNDLED_PROMPTS / "build" / "process.yaml").is_file()
 
 
-def test_bundled_simple_process_file_exists():
+def test_bundled_fix_process_file_exists():
     from lotsa.flows import BUNDLED_PROMPTS
 
-    assert (BUNDLED_PROMPTS / "simple" / "process.yaml").is_file()
+    assert (BUNDLED_PROMPTS / "fix" / "process.yaml").is_file()
 
 
-def test_bundled_standard_process_file_exists():
+def test_bundled_chat_process_file_exists():
     from lotsa.flows import BUNDLED_PROMPTS
 
-    assert (BUNDLED_PROMPTS / "standard" / "process.yaml").is_file()
+    assert (BUNDLED_PROMPTS / "chat" / "process.yaml").is_file()
 
 
 def test_legacy_flow_yaml_files_are_removed():
     """The old ``flow.yaml`` files must be deleted to prevent split-brain loading."""
     from lotsa.flows import BUNDLED_PROMPTS
 
-    for preset in ("simple", "standard", "full"):
+    for preset in ("chat", "build", "fix"):
         legacy = BUNDLED_PROMPTS / preset / "flow.yaml"
         assert not legacy.exists(), f"{legacy} should be deleted; replaced by process.yaml"

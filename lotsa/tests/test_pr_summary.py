@@ -531,7 +531,7 @@ async def test_push_pr_falls_back_when_pr_description_missing(tmp_path):
 def test_full_process_has_pr_summary_agent_step():
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     job = next((j for j in process.jobs if j.name == "pr_summary"), None)
     assert job is not None, "full preset must declare a pr_summary job"
     assert job.type == "agent"
@@ -542,7 +542,7 @@ def test_pr_summary_declares_no_required_inputs():
     """pr_summary must not declare ``inputs`` — a missing spec must not block it."""
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     job = next(j for j in process.jobs if j.name == "pr_summary")
     assert job.inputs == []
 
@@ -550,7 +550,7 @@ def test_pr_summary_declares_no_required_inputs():
 def test_pr_summary_sits_between_verify_and_push_pr_in_main():
     from lotsa.flows import build_process
 
-    process = build_process("full")
+    process = build_process("build")
     names = [b.name for b in process.flows["main"].bindings]
     assert "pr_summary" in names
     assert names.index("verify") < names.index("pr_summary") < names.index("push_pr")
@@ -559,7 +559,7 @@ def test_pr_summary_sits_between_verify_and_push_pr_in_main():
 def test_verify_routes_to_pr_summary_and_pr_summary_routes_to_push_pr():
     from lotsa.flows import build_process
 
-    main = build_process("full").flows["main"]
+    main = build_process("build").flows["main"]
     by_name = {rj.name: rj for rj in main.jobs}
     assert by_name["verify"].success_state == by_name["pr_summary"].queue_state
     assert by_name["pr_summary"].success_state == by_name["push_pr"].queue_state
@@ -568,12 +568,12 @@ def test_verify_routes_to_pr_summary_and_pr_summary_routes_to_push_pr():
 def test_pr_fix_flow_has_no_pr_summary_step():
     from lotsa.flows import build_process
 
-    pr_fix = build_process("full").flows["pr_fix"]
+    pr_fix = build_process("build").flows["pr_fix"]
     assert not any(b.name == "pr_summary" for b in pr_fix.bindings)
 
 
 def test_pr_summary_prompt_files_exist():
     from lotsa.flows import BUNDLED_PROMPTS
 
-    assert (BUNDLED_PROMPTS / "full" / "pr_summary-system.md").is_file()
-    assert (BUNDLED_PROMPTS / "full" / "pr_summary-user.md").is_file()
+    assert (BUNDLED_PROMPTS / "build" / "pr_summary-system.md").is_file()
+    assert (BUNDLED_PROMPTS / "build" / "pr_summary-user.md").is_file()

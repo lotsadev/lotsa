@@ -19,6 +19,7 @@ from lotsa.orchestrator import (
     ApproveNotAllowed,
     ArchiveFailed,
     ArchiveNotAllowed,
+    MarkCompleteNotAllowed,
     OrchestratorService,
     ProcessNotFound,
     ProjectNotFound,
@@ -403,6 +404,17 @@ async def promote_task(request: Request, task_id: str, body: PromoteRequest) -> 
         await service.promote_task(task_id, body.to_process, body.initial_artifacts)
     except PromoteNotAllowed as exc:
         raise _bad_request(exc, "PROMOTE_NOT_ALLOWED") from None
+    return await _build_task_detail(service, task_id)
+
+
+@router.post("/tasks/{task_id}/mark-complete")
+async def mark_complete_task(request: Request, task_id: str) -> TaskDetailFullResponse:
+    """Operator escape hatch (ADR-043) — drive a non-terminal task to ``complete``."""
+    service = _get_service(request)
+    try:
+        await service.mark_complete(task_id)
+    except MarkCompleteNotAllowed as exc:
+        raise _bad_request(exc, "MARK_COMPLETE_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)
 
 

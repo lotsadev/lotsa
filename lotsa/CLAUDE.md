@@ -74,12 +74,13 @@ lotsa/
 │   └── static/dist/    — built frontend output (**gitignored** — run `npm run build` in `lotsa/frontend/` before `lotsa serve`)
 ├── frontend/           — Vite + React + shadcn/ui dashboard (ADR-012)
 ├── prompts/            — bundled process presets and standalone prompts:
-│                         simple/, standard/, full/ — each carries a
-│                         process.yaml + {step}-system.md + {step}-user.md
-│                         (ADR-014 process catalog). chat/ holds the
-│                         task-creation prompt; review/ holds the
-│                         /review skill (SKILL.md + checklist.md), not
-│                         a process.
+│                         build/, fix/ — each carries a process.yaml +
+│                         {step}-system.md + {step}-user.md (ADR-014/043
+│                         process catalog); build/ also holds the generic
+│                         review/pr-fix/resolve_conflicts/pr_summary prompts
+│                         that fix/ reuses. chat/ holds the Think-phase
+│                         prompt; review/ holds the /review skill (SKILL.md +
+│                         checklist.md), not a process.
 ├── tests/              — pytest, mirrors module layout
 ├── Dockerfile.agent    — base image for --docker mode
 └── README.md           — user-facing quickstart and CLI reference
@@ -272,17 +273,21 @@ states, no special-case branches in the dispatcher. `action` and `agent`
 jobs contribute `queue_state` + `active_state`; `monitor` jobs contribute
 a single state.
 
-### Bundled process presets
+### Bundled process presets — the two-phase Think→Execute catalog (ADR-043)
 
-| Preset      | Pipeline                                                           |
-|-------------|--------------------------------------------------------------------|
-| `simple`    | `coding → complete \| blocked`                                     |
-| `standard`  | `coding → complete \| blocked` (with branching + validation + commit) |
-| `full`      | `speccing → planning → planned (gate) → testing → coding → reviewing → verifying → complete` |
+| Process | Phase | Pipeline |
+|---------|-------|----------|
+| `chat`  | **Think** — interactive, never writes code | one conversational REPL step; can distill a spec on request; ends by handoff or abandon |
+| `build` | **Execute (full depth)** | `plan → testing → coding → reviewing → verifying → summarizing → push → wait_for_pr_signal` |
+| `fix`   | **Execute (shallow depth)** | `coding → reviewing → push → wait_for_pr_signal` |
 
-`full` additionally includes the PR pipeline (pr_summary → push →
-wait_for_pr_signal), with `pr_fix` as a sub-flow that handles inbound
-feedback.
+`build` and `fix` both include `pr_fix` as a sub-flow that handles inbound PR
+feedback, and both end in a push + `pr_monitor` watch (ADR-030). `build`'s
+`plan` is the **ungated** first step (ADR-043 dropped the plan gate); the task
+body — or a spec carried from chat via `promotion_inputs: draft_spec` — is the
+brief, so no step declares `inputs`. The former `simple`/`standard`/`full`/
+`quickfix` presets are removed; "full SDLC" is now the *workflow* chat→build,
+not a process.
 
 The `pr_summary` step (state `summarizing`) is an agent step that runs
 immediately before `push_pr`. It reads the **branch diff** (ground truth for
@@ -429,7 +434,7 @@ change:
 
 ```bash
 cd lotsa/frontend && npm run build
-cd ../.. && lotsa serve --process full --budget 50
+cd ../.. && lotsa serve --process build --budget 50
 ```
 
 Or — equivalently — wrap the two in a shell alias / one-liner.
@@ -530,7 +535,7 @@ Common `lotsa serve` flags:
 
 | Flag              | Default                | Description                              |
 |-------------------|------------------------|------------------------------------------|
-| `--flow`          | `chat`                 | Default-selected process for new tasks (ADR-034) — a bundled name (`chat`/`simple`/`standard`/`full`/`quickfix`) or any inline name from `lotsa.yaml`'s `processes:` block. The full catalog always loads; this only picks the picker's pre-selected default, not what loads |
+| `--flow`          | `chat`                 | Default-selected process for new tasks (ADR-034/043) — a bundled name (`chat`/`build`/`fix`) or any inline name from `lotsa.yaml`'s `processes:` block. The full catalog always loads; this only picks the picker's pre-selected default, not what loads |
 | `--process`       | —                      | Alias for `--flow`; either works         |
 | `--flow-file`     | —                      | Standalone `process.yaml` file (highest priority — overrides `--flow`/`--process` and inline `default: true`) |
 | `--model`         | `sonnet`               | Claude model name                        |
@@ -719,8 +724,8 @@ operator had already framed.
 If the full scope is genuinely unworkable in one session, the right
 move is to surface that via `NEEDS_INPUT` (planner) or report a
 scope gap (coder), not to ship a quietly narrowed result. See
-`lotsa/prompts/full/planning-system.md` Step 1-2 and
-`lotsa/prompts/full/coding-system.md` Step 4.5 for the prompt-level
+`lotsa/prompts/build/planning-system.md` Step 1-2 and
+`lotsa/prompts/build/coding-system.md` Step 4.5 for the prompt-level
 rules.
 
 ---
@@ -787,3 +792,17 @@ rules.
   contract). The epic owns the shared artifacts, tracks children to
   terminal, and absorbs mid-flight divergence by revising the contract and
   re-issuing to affected children. Scopes the read-only slice of ADR-026.
+- ADR-043 — Two-phase Think→Execute task model (**Implemented**). The flat
+  five-preset catalog collapses to three processes on a think→execute axis:
+  `chat` (Think), `build` (Execute, full depth), `fix` (Execute, shallow).
+  `build` = `full` minus the spec/plan *gates* (`plan` is an ungated first
+  step; all `inputs` dropped; the task body / carried `draft_spec` is the
+  brief). `fix` = the former `quickfix` that now pushes + opens a PR. Both end
+  in `push_pr → wait_for_pr_signal`. Adds the `awaiting_operator` parked status
+  and the operator `mark_complete` action (`POST /tasks/{id}/mark-complete`) —
+  the GitHub-less escape hatch, shaped like ADR-030's non-edge-gated terminal
+  CAS. Generic prompts live in `build/`; `fix` falls back to them. Removes the
+  ADR-013 `standard` git-in-prompt violation. Legacy rows under removed process
+  names route to `blocked` on restart (clean break). Supersedes ADR-014's
+  catalog; amends ADR-027 (handoff framing), ADR-030 (mark-complete terminal),
+  ADR-034 (chat is the entry mode).

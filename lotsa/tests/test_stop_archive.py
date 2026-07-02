@@ -482,7 +482,7 @@ class TestArchivedInvariant:
     def test_transition_task_noop_on_archived(self, tmp_path, run):
         """A stale PR-monitor ``transition_task`` callback must not un-archive
         a task whose preserved ``state`` still has an outgoing edge."""
-        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+        with service_ctx(run, tmp_path, flow="build") as (svc, db):
 
             async def _t():
                 transitions = svc.flow.state_machine.transitions
@@ -490,7 +490,7 @@ class TestArchivedInvariant:
                 assert complete_srcs, "test setup: full flow should have an edge into 'complete'"
                 state = complete_srcs[0]
 
-                task = await db.create_task("Archived w/ edge", flow_name="full", state=state, status="archived")
+                task = await db.create_task("Archived w/ edge", flow_name="build", state=state, status="archived")
                 await svc.transition_task(task.id, "complete")
 
                 row = await db.get_task(task.id)
@@ -502,7 +502,7 @@ class TestArchivedInvariant:
     def test_block_noop_on_archived(self, tmp_path, run):
         """``block()`` on an archived task is a no-op (no transition, no
         ``Task blocked`` message)."""
-        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+        with service_ctx(run, tmp_path, flow="build") as (svc, db):
 
             async def _t():
                 transitions = svc.flow.state_machine.transitions
@@ -510,7 +510,7 @@ class TestArchivedInvariant:
                 assert blocked_srcs, "test setup: full flow should have an edge into 'blocked'"
                 state = blocked_srcs[0]
 
-                task = await db.create_task("Archived blockable", flow_name="full", state=state, status="archived")
+                task = await db.create_task("Archived blockable", flow_name="build", state=state, status="archived")
                 await svc.block(task.id)
 
                 row = await db.get_task(task.id)
@@ -523,7 +523,7 @@ class TestArchivedInvariant:
     def test_jump_to_step_noop_on_archived(self, tmp_path, run):
         """``jump_to_step()`` must treat ``archived`` as terminal (like
         complete/abandoned) and return early without reopening the task."""
-        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+        with service_ctx(run, tmp_path, flow="build") as (svc, db):
 
             async def _t():
                 jobs = svc.flow.jobs
@@ -531,7 +531,7 @@ class TestArchivedInvariant:
                 start_state = jobs[0].queue_state
                 target_name = jobs[1].name
 
-                task = await db.create_task("Archived jump", flow_name="full", state=start_state, status="archived")
+                task = await db.create_task("Archived jump", flow_name="build", state=start_state, status="archived")
                 await svc.jump_to_step(task.id, target_name)
 
                 row = await db.get_task(task.id)

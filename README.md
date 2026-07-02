@@ -22,9 +22,9 @@ Lotsa makes the process **structural**. You define the pipeline — the steps, t
 
 - **Tests get written. The diff gets reviewed** by a fresh agent with no implementation bias. **The build gets verified** before a PR opens. These aren't lines in a prompt the model might honour — they're steps the system executes, in order, every time, collecting proof as it goes.
 - **Git stays safe.** Agents only edit and commit inside an isolated per-task worktree; branching, pushing, and PR creation are deterministic and operator-owned — never the agent's.
-- **Humans gate what matters.** Approve the plan before any code is written; let everything else run unattended.
+- **Humans gate what matters.** Scope and approve the work at the chat→Execute handoff; let everything else run unattended.
 
-And the pipeline is yours to shape — the steps, gates, and routing live in a `process.yaml` you control (start from the bundled `chat` / `standard` / `full` flows, or write your own). The rules Lotsa enforces are the ones *you* wrote down.
+And the pipeline is yours to shape — the steps, gates, and routing live in a `process.yaml` you control (start from the bundled `chat` / `build` / `fix` flows, or write your own). The rules Lotsa enforces are the ones *you* wrote down.
 
 The point: your rules are enforced by the orchestration layer, not by the model remembering them — so task #100 gets the same rigor as task #1.
 
@@ -34,8 +34,8 @@ The point: your rules are enforced by the orchestration layer, not by the model 
 
 Three beats: **scope it in chat, let it run, verify the result.** Everything below serves that loop.
 
-- **Runs tasks end to end.** Hand Lotsa a task and it drives your flow — chat → spec → plan → *(your approval)* → tests → code → review → verify → PR — dispatching the agent at each step.
-- **Starts as a conversation.** Every task opens in **chat**: talk the work through, then **promote** it into a structured process when you know what you want. Pick the depth per task.
+- **Runs tasks end to end.** Hand Lotsa a task and it drives your flow — chat → *(hand off)* → plan → tests → code → review → verify → PR — dispatching the agent at each step.
+- **Starts as a conversation.** Every task opens in **chat** (the Think phase): talk the work through, then **hand it off** to Execute — **Build** (full SDLC) or **Quick fix** (mechanical) — when you know what you want. Pick the depth per task.
 - **Owns git safely, follows the PR to merge.** Deterministic, orchestrator-owned commits and pushes. Lotsa opens the PR and keeps watching it — when a reviewer or CI leaves actionable feedback, it dispatches a fix, pushes again, and re-runs its own review, automatically, until the PR is merged. You're not the one ferrying review comments back to an agent.
 - **Leaves a trail.** Every dispatch, routing decision, and artifact is recorded in the local SQLite store — the full event history of each task, so you can always see *why* it did what it did.
 - **Runs a fleet.** Many tasks at once, across many repos, from one dashboard you leave running. The work continues whether you're at the keyboard or not.
@@ -60,13 +60,11 @@ Lotsa doesn't replace the tools you code with — use it *alongside* them. Reach
 
 Say you want to add rate limiting to an API endpoint:
 
-1. **Open a task in chat** and talk it through — the endpoint, the limits, the edge cases — until you're aligned. Then **promote** it to the `full` process.
-2. **Spec → Plan.** The agent reads the repo, writes a spec, cuts a fresh branch, and drafts an implementation plan — then stops at a gate.
-3. **You approve the plan** (or send it back) from the dashboard. That's the one decision that needs you.
-4. **Test → Code → Review → Verify** run unattended: failing tests first, code to make them pass, a *fresh* agent reviews the diff with no implementation bias, and the build is verified.
-5. **Lotsa opens the PR** and keeps watching it — when CI or a reviewer leaves actionable feedback, it dispatches a fix and pushes again.
+1. **Open a task in chat** and talk it through — the endpoint, the limits, the edge cases — until you're aligned. Have the agent distill a **spec** if you like. That handoff is the one decision that needs you.
+2. **Hand it off to Build.** The agent takes over autonomously: reads the repo and drafts a plan, writes failing tests, codes to make them pass, then a *fresh* agent reviews the diff with no implementation bias, and the build is verified.
+3. **Lotsa opens the PR** and keeps watching it — when CI or a reviewer leaves actionable feedback, it dispatches a fix and pushes again, until it's merged.
 
-You spent thirty seconds approving a plan. Meanwhile three other tasks ran the same way, in other repos, in parallel.
+You spent a minute in chat and one click to hand off. Meanwhile three other tasks ran the same way, in other repos, in parallel.
 
 ## Who it's for
 
@@ -126,62 +124,44 @@ States depend on the task's process (see [Processes](#processes) below).
 
 ## Processes
 
-A **process** is the full job catalog — every step a task can take, plus the flows that string them together. Lotsa ships five bundled processes; you can also define your own inline in `lotsa.yaml` or as standalone `process.yaml` files.
+A **process** is the full job catalog — every step a task can take, plus the flows that string them together. Lotsa ships **three** bundled processes on a single **Think→Execute** axis; you can also define your own inline in `lotsa.yaml` or as standalone `process.yaml` files.
 
-New tasks default to `chat` (ADR-034): a fresh `lotsa serve` opens a task as a conversation you grow from, then **promote** into a structured process (`full`, `quickfix`, …) when you know what you're building. The whole bundled catalog plus every inline process is always loaded, so each one is pickable per-task in the new-task picker and a valid promotion target — `--process <name>` / `--flow <name>` (or `lotsa.yaml`'s `flow:` field, or an inline entry's `default: true`) only chooses **which process the picker pre-selects** as the default. Pass `--flow full` to make full the default for an operator who always builds; drop the flag for chat-first.
+New tasks default to `chat` (ADR-034/043): a fresh `lotsa serve` opens a task as a conversation you grow from (the **Think** phase), then **hand it off** to Execute — **Build** (`build`) for a full SDLC pass, or **Quick fix** (`fix`) for a mechanical change — when you know what you're building. The handoff is one-way but the running task stays steerable. The whole bundled catalog plus every inline process is always loaded, so each one is pickable per-task and a valid handoff target — `--process <name>` / `--flow <name>` (or `lotsa.yaml`'s `flow:` field, or an inline entry's `default: true`) only chooses **which process the picker pre-selects**. Pass `--flow build` to default to Execute; drop the flag for chat-first.
+
+| Process | Phase | Pipeline |
+|---------|-------|----------|
+| `chat` (default) | **Think** — explore, triage, never writes code | `backlog → chatting (conversational) → hand off` |
+| `build` | **Execute — full depth** | `backlog → planning → testing → coding → reviewing → verifying → summarizing → push_pr → wait_for_pr_signal → complete` |
+| `fix`   | **Execute — shallow depth** | `backlog → coding → reviewing → push_pr → wait_for_pr_signal → complete` |
 
 ### Bundled processes
 
-#### `chat` (default) — explore and triage
+#### `chat` (default) — Think: explore and triage
+
+A single conversational step, no completion marker and no commit pressure. New tasks start here out of the box: discuss the work with the agent, and — on request — have it distill a **spec**. When you're ready, **hand off** to `build` or `fix`; the worktree, history, and any spec carry over. This is the zero-config default.
+
+#### `build` — Execute: plan, test, code, review, verify, PR loop
+
+Six agent-dispatched steps plus an automated PR-monitoring phase — the full SDLC, minus the spec/plan human gates:
+
+1. **Plan** — agent reads the codebase and writes an implementation plan (ungated; its reasoning carries forward). The task body, or a spec carried from chat, is the brief
+2. **Test** — agent writes failing tests (resumes the same session)
+3. **Code** — agent implements to make the tests pass (resumes the same session)
+4. **Review** — agent reviews the diff independently (fresh session, no implementation bias); `REVIEW_FAIL` loops back to code
+5. **Verify** — conversational; agent confirms what was built before opening the PR
+6. **Push & monitor** — the `push_pr` action opens the PR, then `wait_for_pr_signal` polls GitHub. Reviewer comments and failing checks dispatch a `pr_fix` sub-flow that re-runs review and pushes again until merged
+
+There is no plan gate — the operator's touchpoint is the chat→build handoff. Every commit is orchestrator-owned (agents never branch, commit, or push).
+
+#### `fix` — Execute: execute a precise instruction
 
 ```
-backlog → chatting (conversational) → promote into another process
+backlog → coding → reviewing → push_pr → wait_for_pr_signal → complete | blocked
 ```
 
-A single conversational step, no completion marker and no commit pressure. New tasks start here out of the box: discuss the work with the agent, and when you're ready, **promote** the task into a structured process (`full`, `quickfix`, `standard`, `simple`) — the worktree and history carry over. This is the zero-config default.
+For a mechanical change you've already decided on (status bumps, typo fixes, renames, config/dependency tweaks): the coder executes the instruction directly — no spec, no plan, no test-writing — review checks the diff against that instruction, and it opens a PR and watches it to terminal. A common handoff target from `chat` when the conversation lands on a small, well-defined edit.
 
-#### `simple` — implement only
-
-```
-backlog → coding → complete | blocked
-```
-
-Agent implements the task directly in the working directory. No branching, no committing. Good for quick scripts or learning.
-
-#### `standard` — branch, implement, commit
-
-```
-backlog → coding → complete | blocked
-```
-
-Agent creates a feature branch, implements the task, runs validation (lint/test), commits, and reports a summary. A good middle ground for real development work — select it per task in the new-task picker, or make it the picker's default with `--flow standard`.
-
-#### `full` — spec, plan, test, code, review, verify, PR loop
-
-```
-backlog → speccing → planning → planned (human gate) → testing → coding → reviewing → verifying → push_pr → wait_for_pr_signal → complete | blocked
-```
-
-Six agent-dispatched steps plus a human gate and an automated PR-monitoring phase:
-
-1. **Spec** — conversational; agent and operator iterate on the task description until the agent emits `SPEC_COMPLETE: <title>`. The resulting spec is persisted as a `spec` artifact for downstream steps to consume
-2. **Plan** — agent reads codebase, creates feature branch, writes implementation plan
-3. **Approve** — human reviews the plan in the dashboard and approves it
-4. **Test** — agent writes failing tests (resumes same session)
-5. **Code** — agent implements to make tests pass (resumes same session)
-6. **Review** — agent reviews the diff independently (fresh session, no implementation bias)
-7. **Verify** — conversational; agent walks through what was built and confirms it matches the spec before opening the PR
-8. **Push & monitor** — the `push_pr` action job opens the PR, then the `wait_for_pr_signal` monitor polls GitHub. Reviewer comments and failing checks dispatch a `pr_fix` sub-flow that re-runs review and pushes again until merged
-
-The `planned` state is a **human gate** — no dispatch rule targets it. The task waits in the dashboard until you approve or reject it.
-
-#### `quickfix` — execute a precise instruction
-
-```
-backlog → coding → reviewing → complete | blocked
-```
-
-For a mechanical change you've already decided on (status bumps, typo fixes, renames, config/dependency tweaks): the coder executes the instruction directly — no spec, no plan, no test-writing — and review checks the diff against that instruction. A common promotion target from `chat` when the conversation lands on a small, well-defined edit.
+> **GitHub-less setups:** every Execute run pushes and opens a PR by default. If you have no GitHub configured, a task parks in **Awaiting you** and a **Mark complete** control drives it to a terminal state.
 
 ### Custom processes
 
@@ -442,7 +422,7 @@ Start the dashboard. Reads `lotsa.yaml` from `--data-dir` (default `~/.lotsa`). 
 
 ```bash
 lotsa serve                                # dashboard on 127.0.0.1:8420 (chat-first)
-lotsa serve --flow full                    # pre-select the full process in the picker
+lotsa serve --flow build                   # pre-select the build (Execute) process in the picker
 lotsa serve --process marketing            # pre-select an inline process from lotsa.yaml
 lotsa serve --flow-file my.yaml            # use a standalone process.yaml
 lotsa serve --model opus                   # use a specific model
@@ -457,7 +437,7 @@ lotsa serve --config /path/lotsa.yaml      # explicit config file
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--flow` | `chat` | Process the new-task picker pre-selects by default — a bundled name (`chat`/`simple`/`standard`/`full`/`quickfix`) or any inline name. The full catalog always loads; this only sets the default, it doesn't restrict what's available. |
+| `--flow` | `chat` | Process the new-task picker pre-selects by default — a bundled name (`chat`/`build`/`fix`) or any inline name. The full catalog always loads; this only sets the default, it doesn't restrict what's available. |
 | `--process` | — | Alias for `--flow`; either works |
 | `--flow-file` | — | Standalone `process.yaml` file (highest priority — overrides `--flow`/`--process` and inline `default: true`) |
 | `--model` | `sonnet` | Claude model name |

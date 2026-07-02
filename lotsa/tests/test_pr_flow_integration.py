@@ -20,7 +20,7 @@ from lotsa.flows import build_process
 
 def test_full_process_has_push_pr_action_and_wait_for_pr_signal_monitor():
     """The full process exposes the new typed PR-phase jobs."""
-    process = build_process("full")
+    process = build_process("build")
     push_pr = next(j for j in process.jobs if j.name == "push_pr")
     wait = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     assert push_pr.type == "action"
@@ -31,7 +31,7 @@ def test_full_process_has_push_pr_action_and_wait_for_pr_signal_monitor():
 
 def test_full_process_main_flow_has_no_synthetic_pr_states():
     """The new state machine has no ``pushing``/``waiting_for_pr``/``rebasing``."""
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     for synthetic in ("pushing", "waiting_for_pr", "rebasing"):
         assert synthetic not in main.state_machine.states, (
@@ -41,7 +41,7 @@ def test_full_process_main_flow_has_no_synthetic_pr_states():
 
 def test_full_process_main_review_fail_targets_code():
     """Per-flow override puts the autonomous code↔review loop in ``main``."""
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     review_binding = next(b for b in main.bindings if b.name == "review")
     fail = next(r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern)
@@ -50,13 +50,13 @@ def test_full_process_main_review_fail_targets_code():
 
 def test_full_process_pr_fix_has_no_verify_step():
     """The pr_fix sub-flow skips verify (supersedes PR #62 stopgap)."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     assert not any(b.name == "verify" for b in pr_fix.bindings)
 
 
 def test_pr_fix_flow_skipped_targets_wait_for_pr_signal():
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
     skipped = next(r for r in (pr_fix_binding.rules or []) if "SKIPPED" in r.pattern)
@@ -87,18 +87,31 @@ def test_custom_process_with_monitor_job(tmp_path):
     assert "watch" in process.flows["main"].state_machine.states
 
 
-def test_flow_without_monitor_has_no_pr_phase_states():
-    """Simple/standard processes have no monitor — no PR-phase states."""
-    for name in ("simple", "standard"):
-        process = build_process(name)
-        main = process.flows["main"]
-        for synthetic in ("pushing", "waiting_for_pr", "rebasing", "wait_for_pr_signal"):
-            assert synthetic not in main.state_machine.states
+def test_flow_without_monitor_has_no_pr_phase_states(tmp_path):
+    """A process with no monitor job has no PR-phase states. ADR-043's bundled
+    catalog (chat/build/fix) is either conversational or PR-terminated, so this
+    is exercised with a minimal single-step inline process."""
+    import yaml as _yaml
+
+    process_file = tmp_path / "nomonitor.yaml"
+    process_file.write_text(
+        _yaml.dump(
+            {
+                "process": "nomonitor",
+                "jobs": [{"name": "coding", "type": "agent", "prompt": "coding"}],
+                "flows": {"main": {"steps": ["coding"]}},
+            }
+        )
+    )
+    process = build_process("nomonitor", process_file=process_file)
+    main = process.flows["main"]
+    for synthetic in ("pushing", "waiting_for_pr", "rebasing", "wait_for_pr_signal"):
+        assert synthetic not in main.state_machine.states
 
 
 def test_full_process_pr_fix_review_fail_targets_pr_fix():
     """Per-flow override: in pr_fix, review's REVIEW_FAIL loops back to pr-fix."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     review_binding = next(b for b in pr_fix.bindings if b.name == "review")
     fail = next(r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern)
@@ -107,7 +120,7 @@ def test_full_process_pr_fix_review_fail_targets_pr_fix():
 
 def test_pr_fix_flow_pr_fix_active_to_wait_for_pr_signal_transition_registered():
     """SKIPPED routes ``pr-fix`` back into the monitor — the SM transition must exist."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_step = next(rj for rj in pr_fix.jobs if rj.name == "pr-fix")
     assert (pr_fix_step.active_state, "wait_for_pr_signal") in pr_fix.state_machine.transitions
@@ -126,7 +139,7 @@ def test_main_flow_has_sub_flow_entry_edge_into_pr_fix():
     Without the (wait_for_pr_signal, pr-fixing) edge, ``_dispatch_step``'s
     pre-CAS guard rejects the dispatch and the task stalls in ``working``.
     """
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
     assert (
@@ -144,7 +157,7 @@ def test_main_flow_has_sub_flow_exit_edges_back_through_pr_fix_rules():
     Each rule target that names a main-flow job needs the corresponding edge
     registered in main's SM, even though the rules live in the pr_fix sub-flow.
     """
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
     # PR_FIX_SKIPPED → wait_for_pr_signal
@@ -171,7 +184,7 @@ def test_pr_fix_flow_has_sub_flow_entry_edge_from_monitor():
     until the next server restart flips it to blocked. The companion runtime
     test below exercises the full path.
     """
-    process = build_process("full")
+    process = build_process("build")
     pr_fix_first = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
     assert (
         "wait_for_pr_signal",
@@ -481,7 +494,7 @@ def test_resolve_flow_returns_subflow_when_metadata_set(tmp_path):
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -579,7 +592,7 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -705,7 +718,7 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
         # "not a git repository").
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, capture_output=True)
         subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=tmp_path, capture_output=True)
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -803,7 +816,7 @@ def test_retry_review_in_pr_fix_advances_to_push_pr(tmp_path):
     try:
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -887,7 +900,7 @@ def test_answer_review_in_pr_fix_advances_to_push_pr(tmp_path):
     try:
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -962,7 +975,7 @@ def test_resolve_step_for_row_prefers_active_flow(tmp_path):
     try:
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -1026,7 +1039,7 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -1123,7 +1136,7 @@ def _stub_full_process_service(tmp_path, run):
     config = LotsaConfig(
         data_dir=tmp_path / "data",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1719,7 +1732,7 @@ def test_start_recovery_sweep_treats_legacy_pushing_state_as_action_state(tmp_pa
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )

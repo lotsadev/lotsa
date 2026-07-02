@@ -287,7 +287,7 @@ class TestArtifactCapture:
 
         # ADR-021: dispatch resolves the task's process from ``_processes``, so
         # swap the active catalog entry (not just ``self.flow``) to retarget.
-        proc = build_process("full")
+        proc = build_process("build")
         service.process = proc
         service._processes[service._active_process_name] = proc
         service.flow = proc.flows.get("main") or next(iter(proc.flows.values()))
@@ -1614,7 +1614,7 @@ class TestPrPhaseStates:
         from lotsa.flows import build_flow
 
         # The full flow has pr: config
-        flow = build_flow("full")
+        flow = build_flow("build")
         sm_states = set(flow.state_machine._states)
         assert "pushing" in sm_states
         assert "waiting_for_pr" in sm_states
@@ -1625,7 +1625,7 @@ class TestPrPhaseStates:
         """Flow without pr: config should NOT have pushing state."""
         from lotsa.flows import build_flow
 
-        flow = build_flow("simple")
+        flow = build_flow("build")
         sm_states = set(flow.state_machine._states)
         assert "pushing" not in sm_states
         assert "waiting_for_pr" not in sm_states
@@ -1634,7 +1634,7 @@ class TestPrPhaseStates:
         """With pr_config, the last job's success_state should be 'pushing'."""
         from lotsa.flows import build_flow
 
-        flow = build_flow("full")
+        flow = build_flow("build")
         last_job = flow.jobs[-1]
         assert last_job.success_state == "pushing"
 
@@ -1642,28 +1642,28 @@ class TestPrPhaseStates:
         """State machine should allow waiting_for_pr → complete."""
         from lotsa.flows import build_flow
 
-        flow = build_flow("full")
+        flow = build_flow("build")
         assert ("waiting_for_pr", "complete") in flow.state_machine._transitions
 
     def test_waiting_for_pr_to_abandoned_transition(self):
         """State machine should allow waiting_for_pr → abandoned."""
         from lotsa.flows import build_flow
 
-        flow = build_flow("full")
+        flow = build_flow("build")
         assert ("waiting_for_pr", "abandoned") in flow.state_machine._transitions
 
     def test_waiting_for_pr_to_pr_fix_transition(self):
         """State machine should allow waiting_for_pr → pr-fixing."""
         from lotsa.flows import build_flow
 
-        flow = build_flow("full")
+        flow = build_flow("build")
         assert ("waiting_for_pr", "pr-fixing") in flow.state_machine._transitions
 
     def test_pushing_to_rebasing_transition(self):
         """State machine should allow pushing → rebasing."""
         from lotsa.flows import build_flow
 
-        flow = build_flow("full")
+        flow = build_flow("build")
         assert ("pushing", "rebasing") in flow.state_machine._transitions
 
     @pytest.fixture()
@@ -4547,7 +4547,7 @@ class TestDispatchSubFlow:
         config = LotsaConfig(
             data_dir=data_dir,
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -4596,7 +4596,7 @@ class TestDispatchSubFlow:
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def _load_full_destination(service):
+def _load_build_destination(service):
     """Load the bundled ``full`` process into the service catalog as a
     promotion destination, returning it.
 
@@ -4607,9 +4607,9 @@ def _load_full_destination(service):
     """
     from lotsa.flows import build_process
 
-    full = build_process("full")
-    service._processes["full"] = full
-    return full
+    build = build_process("build")
+    service._processes["build"] = build
+    return build
 
 
 def _load_chat_destination(service):
@@ -4648,32 +4648,33 @@ class TestPromote:
     """
 
     def test_non_terminal_source_succeeds(self, service, run):
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
 
-        run(service.promote_task(task.id, "full"))
+        run(service.promote_task(task.id, "build"))
         run(asyncio.sleep(0.2))
 
         row = run(service.db.get_task(task.id))
         assert row is not None
         # Process identity switched to the destination, sub-flow context reset.
-        assert row.metadata.get("process_name") == "full"
+        assert row.metadata.get("process_name") == "build"
         assert row.metadata.get("current_flow") == "main"
-        # Entered the destination at its first step (``spec``).
-        assert row.current_step == "spec"
-        # State is one of the destination spec step's states (queue → active).
-        assert row.state in ("speccing", "spec"), f"unexpected state {row.state!r}"
+        # Entered the destination pipeline. ``plan`` is ungated (ADR-043), so with
+        # the FakeRunner it auto-advances rather than pausing at the first step —
+        # the invariant is that the task now runs a build step, not the chat REPL.
+        build_steps = {s.name for s in service._processes["build"].flows["main"].jobs}
+        assert row.current_step in build_steps, f"unexpected step {row.current_step!r}"
 
     def test_promote_updates_flow_name_label(self, service, run):
         """After promotion the ``flow_name`` label column tracks the new process
         (feeds ``TaskDetail.flow_name`` + audit), not just ``metadata``."""
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
-        run(service.promote_task(task.id, "full"))
+        run(service.promote_task(task.id, "build"))
         run(asyncio.sleep(0.1))
-        assert run(service.db.get_task(task.id)).flow_name == "full"
+        assert run(service.db.get_task(task.id)).flow_name == "build"
 
     def test_task_detail_uses_the_tasks_own_flow_not_the_active_default(self, service, run):
         """Regression: the task-detail endpoint must surface each task's OWN flow
@@ -4681,15 +4682,15 @@ class TestPromote:
         task showed the active flow's steps (e.g. the single ``chat`` stage)."""
         from lotsa.server.api_routes import _build_task_detail
 
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
-        run(service.promote_task(task.id, "full"))
+        run(service.promote_task(task.id, "build"))
         run(asyncio.sleep(0.1))
 
         detail = run(_build_task_detail(service, task.id))
         step_names = [s.name for s in detail.flow.steps]
-        assert "spec" in step_names, f"expected the full pipeline, got {step_names}"
+        assert "plan" in step_names, f"expected the build pipeline, got {step_names}"
         assert step_names != ["chat"], "still showing the chat flow's single stage"
 
     def test_chat_transcript_renders_user_and_assistant(self, service, run):
@@ -4704,20 +4705,20 @@ class TestPromote:
         """Regression: promoting from chat must hand the full conversation to the
         destination's first step (not just the truncated title), so `spec` doesn't
         report the request "cut off"."""
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         full_request = "the full request that the auto-title truncates badly mid-sentence"
         run(service.db.add_message(task.id, "user", "chat", full_request, "chat"))
         _wait_until_waiting(service, run, task.id)
 
-        run(service.promote_task(task.id, "full"))  # no explicit handover
+        run(service.promote_task(task.id, "build"))  # no explicit handover
         run(asyncio.sleep(0.1))
 
         draft = run(service.get_named_artifact(task.id, "draft_spec"))
         assert draft is not None, "promotion from chat should auto-seed draft_spec"
         assert full_request in draft
 
-    @pytest.mark.parametrize("dest", ["full", "quickfix", "standard", "simple"])
+    @pytest.mark.parametrize("dest", ["build", "fix"])
     def test_bundled_preset_promotable_without_manual_load(self, service, run, dest):
         """ADR-034 §1/§5 acceptance #4 — every bundled preset is a valid
         promotion destination straight out of the box, with no test-only
@@ -4729,7 +4730,7 @@ class TestPromote:
         standard / simple) raises ``PromoteNotAllowed('Unknown process …')``.
         ADR-034's ``start()`` loads the full bundled catalog, so each promotion
         now succeeds. This test deliberately does NOT call
-        ``_load_full_destination`` — that is the behaviour under test.
+        ``_load_build_destination`` — that is the behaviour under test.
         """
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
@@ -4747,19 +4748,19 @@ class TestPromote:
         assert row.metadata.get("current_flow") == "main"
 
     def test_records_process_promotion_audit_with_old_and_new(self, service, run):
-        full = _load_full_destination(service)  # noqa: F841 — loaded as destination
+        full = _load_build_destination(service)  # noqa: F841 — loaded as destination
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
         src_name = run(service.db.get_task(task.id)).metadata.get("process_name")
 
-        run(service.promote_task(task.id, "full"))
+        run(service.promote_task(task.id, "build"))
         run(asyncio.sleep(0.1))
 
         promo = run(service.db.get_messages(task.id, msg_type="process_promotion"))
         assert len(promo) == 1, "expected exactly one process_promotion audit row"
         meta = promo[0].metadata
         assert meta.get("old_process") == src_name
-        assert meta.get("new_process") == "full"
+        assert meta.get("new_process") == "build"
 
     def test_unknown_destination_rejected_and_unmutated(self, service, run):
         from lotsa.orchestrator import PromoteNotAllowed
@@ -4789,7 +4790,7 @@ class TestPromote:
         from lotsa.orchestrator import PromoteNotAllowed
 
         _load_chat_destination(service)
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
 
@@ -4799,7 +4800,7 @@ class TestPromote:
         msg = str(excinfo.value)
         assert "chat" not in msg, f"chat must not be offered as a promotion destination: {msg!r}"
         # A genuinely valid destination is still surfaced.
-        assert "full" in msg
+        assert "build" in msg
 
     def test_promote_to_chat_rejected_and_unmutated(self, service, run):
         """ADR-027 §7 — no demotion. Even with ``chat`` loaded as a valid
@@ -4829,7 +4830,7 @@ class TestPromote:
     def test_terminal_source_rejected_and_unmutated(self, service, run):
         from lotsa.orchestrator import PromoteNotAllowed
 
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
         # Drive the source to a terminal state (a legitimate precondition input,
@@ -4837,16 +4838,16 @@ class TestPromote:
         run(service.db.update_task(task.id, state="complete", status="complete"))
 
         with pytest.raises(PromoteNotAllowed):
-            run(service.promote_task(task.id, "full"))
+            run(service.promote_task(task.id, "build"))
 
         after = run(service.db.get_task(task.id))
-        assert after.metadata.get("process_name") != "full"
+        assert after.metadata.get("process_name") != "build"
         assert after.state == "complete"
 
     def test_archived_source_rejected_and_unmutated(self, service, run):
         from lotsa.orchestrator import PromoteNotAllowed
 
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
         # ``archived`` is status-only: ``archive()`` preserves the prior ``state``
@@ -4857,20 +4858,20 @@ class TestPromote:
         run(service.db.update_task(task.id, status="archived"))
 
         with pytest.raises(PromoteNotAllowed):
-            run(service.promote_task(task.id, "full"))
+            run(service.promote_task(task.id, "build"))
 
         after = run(service.db.get_task(task.id))
-        assert after.metadata.get("process_name") != "full"
+        assert after.metadata.get("process_name") != "build"
         assert after.status == "archived"
         assert after.state == prior_state
 
     def test_seeds_initial_artifacts_and_audit(self, service, run):
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
 
         draft = "# Draft spec\n\nBuild a cache layer."
-        run(service.promote_task(task.id, "full", {"draft_spec": draft}))
+        run(service.promote_task(task.id, "build", {"draft_spec": draft}))
         run(asyncio.sleep(0.1))
 
         # The artifact is readable under its declared name (so the destination's
@@ -4885,12 +4886,12 @@ class TestPromote:
         assert seeded[0].metadata.get("source") == "promotion"
 
     def test_dispatches_destination_first_step(self, service, run):
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
 
         before = len(service.runner.calls)
-        run(service.promote_task(task.id, "full"))
+        run(service.promote_task(task.id, "build"))
         run(asyncio.sleep(0.2))
 
         assert len(service.runner.calls) > before, "destination first step was not dispatched"
@@ -4898,12 +4899,12 @@ class TestPromote:
     def test_worktree_and_messages_preserved(self, service, run):
         """Promotion is not task creation — the message log accumulates across
         the switch (ADR-027 §1). The pre-promotion chat/feedback rows survive."""
-        _load_full_destination(service)
+        _load_build_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
         before_count = len(run(service.db.get_messages(task.id)))
 
-        run(service.promote_task(task.id, "full"))
+        run(service.promote_task(task.id, "build"))
         run(asyncio.sleep(0.1))
 
         after_count = len(run(service.db.get_messages(task.id)))
@@ -4918,24 +4919,24 @@ class TestAvailableProcessesRendering:
     (``AttributeError``)."""
 
     def test_renders_loaded_process_descriptions(self, service, run):
-        full = _load_full_destination(service)
+        full = _load_build_destination(service)
         full.description = "Full SDLC: spec, plan, test, code, review, verify, push."
 
         rendered = service._render_available_processes()
-        assert "full" in rendered
+        assert "build" in rendered
         assert "Full SDLC" in rendered
 
     def test_excludes_processes_without_a_description(self, service, run):
-        full = _load_full_destination(service)
+        full = _load_build_destination(service)
         full.description = None  # no description → not surfaced to triage
 
         rendered = service._render_available_processes()
-        # Match the rendered entry marker ``- full:`` rather than the bare word
-        # "full": ADR-034 auto-loads the whole catalog, and other presets'
-        # descriptions legitimately contain the substring "full" (e.g.
-        # "...warrant the full SDLC"). The invariant under test is that the
-        # description-less ``full`` process has no entry of its own.
-        assert "- full:" not in rendered
+        # Match the rendered entry marker ``- build:`` rather than the bare word
+        # "build": ADR-034 auto-loads the whole catalog, and other presets'
+        # descriptions legitimately contain the substring "build". The invariant
+        # under test is that the description-less ``build`` process has no entry
+        # of its own.
+        assert "- build:" not in rendered
 
     def test_excludes_the_chat_process_itself(self, service, run, tmp_path):
         from lotsa.flows import build_process_from_inline
@@ -4964,15 +4965,15 @@ class TestListProcessesSummaryPromotionFields:
     def test_summary_includes_description_and_promotion_inputs(self, service, run):
         from lotsa.flows import PromotionInput, build_process
 
-        full = build_process("full")
+        full = build_process("build")
         full.description = "Full SDLC"
         full.promotion_inputs = [
             PromotionInput(name="draft_spec", description="A spec to verify rather than re-elicit.")
         ]
-        service._processes["full"] = full
+        service._processes["build"] = full
 
         summaries = service.list_processes_summary()
-        full_summary = next(s for s in summaries if s["name"] == "full")
+        full_summary = next(s for s in summaries if s["name"] == "build")
         assert full_summary["description"] == "Full SDLC"
         assert full_summary["promotion_inputs"] == [
             {"name": "draft_spec", "description": "A spec to verify rather than re-elicit."}
@@ -5136,9 +5137,10 @@ def _git_porcelain(wt) -> str:
 
 @pytest.fixture()
 def full_service(tmp_path, _loop, run):
-    """A started OrchestratorService on the bundled ``full`` process.
+    """A started OrchestratorService on the bundled ``build`` process.
 
-    ``full`` carries the pr_fix sub-flow (and thus the ``pr-fix`` step and the
+    ``build`` (ADR-043, the Execute-at-full-depth process that replaced ``full``)
+    carries the pr_fix sub-flow (and thus the ``pr-fix`` step and the
     ``wait_for_pr_signal`` monitor state) that the sync precedes. ``push_pr``
     (the action tool) is stubbed so nothing reaches the real ``execute_push``
     via the action path; the autouse ``_isolated_registry`` fixture restores
@@ -5160,7 +5162,7 @@ def full_service(tmp_path, _loop, run):
     config = LotsaConfig(
         data_dir=tmp_path / "data",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )

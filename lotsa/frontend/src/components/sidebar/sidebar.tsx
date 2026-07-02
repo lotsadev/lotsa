@@ -52,6 +52,8 @@ function StatusIndicator({ task }: { task: TaskSummary }) {
       const prNumber = task.metadata?.pr_number
       return <Badge variant="outline" className="border-amber-500/40 text-amber-500 text-[10px] h-5 shrink-0">{prNumber ? `PR #${prNumber}` : 'PR'}</Badge>
     }
+    case 'awaiting_operator':
+      return <Badge variant="outline" className="border-amber-500/40 text-amber-500 text-[10px] h-5 shrink-0">Awaiting you</Badge>
     case 'complete':
       return <Badge variant="outline" className="border-primary/40 text-primary text-[10px] h-5 shrink-0">Done</Badge>
     case 'abandoned':

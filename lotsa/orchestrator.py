@@ -175,6 +175,17 @@ class PromoteNotAllowed(Exception):
     """
 
 
+class MarkCompleteNotAllowed(Exception):
+    """Raised when ``mark_complete`` is called for a missing or already-terminal
+    task (ADR-043).
+
+    Follows the ``ApproveNotAllowed`` / ``PromoteNotAllowed`` pattern — the route
+    maps it to a 400 ``MARK_COMPLETE_NOT_ALLOWED``. The operator escape hatch has
+    no state-aware preconditions beyond "non-terminal source": any non-terminal
+    task can be driven to ``complete`` (same shape as ADR-030's terminal signals).
+    """
+
+
 class ProcessNotFound(ValueError):
     """Raised when ``create_task`` is given a ``process_name`` that doesn't
     match any loaded process. The operator's recovery action is "add it to
@@ -1012,14 +1023,39 @@ class OrchestratorService:
                 # recorded against a non-default process is checked against that
                 # process's action states (not a global active-process set, which
                 # would mis-route it).
-                row_actions = self._action_states_by_process.get(self._process_name_for(row), set())
+                row_process = self._process_name_for(row)
+                row_actions = self._action_states_by_process.get(row_process, set())
                 push_state = row.state in row_actions or row.state in _legacy_push_states
                 # ``blocked`` is already terminal-for-restart (avoids duplicate
                 # recovery messages); ``archived`` is terminal full-stop and must
                 # never be reopened — an archived row preserves its prior ``state``
                 # (which may be an action/push state), so without this skip the
                 # ``push_state`` branch below would flip it to ``blocked``.
-                if row.status in ("blocked", "archived"):
+                if row.status in ("blocked", "archived", "complete", "abandoned"):
+                    continue
+                # ADR-043 clean break: a row persisted under a process name that
+                # is no longer in the loaded catalog (e.g. the removed
+                # ``simple``/``standard``/``full``/``quickfix`` presets) can't
+                # resolve a flow to continue on. Route it to ``blocked`` with a
+                # recovery message naming the removed process instead of leaving
+                # it stranded (it would never re-enter an active flow, and any
+                # dispatch that touched it would fail to resolve its process).
+                # We do NOT alias legacy names to the new catalog. Read the RAW
+                # recorded name here, not ``_process_name_for`` — that resolver
+                # silently falls back to the active process for unknown names,
+                # which would mask exactly the rows this branch must catch.
+                recorded_process = (row.metadata or {}).get("process_name")
+                if recorded_process is not None and recorded_process not in self._processes:
+                    await self._set_status(row.id, "blocked", row.current_step or row.state)
+                    await self.db.add_message(
+                        row.id,
+                        "system",
+                        row.current_step or row.state,
+                        f"Process {recorded_process!r} was removed in the two-phase "
+                        "Think→Execute upgrade (ADR-043). This task can't continue — "
+                        "start a new task in chat and hand it off to Build or Quick fix.",
+                        "status_change",
+                    )
                     continue
                 if row.status == "working" or push_state:
                     await self._set_status(row.id, "blocked", row.current_step or row.state)
@@ -1437,7 +1473,7 @@ class OrchestratorService:
 
         # Label the task with the resolved process name, not ``config.flow``.
         # The two diverge when an inline ``default: true`` entry overrides
-        # the configured ``flow:`` value (e.g. config.flow="full" but the
+        # the configured ``flow:`` value (e.g. config.flow="build" but the
         # active inline process is "marketing_research"), or when the caller
         # picks a non-active process (ADR-021). Using config.flow here would
         # surface the wrong label in audit logs and the TaskDetail.flow_name
@@ -3127,6 +3163,72 @@ class OrchestratorService:
         if target_state in ("complete", "abandoned"):
             item = Item(id=task.id, state=target_state, title=task.title, body=task.body, metadata=task.metadata)
             await self._cleanup_worktree_if_done(item)
+
+    async def mark_complete(self, task_id: str) -> None:
+        """Operator-initiated terminal action — drive a task to ``complete`` (ADR-043).
+
+        The GitHub-less escape hatch: an Execute run can finish the work the
+        orchestrator does automatically yet have no PR terminal signal to close
+        it (no GitHub configured, or a task parked at ``awaiting_operator``). The
+        operator marks it complete, and the task moves to the terminal
+        ``complete`` status from ANY non-terminal state.
+
+        Same shape as ADR-030's terminal signals (``transition_task``): the CAS
+        is NOT edge-gated against the flow SM (completion is global truth, not a
+        flow transition), so it works from a SM sink like ``blocked`` or a
+        sub-flow active state. Teardown mirrors ``archive``: cancel any in-flight
+        agent, untrack from the PR monitor, then complete and clean the worktree.
+
+        Idempotent on a lost CAS race (a concurrent completion / terminal signal
+        wins); an already-terminal task raises ``MarkCompleteNotAllowed``.
+        """
+        if self.flow is None:
+            raise RuntimeError("OrchestratorService not started")
+        row = await self.db.get_task(task_id)
+        if row is None:
+            raise MarkCompleteNotAllowed(f"Task {task_id} not found")
+        if row.status in ("complete", "abandoned", "archived") or row.state in ("complete", "abandoned"):
+            raise MarkCompleteNotAllowed(
+                f"Cannot mark a terminal task complete (status={row.status!r}, state={row.state!r})"
+            )
+
+        # 1. Stop any in-flight agent (shared cancel machinery).
+        await self._cancel_in_flight(task_id)
+
+        # 2. Untrack from the PR monitor if parked in a monitor state — mirrors
+        #    archive()/block(), resolving the engine against the task's OWN process.
+        _mon = self._monitor_state_for(row) or "waiting_for_pr"
+        if row.state in (_mon, "waiting_for_pr"):
+            engine = self._monitor_engine_for(row)
+            if engine is not None:
+                engine.untrack(task_id)
+
+        # 3. Terminal CAS from the task's fresh (status, state) — not edge-gated
+        #    (ADR-030 pattern). Re-read after the cancel so a completion the
+        #    drainer processed in between shifts ``from_status`` cleanly.
+        fresh = await self.db.get_task(task_id)
+        if fresh is None:
+            raise MarkCompleteNotAllowed(f"Task {task_id} not found")
+        if fresh.status in ("complete", "abandoned", "archived"):
+            return  # a concurrent terminal outcome already closed it — idempotent
+        result = await self.db.atomic_transition(
+            task_id,
+            from_status=fresh.status,
+            from_state=fresh.state,
+            to_state="complete",
+            to_status="complete",
+            to_current_step=None,
+            audit_on_win=AuditRow(
+                role="system",
+                step_name=fresh.current_step or fresh.state,
+                content="Marked complete by operator",
+                msg_type="status_change",
+            ),
+        )
+        if not result.won:
+            return  # lost the race — another caller already advanced this task
+        item = Item(id=row.id, state="complete", title=row.title, body=row.body, metadata=row.metadata)
+        await self._cleanup_worktree_if_done(item)
 
     async def dispatch_pr_fix(self, task_id: str, feedback: str) -> bool:
         """Dispatch a pr-fix step for a task (used by PrMonitor).
@@ -5045,7 +5147,7 @@ class OrchestratorService:
                                     # outcome with no recoverable path short of a
                                     # manual DB edit. Surface this in logs so a
                                     # custom-flow operator can spot the
-                                    # misconfiguration; the bundled "full" flow
+                                    # misconfiguration; the bundled "build" flow
                                     # registers ``(waiting_for_pr, blocked)`` via
                                     # ``_build_state_machine`` so this branch is
                                     # unreachable in production. Mirrors the
@@ -5674,7 +5776,7 @@ class OrchestratorService:
             # round-cap will keep firing on every future dispatch attempt with
             # no recoverable path short of a manual DB edit. Surface this in
             # logs so a custom-flow operator can spot the misconfiguration; the
-            # bundled "full" flow registers the needed transitions so this
+            # bundled "build" flow registers the needed transitions so this
             # branch is unreachable in production.
             logger.warning(
                 "pr-fix round cap fired for task %s but state machine has no (%r, 'blocked') transition; "

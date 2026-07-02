@@ -272,7 +272,7 @@ class Process:
 # Bundled presets
 # ---------------------------------------------------------------------------
 
-PRESET_NAMES = ("simple", "standard", "full", "chat", "quickfix")
+PRESET_NAMES = ("chat", "build", "fix")
 
 
 # ---------------------------------------------------------------------------
@@ -733,14 +733,16 @@ def _resolve_prompts_search_paths(
     if flow_name in PRESET_NAMES:
         paths.append(BUNDLED_PROMPTS / flow_name)
     else:
-        paths.append(BUNDLED_PROMPTS / "standard")
-    # ``quickfix`` ships only its distinctive ``coding`` prompts (the
-    # "execute this instruction" framing); its ``review`` job reuses the
-    # generic reviewer. Fall back to ``full`` so ``review-*`` resolves without
-    # duplicating the prompt text (ADR-027 §3 — review is generic across
-    # processes; quickfix's narrowness comes from the coder prompt).
-    if flow_name == "quickfix":
-        paths.append(BUNDLED_PROMPTS / "full")
+        paths.append(BUNDLED_PROMPTS / "build")
+    # ``fix`` ships only its distinctive ``coding`` prompt (the "execute this
+    # instruction" framing); its ``review`` / ``pr-fix`` / ``resolve_conflicts``
+    # jobs reuse the generic prompts. Fall back to ``build`` (which carries every
+    # generic diff/PR/git-driven prompt) so those resolve without duplicating the
+    # text (ADR-043 §8 / ADR-027 §3 — the generics are shared across processes;
+    # fix's narrowness comes from the coder prompt). Inline / unknown processes
+    # fall back to ``build`` via the ``else`` branch above for the same reason.
+    if flow_name == "fix":
+        paths.append(BUNDLED_PROMPTS / "build")
     return paths
 
 
@@ -1260,7 +1262,7 @@ def build_process_from_inline(
     resolved, gate_states = _resolve_jobs(jobs, bindings)
     sm = _build_state_machine(resolved, gate_states)
 
-    search_paths = [prompts_dir, BUNDLED_PROMPTS / "standard"]
+    search_paths = [prompts_dir, BUNDLED_PROMPTS / "build"]
     registry = PromptRegistry(search_paths=search_paths)
 
     flow = FlowConfig(
