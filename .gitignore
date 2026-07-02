@@ -31,3 +31,5 @@ node_modules/
 
 # Deploy secrets
 deploy/deploy.env
+deploy.yaml
+deploy/deploy.yaml
