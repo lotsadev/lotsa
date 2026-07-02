@@ -1,6 +1,10 @@
-# Lotsa
+<p align="center">
+  <img src="docs/assets/lotsa-logo.svg" alt="Lotsa" width="76">
+</p>
 
-**Describe a task, walk away, come back to a PR that followed your rules.**
+<h1 align="center">Lotsa</h1>
+
+<p align="center"><strong>Describe a task, walk away, come back to a PR that followed your rules.</strong></p>
 
 <p align="center">
   <img src="docs/assets/dashboard.png" alt="The Lotsa dashboard — tasks running across repos, every step visible" width="820">
