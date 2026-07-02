@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
 import { useTask } from '@/hooks/use-task'
 import { ChatMessage } from './chat-message'
+import { collapseNeedsInputMessages } from './needs-input'
 import { StageBar } from './stage-bar'
 import { ChatInput } from './chat-input'
 import { PeekBar } from '@/components/layout/peek-bar'
@@ -60,8 +61,12 @@ export function ChatPanel({ taskId, onOpenPanel }: ChatPanelProps) {
         className="flex-1 overflow-y-auto min-h-0"
       >
         <div className="mx-auto max-w-3xl px-4 py-4">
-          {data.messages.map((message) => (
-            <ChatMessage key={message.id} message={message} />
+          {collapseNeedsInputMessages(data.messages).map((item) => (
+            <ChatMessage
+              key={item.message.id}
+              message={item.message}
+              awaitingInput={item.awaitingInput}
+            />
           ))}
           <div ref={messagesEndRef} />
         </div>
