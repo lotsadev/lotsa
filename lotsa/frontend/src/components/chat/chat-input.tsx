@@ -10,8 +10,10 @@ import {
   retryTask,
   stopAgent,
   acknowledgeOverride,
+  uploadAttachment,
 } from '@/api/tasks'
 import type { TaskDetailFull } from '@/api/types'
+import { AttachmentPicker } from '@/components/attachment-picker'
 import { PromoteDialog } from './promote-dialog'
 
 interface ChatInputProps {
@@ -20,12 +22,31 @@ interface ChatInputProps {
 
 export function ChatInput({ data }: ChatInputProps) {
   const [inputValue, setInputValue] = useState('')
+  const [files, setFiles] = useState<File[]>([])
+  const [attachError, setAttachError] = useState<string | null>(null)
   const [reasonOpen, setReasonOpen] = useState(false)
   const [reasonText, setReasonText] = useState('')
   const [promoteOpen, setPromoteOpen] = useState(false)
   const queryClient = useQueryClient()
   const { task } = data
   const availableOverrides = data.available_overrides ?? []
+
+  // Upload any pending attachments to this task before the message dispatches,
+  // so the next step materializes them. Throws (aborting the send) if an upload
+  // fails, surfacing the error inline rather than sending a message that
+  // references files that never arrived.
+  const uploadPending = async () => {
+    setAttachError(null)
+    for (const f of files) {
+      try {
+        await uploadAttachment(task.id, f)
+      } catch (e) {
+        setAttachError(`Failed to attach ${f.name}: ${(e as Error).message}`)
+        throw e
+      }
+    }
+    setFiles([])
+  }
 
   // ADR-027 — promotion is valid from any non-terminal state. Mirror the
   // server-side guard in promote_task exactly: it rejects terminal tasks on
@@ -42,9 +63,27 @@ export function ChatInput({ data }: ChatInputProps) {
     setInputValue('')
   }
 
-  const sendMutation = useMutation({ mutationFn: () => sendMessage(task.id, inputValue), onSuccess })
-  const reviseMutation = useMutation({ mutationFn: () => reviseTask(task.id, inputValue), onSuccess })
-  const answerMutation = useMutation({ mutationFn: () => answerTask(task.id, inputValue), onSuccess })
+  const sendMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return sendMessage(task.id, inputValue)
+    },
+    onSuccess,
+  })
+  const reviseMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return reviseTask(task.id, inputValue)
+    },
+    onSuccess,
+  })
+  const answerMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return answerTask(task.id, inputValue)
+    },
+    onSuccess,
+  })
   const approveMutation = useMutation({ mutationFn: () => approveTask(task.id), onSuccess })
   const retryMutation = useMutation({ mutationFn: () => retryTask(task.id), onSuccess })
   const stopMutation = useMutation({ mutationFn: () => stopAgent(task.id), onSuccess })
@@ -267,6 +306,15 @@ export function ChatInput({ data }: ChatInputProps) {
         }}
         className="flex flex-wrap items-end gap-2"
       >
+        {task.status !== 'complete' && task.status !== 'abandoned' && (
+          <AttachmentPicker
+            files={files}
+            onChange={setFiles}
+            disabled={isPending}
+            error={attachError}
+            className="w-full basis-full"
+          />
+        )}
         <AutoGrowTextarea
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}

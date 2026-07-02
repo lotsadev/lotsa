@@ -1,5 +1,14 @@
 import { apiFetch } from './client'
-import type { TaskSummary, TaskDetailFull, Message, Flow, Process, Project, AgentActivity } from './types'
+import type {
+  TaskSummary,
+  TaskDetailFull,
+  Message,
+  Flow,
+  Process,
+  Project,
+  AgentActivity,
+  Attachment,
+} from './types'
 
 export const fetchTasks = () => apiFetch<TaskSummary[]>('/api/tasks')
 
@@ -34,6 +43,33 @@ export const createTask = (data: {
     method: 'POST',
     body: JSON.stringify(data),
   })
+
+export const fetchAttachments = (taskId: string) =>
+  apiFetch<Attachment[]>(`/api/tasks/${taskId}/attachments`)
+
+// Raw-body upload — one file per request. Bypasses apiFetch (which forces a
+// JSON Content-Type); the filename rides as a query param and the body is the
+// raw bytes. The server sanitizes the filename and enforces the size/count caps.
+export const uploadAttachment = async (taskId: string, file: File): Promise<Attachment> => {
+  const resp = await fetch(
+    `/api/tasks/${taskId}/attachments?filename=${encodeURIComponent(file.name)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    }
+  )
+  if (!resp.ok) {
+    let message = `${resp.status} ${resp.statusText}`
+    try {
+      const body = await resp.json()
+      if (body?.detail?.error) message = body.detail.error
+      else if (body?.error) message = body.error
+    } catch { /* non-JSON error body */ }
+    throw new Error(message)
+  }
+  return resp.json()
+}
 
 export const approveTask = (taskId: string) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/approve`, { method: 'POST' })

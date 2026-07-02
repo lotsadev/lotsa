@@ -560,6 +560,32 @@ class TaskDB:
         await self._execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
         await self._commit()
 
+    async def append_attachment(self, task_id: str, record: dict[str, Any], *, cap: int) -> bool:
+        """Atomically append one attachment record to ``metadata.$.attachments``.
+
+        A single UPDATE (no read-modify-write) so concurrent uploads to the same
+        task can't clobber each other's records — the metadata RMW caveat in the
+        class docstring is sidestepped by mutating the JSON in one statement. The
+        per-task ``cap`` is enforced in the WHERE clause: the append lands only
+        while the current array length is below the cap, so the count limit holds
+        even under a race.
+
+        Returns True when the record was appended, False when the cap was already
+        reached or the task no longer exists.
+        """
+        cur = await self._execute(
+            "UPDATE tasks SET metadata = json_set("
+            "  json_set(metadata, '$.attachments',"
+            "    COALESCE(json_extract(metadata, '$.attachments'), json('[]'))),"
+            "  '$.attachments[#]', json(?)"
+            "), updated_at = ? "
+            "WHERE id = ? AND "
+            "json_array_length(COALESCE(json_extract(metadata, '$.attachments'), '[]')) < ?",
+            (json.dumps(record), _now(), task_id, cap),
+        )
+        await self._commit()
+        return cur.rowcount == 1
+
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> TaskRow:
         return TaskRow(

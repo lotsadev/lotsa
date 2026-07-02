@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from lotsa.engines.pr_monitor import PrMonitorConfig
 
+from lotsa.attachments import materialize_into_worktree
 from lotsa.config import LotsaConfig, resolve_project_specs
 from lotsa.db import (
     PUSH_START,
@@ -4469,6 +4470,20 @@ class OrchestratorService:
                     user_prompt += f"\n\n## Revision Feedback\n\n{info.feedback}"
 
             work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
+
+            # Materialize operator-attached files into the worktree and append a
+            # path block so the agent can Read them (Path A). Idempotent — runs
+            # on every dispatch (creation, revision, next steps, pr-fix), so a
+            # file attached after the first dispatch still reaches later steps.
+            rel_paths = await self._materialize_attachments(item, work_dir)
+            if rel_paths:
+                listed = ", ".join(f"`{p}`" for p in rel_paths)
+                user_prompt += (
+                    "\n\n## Operator-attached files\n\n"
+                    "The operator attached these files — read them with the Read tool: "
+                    f"{listed}."
+                )
+
             result = await runner.run(
                 system_prompt=system,
                 user_prompt=user_prompt,
@@ -6125,6 +6140,30 @@ class OrchestratorService:
         if project is not None:
             return Path(project.path)
         return Path(self.config.work_dir)
+
+    async def _materialize_attachments(self, item: Item, work_dir: Path) -> list[str]:
+        """Copy the task's durable attachments into the worktree and return the
+        worktree-relative paths for the prompt block (Path A).
+
+        Re-reads the task row so a file attached *after* this dispatch was queued
+        is still picked up. Idempotent and best-effort — the copy runs off the
+        event loop (Constitution §2.1) and a missing durable source is skipped,
+        not fatal.
+        """
+        row = await self.db.get_task(item.id)
+        if row is None:
+            return []
+        records = row.metadata.get("attachments") or []
+        if not records:
+            return []
+        return await asyncio.to_thread(
+            materialize_into_worktree,
+            records,
+            self.config.data_dir,
+            row.project_id,
+            item.id,
+            work_dir,
+        )
 
     async def _sync_projects(self) -> None:
         """Seed/sync the ``projects`` table from ``lotsa.yaml`` at startup.

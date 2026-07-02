@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react'
 import { Send } from 'lucide-react'
-import { createTask } from '@/api/tasks'
+import { createTask, uploadAttachment } from '@/api/tasks'
 import { AutoGrowTextarea } from '@/components/ui/auto-grow-textarea'
 import { Button } from '@/components/ui/button'
+import { AttachmentPicker } from '@/components/attachment-picker'
 import { ProcessPicker } from '@/components/process-picker'
 import { ProjectPicker } from '@/components/project-picker'
 import { useProjects } from '@/hooks/use-projects'
@@ -17,6 +18,7 @@ const LAST_PROJECT_KEY = 'lotsa:lastProject'
 
 export function EmptyState({ onTaskCreated }: EmptyStateProps) {
   const [message, setMessage] = useState('')
+  const [files, setFiles] = useState<File[]>([])
   const [process, setProcess] = useState<string | undefined>(undefined)
   // An explicit picker selection; `undefined` means "use the remembered
   // default" computed below (no effect/setState — derived during render).
@@ -45,9 +47,20 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
     setIsCreating(true)
     setError(null)
     try {
+      // The task must exist before attachments can be posted to it, so create
+      // first, then upload each file sequentially (the count cap is per task).
       const result = await createTask({ message: trimmed, process, project })
+      for (const f of files) {
+        try {
+          await uploadAttachment(result.task.id, f)
+        } catch (e) {
+          setError(`Failed to attach ${f.name}: ${(e as Error).message}`)
+          return
+        }
+      }
       if (project) localStorage.setItem(LAST_PROJECT_KEY, project)
       setMessage('')
+      setFiles([])
       onTaskCreated(result.task.id)
     } catch {
       setError('Failed to create task')
@@ -85,6 +98,7 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
           minRows={7}
           className="w-full"
         />
+        <AttachmentPicker files={files} onChange={setFiles} disabled={isCreating} />
         {/* Below 768px the pickers stack full-width so they + Send don't
             overflow; at md they return to the side-by-side fixed-width row. */}
         <div className="flex flex-col gap-2 md:flex-row md:items-center">
