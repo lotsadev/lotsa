@@ -574,7 +574,7 @@ class OrchestratorService:
         self.process: Process | None = None
         # ``_processes`` is the catalog of every process loaded at start() time
         # — the FULL bundled catalog (``PRESET_NAMES``, each keyed by its preset
-        # name, e.g. ``full``/``chat``/``quickfix``) PLUS every entry from
+        # name, e.g. ``chat``/``build``/``fix``) PLUS every entry from
         # ``lotsa.yaml``'s ``processes:`` block, PLUS an explicit ``--flow-file``
         # process (keyed by its YAML's declared ``process:`` field). ADR-034 §1
         # loads every bundled preset (not just the active one) so each is a
@@ -595,8 +595,9 @@ class OrchestratorService:
         # ``_processes`` whose value is ``self.process``). For inline
         # processes this matches both the dict key and the process's
         # internal name. For bundled processes it's the preset name
-        # (``full``/``standard``/``simple``), which differs from the
-        # internal ``self.process.name`` (e.g. ``software_process``).
+        # (``chat``/``build``/``fix``); since ADR-043 each preset's internal
+        # ``process:`` field equals its preset name, so the two coincide (the
+        # former ``full`` → ``software_process`` split is gone).
         self._active_process_name: str = ""
         # ADR-023 — the dispatch path resolves a runner per dispatch from the
         # process-global registry (``resolve_runner``) instead of holding one
@@ -637,10 +638,10 @@ class OrchestratorService:
         # singletons (``_pr_monitor`` / ``_pr_monitor_config`` /
         # ``_action_states`` / ``_monitor_state``). Each is keyed by the
         # *catalog name* (the key in ``_processes`` / the value of a task's
-        # ``metadata['process_name']``), which for bundled processes differs
-        # from ``Process.name`` (``full`` → ``software_process``). Route every
-        # per-process lookup through ``_process_name_for(task)`` so the keying
-        # never diverges.
+        # ``metadata['process_name']``). Since ADR-043 each bundled preset's
+        # ``Process.name`` equals its catalog name (``build``/``fix``/``chat``);
+        # inline processes may still diverge, so route every per-process lookup
+        # through ``_process_name_for(task)`` so the keying never diverges.
         #
         # ``_pr_monitors_by_process`` holds one engine instance per
         # monitor-bearing process (the engine declared via the ``engine:`` field
@@ -828,7 +829,7 @@ class OrchestratorService:
         # ADR-034 §1 — load the FULL bundled catalog, not just the active preset.
         # Every preset becomes a pickable new-task option AND a valid promotion
         # target (ADR-027), which is the whole point of chat-first creation: a
-        # task starts in ``chat`` and is promoted into ``full``/``quickfix``/…
+        # task starts in ``chat`` and is promoted into ``build``/``fix``
         # without any of them being unreachable. Each preset is keyed by its
         # operator-facing name via the same ``build_process`` path the active
         # preset uses (DD2). The skip guard implements DD1 — an inline
@@ -890,8 +891,8 @@ class OrchestratorService:
             except ValueError as exc:
                 # ``build_process`` only knows about bundled presets; its
                 # "Choose from: {PRESET_NAMES}" message (interpolating the
-                # full ('simple', 'standard', 'full', 'chat', 'quickfix') tuple)
-                # omits the inline catalog the orchestrator also accepts.
+                # ('chat', 'build', 'fix') tuple) omits the inline catalog the
+                # orchestrator also accepts.
                 # Re-raise with the full set of valid names when the
                 # operator is in the no-file, not-a-preset branch — that
                 # case can only be reached by a misspelled inline name (a
@@ -1453,7 +1454,7 @@ class OrchestratorService:
             raise ProcessNotFound(
                 f"Unknown process {process_name!r}. Available: {available}. "
                 f"Add it to ``lotsa.yaml``'s ``processes:`` block, or load a "
-                f"bundled process by name (full/standard/simple)."
+                f"bundled process by name (chat/build/fix)."
             )
         resolved_process = self._processes[resolved_process_name]
         resolved_flow = resolved_process.flows.get("main") or next(iter(resolved_process.flows.values()))
@@ -1564,7 +1565,7 @@ class OrchestratorService:
         only ``metadata.process_name`` / ``metadata.current_flow`` / the state
         machine position move. Any work to carry forward is delivered as
         ``initial_artifacts`` (artifact-name → content), which the destination's
-        first-step prompt reads (e.g. ``full``'s spec step reads ``draft_spec``).
+        first-step prompt reads (e.g. ``build``'s planning step reads ``draft_spec``).
 
         Preconditions (else ``PromoteNotAllowed``): the task exists, the
         destination is loaded, and the task is not terminal. Per ADR-027 §5
@@ -1679,9 +1680,9 @@ class OrchestratorService:
         # Handover (ADR-027 §4). When the caller supplies no explicit context,
         # carry the chat conversation forward so the destination's first step has
         # the FULL discussion — not just the (truncated) task title. Without this,
-        # a task promoted from chat reaches e.g. ``spec`` with only ``{title}`` /
+        # a task promoted from chat reaches e.g. ``planning`` with only ``{title}`` /
         # empty ``{body}`` and reports the request "cut off". Seeded under both the
-        # generic ``promotion_context`` and ``draft_spec`` (what ``full``'s spec
+        # generic ``promotion_context`` and ``draft_spec`` (what ``build``'s planning
         # step reads); harmless extras for destinations that read neither.
         seed_artifacts = dict(initial_artifacts or {})
         if not seed_artifacts:
@@ -2326,7 +2327,7 @@ class OrchestratorService:
             return
 
         # ADR-014 Layer A — the monitor's live state is whatever the YAML job
-        # names (e.g. ``wait_for_pr_signal`` in the bundled ``full`` process);
+        # names (e.g. ``wait_for_pr_signal`` in the bundled ``build`` process);
         # the legacy synthetic ``"waiting_for_pr"`` is still recognized so
         # tasks persisted under the old model untrack correctly during a
         # mid-rollout block(). Without both checks, untrack silently no-ops
@@ -3179,8 +3180,10 @@ class OrchestratorService:
         sub-flow active state. Teardown mirrors ``archive``: cancel any in-flight
         agent, untrack from the PR monitor, then complete and clean the worktree.
 
-        Idempotent on a lost CAS race (a concurrent completion / terminal signal
-        wins); an already-terminal task raises ``MarkCompleteNotAllowed``.
+        Idempotent only when a concurrent *terminal* outcome (completion /
+        merge / archive) wins the race; a lost CAS against a non-terminal shift
+        re-reads and retries (up to 5 attempts) rather than silently no-opping.
+        An already-terminal task raises ``MarkCompleteNotAllowed``.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
@@ -3204,31 +3207,42 @@ class OrchestratorService:
                 engine.untrack(task_id)
 
         # 3. Terminal CAS from the task's fresh (status, state) — not edge-gated
-        #    (ADR-030 pattern). Re-read after the cancel so a completion the
-        #    drainer processed in between shifts ``from_status`` cleanly.
-        fresh = await self.db.get_task(task_id)
-        if fresh is None:
-            raise MarkCompleteNotAllowed(f"Task {task_id} not found")
-        if fresh.status in ("complete", "abandoned", "archived"):
-            return  # a concurrent terminal outcome already closed it — idempotent
-        result = await self.db.atomic_transition(
-            task_id,
-            from_status=fresh.status,
-            from_state=fresh.state,
-            to_state="complete",
-            to_status="complete",
-            to_current_step=None,
-            audit_on_win=AuditRow(
-                role="system",
-                step_name=fresh.current_step or fresh.state,
-                content="Marked complete by operator",
-                msg_type="status_change",
-            ),
-        )
-        if not result.won:
-            return  # lost the race — another caller already advanced this task
-        item = Item(id=row.id, state="complete", title=row.title, body=row.body, metadata=row.metadata)
-        await self._cleanup_worktree_if_done(item)
+        #    (ADR-030 pattern). Re-read + CAS in a retry loop mirroring
+        #    ``archive()``: a concurrent path (drainer, PR monitor) can advance
+        #    ``(status, state)`` to a NON-terminal value between the re-read and
+        #    the CAS, so a single attempt would lose and return without
+        #    completing the task. Re-read each attempt and only treat a lost CAS
+        #    as idempotent when the fresh status is genuinely terminal.
+        for _ in range(5):
+            fresh = await self.db.get_task(task_id)
+            if fresh is None:
+                raise MarkCompleteNotAllowed(f"Task {task_id} not found")
+            if fresh.status in ("complete", "abandoned", "archived"):
+                return  # a concurrent terminal outcome already closed it — idempotent
+            result = await self.db.atomic_transition(
+                task_id,
+                from_status=fresh.status,
+                from_state=fresh.state,
+                to_state="complete",
+                to_status="complete",
+                to_current_step=None,
+                audit_on_win=AuditRow(
+                    role="system",
+                    step_name=fresh.current_step or fresh.state,
+                    content="Marked complete by operator",
+                    msg_type="status_change",
+                ),
+            )
+            if result.won:
+                item = Item(id=row.id, state="complete", title=row.title, body=row.body, metadata=row.metadata)
+                await self._cleanup_worktree_if_done(item)
+                return
+            # Lost the CAS against a NON-terminal shift — re-read and retry.
+
+        # Every attempt lost against a moving non-terminal state — surface the
+        # non-convergence rather than returning a false success. Effectively
+        # unreachable under CE's single-writer SQLite, but the contract holds.
+        raise MarkCompleteNotAllowed(f"mark_complete() did not converge for task {task_id} after 5 attempts")
 
     async def dispatch_pr_fix(self, task_id: str, feedback: str) -> bool:
         """Dispatch a pr-fix step for a task (used by PrMonitor).
@@ -3793,7 +3807,23 @@ class OrchestratorService:
             )
         except PushError as exc:
             error_msg = str(exc)
-            target_state = "rebasing" if error_msg.startswith("NON_FAST_FORWARD:") else "blocked"
+            # ADR-043 escape hatch: a GitHub-less setup parks in
+            # ``awaiting_operator`` (status_change, not error) so the operator
+            # can Mark complete — symmetric with the ``push_pr`` action path's
+            # ``no_github`` handling. Otherwise NON_FAST_FORWARD → rebasing and
+            # any other failure → blocked, both surfaced as status='blocked'.
+            if error_msg.startswith("NO_GITHUB:"):
+                target_state = "awaiting_operator"
+                target_status = "awaiting_operator"
+                audit_msg_type = "status_change"
+                error_msg = (
+                    f"Code is committed on `lotsa/{item.id}`. No GitHub configured — "
+                    "review the worktree and Mark complete when done."
+                )
+            else:
+                target_state = "rebasing" if error_msg.startswith("NON_FAST_FORWARD:") else "blocked"
+                target_status = "blocked"
+                audit_msg_type = "error"
             # Atomic CAS — the previous source.save → add_message → _set_status
             # sequence had a brief window where DB held (state=target_state,
             # status='working'), which UI polls could render as "still pushing".
@@ -3805,13 +3835,13 @@ class OrchestratorService:
                 from_status="working",
                 from_state="pushing",
                 to_state=target_state,
-                to_status="blocked",
+                to_status=target_status,
                 to_current_step="push",
                 audit_on_win=AuditRow(
                     role="system",
                     step_name="push",
                     content=error_msg,
-                    msg_type="error",
+                    msg_type=audit_msg_type,
                 ),
             )
             if not result.won:
@@ -4223,6 +4253,39 @@ class OrchestratorService:
 
         if not result.success:
             error_kind = (result.metadata or {}).get("error_kind")
+            # ADR-043 escape hatch: a push that fails only because no GitHub is
+            # configured is not a "blocked" failure — the code is committed on
+            # ``lotsa/<task_id>`` and the operator can Mark complete after
+            # reviewing the worktree. Park it in ``awaiting_operator`` via a
+            # non-edge-gated CAS (the ADR-030 pattern — this is a task-lifecycle
+            # outcome, not a flow edge, so it works even when the process YAML
+            # registers no ``(active_state, "awaiting_operator")`` edge). On CAS
+            # loss a concurrent block()/transition already owns the row; skip.
+            if error_kind == "no_github":
+                park = await self.db.atomic_transition(
+                    item.id,
+                    from_status="working",
+                    from_state=item.state,
+                    to_state="awaiting_operator",
+                    to_status="awaiting_operator",
+                    to_current_step=step.name,
+                    audit_on_win=AuditRow(
+                        role="system",
+                        step_name=step.job_type,
+                        content=(
+                            f"Code is committed on `lotsa/{item.id}`. No GitHub configured — "
+                            "review the worktree and Mark complete when done."
+                        ),
+                        msg_type="status_change",
+                    ),
+                )
+                if not park.won:
+                    return
+                item.state = "awaiting_operator"
+                await self.source.append_event(
+                    item.id, {"type": "dispatch", "job_type": step.job_type, "success": False}
+                )
+                return
             # ADR-014 Layer A note: the legacy ``rebasing`` synthetic state
             # used to absorb ``non_fast_forward`` push failures and let
             # ``revise()`` route them back into pr-fix. The new SM has no
@@ -4679,7 +4742,7 @@ class OrchestratorService:
                     err_msg = _summarize_agent_error(result.return_code, result.stderr)
                     # Validate against the active flow's SM — a sub-flow-only
                     # agent step whose ``active_state`` isn't stitched into
-                    # main's SM (custom processes only; the bundled ``full``
+                    # main's SM (custom processes only; the bundled ``build``
                     # process is covered by ``_register_cross_flow_edges``
                     # for every pr_fix binding) would otherwise silently
                     # ``continue`` and strand the task at ``status=working``.
@@ -5901,18 +5964,18 @@ class OrchestratorService:
         2. An inline entry in ``lotsa.yaml``'s ``processes:`` block declares
            ``default: true`` — that name wins.
         3. ``config.flow`` — the ``--flow`` CLI flag or ``flow:`` YAML field.
-           This is the path bundled presets (``chat``, ``full``, ``standard``,
-           ``simple``, ``quickfix``) take.
+           This is the path bundled presets (``chat``, ``build``, ``fix``)
+           take.
         4. ``"chat"`` — the package default (ADR-034 §2).
 
         The active name is matched first against the inline catalog (so a
-        user can name an inline process ``full`` to override the bundled
+        user can name an inline process ``build`` to override the bundled
         one), then against the bundled set.
 
         ``"chat"`` doubles as the "operator didn't choose" sentinel below: the
         warning guards treat ``config.flow == "chat"`` as unset (it equals the
         package default) so the common zero-config path never warns, while an
-        operator who explicitly set ``--flow full`` IS warned when an inline
+        operator who explicitly set ``--flow build`` IS warned when an inline
         default or ``--flow-file`` outranks them.
         """
         if self.config.flow_file is not None:
@@ -6020,8 +6083,8 @@ class OrchestratorService:
         """Public accessor for a task's own root flow (ADR-021/027).
 
         The API renders each task's flow / stage bar against ITS process, not the
-        server's active default — a chat task, a ``full`` task, and a task
-        promoted to ``full`` must each show their own flow.
+        server's active default — a chat task, a ``build`` task, and a task
+        promoted to ``build`` must each show their own flow.
         """
         return self._root_flow_for(item_or_row)
 

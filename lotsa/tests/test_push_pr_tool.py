@@ -216,6 +216,28 @@ def test_push_pr_non_fast_forward_returns_failure_with_error_kind(tmp_path):
     assert result.metadata.get("error_kind") == "non_fast_forward"
 
 
+def test_push_pr_no_github_returns_failure_with_no_github_error_kind(tmp_path):
+    """``NO_GITHUB: ...`` failures surface ``error_kind=no_github`` — the
+    contract the action dispatcher reads to park the task in
+    ``awaiting_operator`` (ADR-043) instead of ``blocked``.
+
+    Regression: pre-fix the tool folded the missing-token error into the
+    generic ``push_failed`` bucket, so it was indistinguishable from a real
+    push failure and the dispatcher routed it to ``blocked``.
+    """
+    from lotsa.push_step import PushError
+    from lotsa.tools.push_pr import push_pr
+
+    ctx = _make_ctx(tmp_path, artifacts={"spec": "s", "plan": "p"})
+
+    with patch("lotsa.tools.push_pr.execute_push", new_callable=AsyncMock) as mock_push:
+        mock_push.side_effect = PushError("NO_GITHUB: GITHUB_TOKEN environment variable is not set.")
+        result = asyncio.get_event_loop().run_until_complete(push_pr(ctx, {}))
+
+    assert result.success is False
+    assert result.metadata.get("error_kind") == "no_github"
+
+
 def test_push_pr_generic_push_error_returns_failure_with_error_kind(tmp_path):
     """Other ``PushError`` instances surface ``error_kind=push_failed``."""
     from lotsa.push_step import PushError

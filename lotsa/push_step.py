@@ -182,9 +182,16 @@ async def check_preconditions(work_dir: Path) -> tuple[str, str, str]:
     """
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
+        # ``NO_GITHUB:`` prefix is the machine-detectable contract the push
+        # callers read to route a GitHub-less setup to ``awaiting_operator``
+        # (the ADR-043 escape hatch) rather than the generic ``blocked``
+        # failure — mirrors the ``NON_FAST_FORWARD:`` prefix used for rebase
+        # routing. Keep the two prefixes in sync with the callers in
+        # ``lotsa/tools/push_pr.py`` and ``OrchestratorService._execute_push``.
         raise PushError(
-            "GITHUB_TOKEN environment variable is not set. "
-            "Export a personal access token with repo scope before pushing."
+            "NO_GITHUB: GITHUB_TOKEN environment variable is not set. "
+            "Export a personal access token with repo scope before pushing, "
+            "or Mark complete to close the task after reviewing the worktree."
         )
 
     remote_url = await _get_remote_url(work_dir)

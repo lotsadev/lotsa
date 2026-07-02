@@ -57,7 +57,14 @@ async def push_pr(task: TaskContext, config: dict[str, Any]) -> ToolResult:
         )
     except PushError as exc:
         msg = str(exc)
-        kind = "non_fast_forward" if msg.startswith("NON_FAST_FORWARD:") else "push_failed"
+        if msg.startswith("NON_FAST_FORWARD:"):
+            kind = "non_fast_forward"
+        elif msg.startswith("NO_GITHUB:"):
+            # No GitHub configured — the orchestrator routes this to the
+            # ``awaiting_operator`` escape hatch instead of ``blocked``.
+            kind = "no_github"
+        else:
+            kind = "push_failed"
         return ToolResult(
             success=False,
             output=msg,

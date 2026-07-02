@@ -136,6 +136,73 @@ def test_mark_complete_rejects_already_terminal_task(tmp_path, run):
         run(svc.db.close())
 
 
+def test_mark_complete_retries_past_concurrent_non_terminal_shift(tmp_path, run):
+    """mark_complete must converge when a concurrent path advances the task to
+    a DIFFERENT non-terminal ``(status, state)`` between its fresh read and its
+    CAS — the asymmetric-guard bug class ``lotsa/CLAUDE.md`` calls out.
+
+    The failure is exercised from INSIDE the code under test: a stub wraps
+    ``atomic_transition`` and, on the first terminal CAS attempt, advances the
+    row out from under the expected ``from_*`` (so that CAS loses), then lets
+    the retry succeed. This is not a pre-flipped post-bug row — the row starts
+    at a legitimately non-terminal state and moves mid-execution.
+
+    Regression: pre-fix ``mark_complete`` issued a SINGLE CAS attempt and, on
+    loss against a non-terminal shift, returned silently. The task would stay
+    ``working``/``verifying`` and this assertion (``status == 'complete'``)
+    would fail; only a terminal concurrent outcome was meant to no-op.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Racy complete",
+                state="reviewing",
+                status="waiting",
+                current_step="review",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        real_at = svc.db.atomic_transition
+        counters = {"terminal_attempts": 0, "interfered": False}
+
+        async def racy_atomic_transition(task_id, **kwargs):
+            # Only perturb the terminal CAS mark_complete issues, and only once.
+            if kwargs.get("to_status") == "complete" and not counters["interfered"]:
+                counters["interfered"] = True
+                # A competing coroutine advances the row to a non-terminal
+                # (status, state) after mark_complete's re-read but before its
+                # CAS lands — the exact window the single-attempt version lost.
+                await real_at(
+                    task_id,
+                    from_status=kwargs["from_status"],
+                    from_state=kwargs["from_state"],
+                    to_state="verifying",
+                    to_status="working",
+                    to_current_step="verify",
+                    audit_on_win=None,
+                )
+            if kwargs.get("to_status") == "complete":
+                counters["terminal_attempts"] += 1
+            return await real_at(task_id, **kwargs)
+
+        svc.db.atomic_transition = racy_atomic_transition
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert counters["terminal_attempts"] >= 2, (
+            "mark_complete must re-read and retry the terminal CAS after losing to a concurrent non-terminal shift"
+        )
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
 def test_mark_complete_api_route_completes_task(app_with_service, run):
     """POST /api/tasks/{id}/mark-complete drives the task terminal and returns
     the full task detail.

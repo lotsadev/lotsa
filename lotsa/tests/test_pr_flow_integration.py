@@ -1102,6 +1102,102 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
         loop.close()
 
 
+def test_push_pr_no_github_parks_task_in_awaiting_operator(tmp_path):
+    """A ``push_pr`` action that fails only because no GitHub is configured
+    (``error_kind='no_github'``) parks the task in ``awaiting_operator`` — the
+    ADR-043 escape hatch — NOT ``blocked``. This is the live producer for the
+    parked status the README/UI advertise; without it a GitHub-less operator
+    sees "blocked" with a token error instead of "Awaiting you".
+
+    Regression: pre-fix the action dispatcher routed every failed action to
+    ``blocked`` (via the ``rebasing``/``blocked`` branch), so this task landed
+    at ``status='blocked'`` and no code path ever produced ``awaiting_operator``.
+    The failure is driven from inside the code under test — the stub tool
+    returns the real ``no_github`` failure contract, not a pre-flipped row.
+    """
+    import asyncio
+
+    from lotsa.config import LotsaConfig
+    from lotsa.db import TaskDB
+    from lotsa.orchestrator import OrchestratorService
+    from lotsa.registry import register_tool
+    from lotsa.tools import ToolResult
+    from rigg.models import Item
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        (tmp_path / "data").mkdir()
+        config = LotsaConfig(
+            data_dir=tmp_path / "data",
+            work_dir=tmp_path,
+            flow="build",
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(tmp_path / "data" / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+
+        from lotsa import registry as reg
+
+        reg._TOOLS.pop("push_pr", None)
+
+        async def stub_push_pr(ctx, config):
+            # Mirror the real push_pr tool's NO_GITHUB failure contract.
+            return ToolResult(
+                success=False,
+                output="NO_GITHUB: GITHUB_TOKEN environment variable is not set.",
+                metadata={"error_kind": "no_github"},
+            )
+
+        register_tool("push_pr", stub_push_pr)
+
+        try:
+            run(svc.start())
+            try:
+                task = run(svc.db.create_task("No GitHub", state="push_pr", metadata={"process_name": "build"}))
+                run(
+                    svc.db.claim_task_transition(
+                        task.id,
+                        from_status=task.status,
+                        from_state=task.state,
+                        to_state="push_pr",
+                        to_status="working",
+                        to_current_step="push_pr",
+                    )
+                )
+                item = Item(id=task.id, state="push_pr", title="No GitHub", metadata={"process_name": "build"})
+                push_pr_step = next(j for j in svc.process.flows["main"].jobs if j.name == "push_pr")
+                run(svc._dispatch_step(item, push_pr_step))
+                for _ in range(5):
+                    run(asyncio.sleep(0.01))
+
+                row = run(svc.db.get_task(task.id))
+                assert row.status == "awaiting_operator", (
+                    f"Expected GitHub-less push to park in awaiting_operator, got "
+                    f"status={row.status!r} state={row.state!r}"
+                )
+                assert row.state == "awaiting_operator"
+                assert "pr_number" not in row.metadata
+                # Parked with a status_change (an invitation to act), not an error.
+                msgs = run(svc.db.get_messages(task.id))
+                assert any(m.type == "status_change" and "Mark complete" in m.content for m in msgs), (
+                    "expected an 'awaiting you' status_change audit row inviting Mark complete"
+                )
+                assert not any(m.type == "error" for m in msgs), (
+                    "a GitHub-less park must not surface as an error message"
+                )
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+    finally:
+        loop.close()
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests for the cross-flow step-lookup fallback. ``retry()`` and
 # ``jump_to_step()`` historically scanned only ``self.flow`` (main); under

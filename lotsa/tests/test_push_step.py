@@ -46,7 +46,11 @@ async def test_preconditions_missing_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
     remote_patch, changes_patch = _patch_helpers(_HTTPS_REMOTE, False)
-    with remote_patch, changes_patch, pytest.raises(PushError, match="GITHUB_TOKEN"):
+    # The ``NO_GITHUB:`` prefix is the machine-detectable contract the push
+    # callers read to route a GitHub-less setup to ``awaiting_operator``
+    # (ADR-043) rather than ``blocked``. Lock both the prefix and the human
+    # text so a future reword can't silently break the escape-hatch routing.
+    with remote_patch, changes_patch, pytest.raises(PushError, match="NO_GITHUB:.*GITHUB_TOKEN"):
         await check_preconditions(_WORK_DIR)
 
 
