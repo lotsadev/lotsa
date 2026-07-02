@@ -275,6 +275,13 @@ You may have been interrupted and resumed. Before continuing, check what
 you have already done (git status, the worktree, existing files, prior
 tool output) and do not redo completed work."""
 
+# ADR-040 — bound on how long ``shutdown()`` waits for the completion drainer to
+# *apply* completions that landed inside the grace window (state CAS + in-flight
+# pop), after the in-flight agents themselves have finished. Small: the backlog
+# is DB writes, not agent work, so this is not a second grace window. A drainer
+# still wedged past this bound is abandoned and recovered by the next resume sweep.
+_DRAIN_APPLY_TIMEOUT_SECONDS = 5.0
+
 _NEEDS_INPUT_RE = re.compile(r"^NEEDS_INPUT:\s*(.+)", re.MULTILINE)
 
 _MAX_TITLE_LEN = 80
@@ -1053,8 +1060,11 @@ class OrchestratorService:
                 # destroying it: classify + auto-dispatch a continuation (resume
                 # the agent or idempotently re-run the step), bounded by the
                 # ``resume_cap`` fallback to ``blocked``. This covers modern
-                # mid-push/rebase tasks too — they are ``status='working'`` with
-                # ``state`` in the action/rebasing set.
+                # mid-action tasks too — an action job (e.g. ``push_pr``) that was
+                # executing when the server died is ``status='working'`` with
+                # ``state`` in the action set. (``rebasing`` is always paired with
+                # ``status='blocked'`` — see the ``to_status='blocked'`` rebase
+                # transitions — so it is skipped above, not resumed here.)
                 if row.status == "working":
                     await self._classify_and_resume(row)
                     continue
@@ -1106,6 +1116,26 @@ class OrchestratorService:
         inflight = [info.task for info in self._in_flight.values() if info.task and not info.task.done()]
         if inflight:
             await asyncio.wait(inflight, timeout=self.config.shutdown_grace_seconds)
+
+        # Apply the completions those finished agents enqueued *before* the
+        # drainer is cancelled below. ``_run_agent`` ends at
+        # ``_completions.put(info)``; the state-transition CAS and ``_in_flight``
+        # pop happen later in ``_completion_drainer``. Without this join, an
+        # agent that finished cleanly inside the grace window has its completion
+        # silently discarded when the drainer is cancelled — the DB row stays
+        # ``status='working'`` and burns a wasted resume cycle on the next start.
+        # Bounded so a wedged drainer can't hang shutdown; the backlog is just
+        # DB writes, so ``_DRAIN_APPLY_TIMEOUT_SECONDS`` is small (a survivor past
+        # this bound is recovered by the next start()'s resume sweep).
+        if self._drainer_task and not self._drainer_task.done():
+            try:
+                await asyncio.wait_for(self._completions.join(), timeout=_DRAIN_APPLY_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning(
+                    "shutdown: completion drain timed out after %.1fs; unapplied completions "
+                    "will be recovered by the next start()'s resume sweep",
+                    _DRAIN_APPLY_TIMEOUT_SECONDS,
+                )
 
         # Cancel ALL monitor tasks first, then await them concurrently — a
         # serial cancel+await would make worst-case shutdown 5s × N processes.
@@ -5683,6 +5713,14 @@ class OrchestratorService:
                     except Exception:
                         logger.exception("Failed to block task %s after completion error", info.item.id)
             finally:
+                if info is not None:
+                    # ADR-040: mark the dequeued completion done so shutdown()'s
+                    # bounded ``_completions.join()`` can tell when the
+                    # grace-window backlog has actually been *applied* (state
+                    # CAS + ``_in_flight`` pop), not merely dequeued. Synchronous
+                    # and first in the ``finally`` so it runs on every exit path
+                    # (including cancellation mid-terminal-apply below).
+                    self._completions.task_done()
                 # ADR-030: apply a deferred PR terminal once the agent's own
                 # routing (the try body above) has completed — the happens-before
                 # the ADR requires. Runs on every exit path (the body's many

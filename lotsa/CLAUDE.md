@@ -607,9 +607,14 @@ required.
 
 **Graceful drain:** on `shutdown()` the service sets `_accepting=False` (refusing
 new dispatches), awaits in-flight agents up to `shutdown_grace_seconds`
-(default 30s), then cancels survivors — which the next start()'s resume sweep
-recovers. Operators should set systemd `TimeoutStopSec` ≥ `shutdown_grace_seconds`
-so systemd doesn't SIGKILL mid-drain.
+(default 30s), then — before cancelling the completion drainer — waits (briefly,
+bounded) on `_completions.join()` so completions that landed inside the window are
+*applied* (state CAS + `_in_flight` pop), not just dequeued. Agents that finish
+cleanly in-window therefore commit their transition instead of being left
+`status='working'` and re-resumed pointlessly on the next start. Survivors past
+the window are cancelled and recovered by the next start()'s resume sweep.
+Operators should set systemd `TimeoutStopSec` ≥ `shutdown_grace_seconds` so
+systemd doesn't SIGKILL mid-drain.
 
 ---
 

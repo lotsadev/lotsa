@@ -414,6 +414,72 @@ def test_shutdown_stops_accepting_and_drains_inflight_within_grace(tmp_path, run
         run(db.close())
 
 
+def test_shutdown_applies_completion_that_lands_inside_grace_window(tmp_path, run):
+    """An agent that finishes cleanly *inside* the grace window must have its
+    completion **applied** (state transition committed) before ``shutdown()``
+    cancels the drainer — not merely awaited.
+
+    ``_run_agent`` ends at ``_completions.put(info)``; the state-transition CAS
+    and ``_in_flight`` pop happen later in ``_completion_drainer``. If
+    ``shutdown()`` cancels the drainer right after awaiting the agent task (no
+    intervening drain), a cleanly-finished agent's row is left
+    ``status='working'`` with no agent in flight — a "working-orphan" that burns
+    a pointless resume cycle on the next start.
+
+    Fails pre-fix: ``shutdown()`` awaits only the raw agent task, then cancels
+    the drainer with no ``_completions.join()``; the completion is discarded and
+    the row stays ``status='working'`` (this custom flow has no monitors, so
+    there is no incidental await to let the drainer run first).
+    """
+    config = make_server_config(tmp_path)
+    config.shutdown_grace_seconds = 5.0  # ample: the agent finishes well within it
+    db = TaskDB(config.data_dir / "lotsa.db")
+    run(db.initialize())
+    svc = OrchestratorService(config, db)
+    runner = DrainRunner()
+    svc.runner = runner
+    run(svc.start())
+
+    # Widen the genuine race so it resolves deterministically: the drainer's
+    # completion-processing spends a real, controllable interval mid-apply (a
+    # DB-bound step in production; a sleep here). Pre-fix, ``shutdown()`` cancels
+    # the drainer while it is still inside this window, so the transition is
+    # never committed. Post-fix, ``shutdown()``'s bounded ``_completions.join()``
+    # waits for the drainer to finish applying (call ``task_done``) first. This
+    # exercises the real drainer path — it does not pre-seed any post-bug state.
+    _orig_merge = svc._merge_task_metadata
+
+    async def _slow_merge(item, updates):
+        await asyncio.sleep(0.2)
+        return await _orig_merge(item, updates)
+
+    svc._merge_task_metadata = _slow_merge
+
+    try:
+
+        async def _t():
+            task = await svc.create_task("apply my completion")
+            await wait_for_status(svc, task.id, "working")
+            await runner.started.wait()
+
+            shutdown_task = asyncio.create_task(svc.shutdown())
+            await asyncio.sleep(0.05)
+            runner.release.set()  # finish inside the grace window
+            await shutdown_task
+
+            assert runner.finished is True, "agent should have finished inside the grace window"
+            row = await db.get_task(task.id)
+            assert row.status != "working", (
+                "a completion that landed inside the grace window must be applied, not dropped — "
+                f"the row is still status={row.status!r}, a working-orphan the next start must resume"
+            )
+            assert task.id not in svc._in_flight, "the applied completion must be popped from _in_flight"
+
+        run(_t())
+    finally:
+        run(db.close())
+
+
 def test_dispatch_refused_while_draining(tmp_path, run):
     """While ``_accepting`` is False, a new dispatch is refused — the agent is
     never launched and the task is not tracked in-flight.
