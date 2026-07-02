@@ -448,6 +448,91 @@ def test_resume_count_resets_when_task_advances_past_interrupted_step(tmp_path, 
         run(db.close())
 
 
+def test_resume_count_resets_when_forward_progress_lands_in_a_monitor_state(tmp_path, run):
+    """The resume-cap markers must also clear when forward progress lands the
+    task in a **monitor** state — not only on the generic agent→agent
+    active-state edge.
+
+    ``_dispatch_step``'s monitor branch flips status to ``waiting_for_pr`` and
+    ``return``s *before* the generic clear-markers block, so an interrupted step
+    that routes straight into a monitor kept a stale ``resume_count`` /
+    ``interrupted_at``. That breaks the ADR's "cap bounds repeated failure at a
+    *single* interruption" promise for every flow whose forward progress crosses
+    a monitor (the canonical ``push_pr → wait_for_pr_signal`` case, and any
+    agent→monitor flow). The sibling agent→agent path is already covered by
+    ``test_resume_count_resets_when_task_advances_past_interrupted_step``; this
+    exercises the monitor path that path does not reach.
+
+    Two-step flow (``code`` agent → ``watch`` monitor): seed the task
+    interrupted at ``code`` with a non-zero ``resume_count``; after the resumed
+    ``code`` step completes and the task advances into the ``watch`` monitor
+    state (status → ``waiting_for_pr``), the markers are gone.
+
+    Fails pre-fix: ``resume_count`` / ``interrupted_at`` survive into the monitor
+    state (the monitor branch never cleared them).
+    """
+    from lotsa.config import LotsaConfig
+
+    flow_yaml = tmp_path / "monitor_reset_flow.yaml"
+    flow_yaml.write_text(
+        "name: monitor-reset\njobs:\n"
+        "  - name: code\n    prompt: coding\n    resume: true\n"
+        "    queue_state: backlog\n    active_state: coding\n"
+        "  - name: watch\n    type: monitor\n    engine: pr_monitor\n"
+        "    config:\n      poll_interval_seconds: 30\n"
+    )
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    for name in ("coding-system", "coding-user"):
+        (prompts_dir / f"{name}.md").write_text(f"# {name}\n{{title}}\n{{body}}")
+    (tmp_path / "data").mkdir()
+    config = LotsaConfig(
+        data_dir=tmp_path / "data",
+        work_dir=tmp_path,
+        flow="custom",
+        flow_file=flow_yaml,
+        prompts_dir=prompts_dir,
+        model="sonnet",
+        budget=5.0,
+    )
+    db = TaskDB(config.data_dir / "lotsa.db")
+    run(db.initialize())
+    task = run(
+        db.create_task(
+            title="progress into monitor",
+            state="coding",
+            status="working",
+            current_step="code",
+            metadata={"resume_count": 1, "interrupted_at": "2026-07-02T00:00:00+00:00"},
+        )
+    )
+    runner = RecordingRunner(supports_resume=True)
+    svc = OrchestratorService(config, db)
+    svc.runner = runner
+    run(svc.start())
+    try:
+
+        async def _t():
+            # The resumed ``code`` step completes and the task advances into the
+            # ``watch`` monitor state — wait for that forward-progress edge
+            # (monitor entry flips status to ``waiting_for_pr``).
+            await wait_for_status(svc, task.id, "waiting_for_pr")
+            row = await db.get_task(task.id)
+            assert row.state == "watch", "task should have advanced into the monitor state"
+            assert "resume_count" not in row.metadata, (
+                "resume_count must reset when forward progress lands in a monitor state"
+            )
+            assert "interrupted_at" not in row.metadata, (
+                "interrupted_at must clear on the monitor-state forward-progress edge too"
+            )
+
+        run(_t())
+    finally:
+        with contextlib.suppress(Exception):
+            run(svc.shutdown())
+        run(db.close())
+
+
 # ---------------------------------------------------------------------------
 # R4 — resumed-agent prompt note
 # ---------------------------------------------------------------------------

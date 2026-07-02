@@ -595,9 +595,11 @@ The sweep records `interrupted_at` + `resume_count` in the task `metadata` JSON
 - **Cap → block** — bounded by `resume_count` (default `resume_cap=2`,
   `lotsa.yaml`-configurable). The count bounds repeated failure at a *single*
   interruption: it is cleared (`_clear_interruption_markers`) the moment a task
-  advances into a new step's active state, so routine deploys that each make
-  real forward progress don't accumulate toward the cap. Past the cap, fall
-  back to `blocked` with a "couldn't resume after N attempts" message.
+  makes forward progress past the interrupted step — advancing into a new step's
+  active state, an action step completing, **or** entering a monitor state (all
+  three sibling forward-progress edges clear the markers) — so routine deploys
+  that each make real forward progress don't accumulate toward the cap. Past the
+  cap, fall back to `blocked` with a "couldn't resume after N attempts" message.
 
 Resume-vs-re-run is selected via the runner's `supports_resume` capability
 (read defensively, never `isinstance`). A resumed dispatch appends a

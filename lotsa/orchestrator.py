@@ -4063,6 +4063,15 @@ class OrchestratorService:
                 # matches the won-check pattern at every other CAS site in
                 # this file.
                 return
+            # ADR-040 — landing in a monitor state is forward progress past the
+            # (possibly interrupted) prior step. Clear the resume-cap markers
+            # here too: the monitor branch ``return``s before the generic
+            # active-state path below, where the sibling clear lives, so an
+            # interrupted step that routes straight into a monitor would
+            # otherwise strand ``resume_count``/``interrupted_at`` — the same
+            # gap ``_execute_action_step``'s action→monitor fold closes.
+            if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+                await self._clear_interruption_markers(item)
             return
 
         # Single CAS: state → active_state, status → working, current_step →
@@ -4089,7 +4098,10 @@ class OrchestratorService:
         # interrupted on. ``resume_count`` bounds repeated failure at a *single*
         # interruption, not the task's whole life; a routine deploy that
         # interrupts a step which then completes must not accumulate toward the
-        # cap. Clear the interruption markers on this forward-progress edge.
+        # cap. Clear the interruption markers on this forward-progress edge. The
+        # two sibling forward-progress paths that bypass this generic CAS clear
+        # the same markers themselves: the monitor branch above and
+        # ``_execute_action_step``'s action-success CAS.
         if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
             await self._clear_interruption_markers(item)
 
@@ -4547,6 +4559,16 @@ class OrchestratorService:
         if not result_cas.won:
             return
         item.state = success_state
+        # ADR-040 — an action step completing and advancing is forward progress
+        # past the (possibly interrupted) action step. Clear the resume-cap
+        # markers here so the action→monitor fold below — which folds
+        # ``to_status="waiting_for_pr"`` into its own CAS and never routes
+        # through ``_dispatch_step``'s generic clear — doesn't strand stale
+        # ``resume_count``/``interrupted_at``. (The action→non-monitor case is
+        # already cleared one hop later by ``_dispatch_next_step``; clearing
+        # here makes both sibling paths symmetric.)
+        if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+            await self._clear_interruption_markers(item)
         # Sub-flow exit: an action that lands the task into a monitor state
         # (e.g. ``push_pr`` → ``wait_for_pr_signal``) is the canonical return
         # to the root flow. Reset ``current_flow`` to the task's OWN process's
