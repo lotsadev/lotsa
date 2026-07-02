@@ -4,8 +4,8 @@ export interface ChatRenderItem {
   message: Message
   // True → render this agent chat/output bubble with the amber "awaiting your
   // answer" accent because a duplicate needs-input question row collapsed into
-  // it (R2). Ignored for non-agent-bubble items — the standalone `question`
-  // branch styles itself amber.
+  // it (R2). Ignored for non-agent-bubble items — a standalone `question`
+  // (the defensive fallback) styles itself amber.
   awaitingInput: boolean
 }
 
@@ -28,8 +28,14 @@ function covers(primary: Message, question: Message): boolean {
 // `messages` table is append-only, so both the agent chat/output row and the
 // redundant `question` row are persisted; here we drop the question when it
 // duplicates an adjacent same-step agent bubble and mark that bubble
-// `awaitingInput`. A question with no covering bubble (e.g. pr-fix
-// NEEDS_DECISION, which writes no separate chat row) renders on its own.
+// `awaitingInput`. This covers every needs-input shape the orchestrator writes:
+// non-conversational NEEDS_INPUT (`output` + `question`), conversational
+// chat+question, and pr-fix NEEDS_DECISION — pr-fix is a non-conversational
+// step, so it too persists a full-stdout `output` row before the `question`
+// row (same `step_name`, question extracted verbatim from that stdout), so it
+// collapses into that bubble like the others. The standalone-question branch
+// below is a defensive fallback for a `question` that arrives with no covering
+// bubble; it renders once, on its own.
 export function collapseNeedsInputMessages(messages: Message[]): ChatRenderItem[] {
   const items: ChatRenderItem[] = []
   let lastAgentBubble: ChatRenderItem | null = null

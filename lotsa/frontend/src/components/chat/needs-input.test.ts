@@ -11,8 +11,10 @@ import { collapseNeedsInputMessages } from './needs-input'
 // drops the redundant ``question`` row when it duplicates (equals, or is a
 // subset of) an adjacent same-step agent ``chat``/``output`` bubble, and marks
 // that surviving bubble ``awaitingInput`` so it renders with the amber
-// needs-input accent. A ``question`` with no covering bubble (e.g. pr-fix
-// NEEDS_DECISION) renders on its own as a single bubble.
+// needs-input accent. pr-fix NEEDS_DECISION is non-conversational, so it also
+// persists a full-stdout ``output`` row before its ``question`` row and
+// collapses the same way. A ``question`` with no covering bubble is a defensive
+// fallback that renders on its own as a single bubble.
 
 let nextId = 1
 function makeMessage(overrides: Partial<Message> = {}): Message {
@@ -104,9 +106,35 @@ describe('collapseNeedsInputMessages', () => {
     expect(outputItem.awaitingInput).toBe(false)
   })
 
-  it('renders a standalone question (pr-fix NEEDS_DECISION) as a single bubble', () => {
-    // pr-fix NEEDS_DECISION persists a question with no covering agent bubble
-    // ahead of it — it renders once, on its own.
+  it('collapses a pr-fix NEEDS_DECISION into its output bubble', () => {
+    // pr-fix is non-conversational: the orchestrator persists a full-stdout
+    // ``output`` row (line 4489 in orchestrator.py) BEFORE the needs_input rule
+    // fires and writes the ``question`` row (line 4741), both step_name
+    // "pr-fix". The question is extracted verbatim from that same stdout, so it
+    // is always a substring of the output — the pair collapses like any other
+    // non-conversational NEEDS_INPUT pause, into a single awaiting bubble.
+    const output = makeMessage({
+      type: 'output',
+      step_name: 'pr-fix',
+      content:
+        'Reviewed the feedback.\n\nPR_FIX_NEEDS_DECISION: The reviewer disagrees with the approach. Proceed anyway?',
+    })
+    const question = makeMessage({
+      type: 'question',
+      step_name: 'pr-fix',
+      content: 'The reviewer disagrees with the approach. Proceed anyway?',
+    })
+
+    const items = collapseNeedsInputMessages([output, question])
+
+    expect(items).toHaveLength(1)
+    expect(items[0].message.id).toBe(output.id)
+    expect(items[0].awaitingInput).toBe(true)
+  })
+
+  it('renders a standalone question with no covering bubble as a single bubble (defensive fallback)', () => {
+    // Defensive path: a ``question`` row that arrives with no preceding covering
+    // agent bubble still renders exactly once, on its own, with no crash.
     const question = makeMessage({
       type: 'question',
       step_name: 'pr-fix',
