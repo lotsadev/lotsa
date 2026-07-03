@@ -58,6 +58,11 @@ class DockerAgentRunner:
         """CLI-shaped dispatch fragment — Docker still runs ``claude --print``."""
         return CLI_DISPATCH_SHAPE_FRAGMENT
 
+    # ADR-040: Docker threads ``session_id`` into ``--resume`` inside the
+    # container and the agent-home is a persisted mount, so the session survives
+    # a daemon restart and can be resumed (same posture as ``ClaudeCodeRunner``).
+    supports_resume = True
+
     async def read_activity(
         self,
         session_id: str,

@@ -286,3 +286,36 @@ def test_yaml_null_scalar_keeps_dataclass_default(tmp_path):
     config_file.write_text("model:\n")
     config = LotsaConfig.load(config_path=config_file)
     assert config.model == "sonnet"
+
+
+# ---------------------------------------------------------------------------
+# ADR-040 — restart-resilient orchestration config knobs
+# ---------------------------------------------------------------------------
+
+
+def test_resume_cap_default_is_two():
+    """The per-task auto-resume cap defaults to 2 (ADR-040 R3)."""
+    config = LotsaConfig()
+    assert config.resume_cap == 2
+
+
+def test_resume_cap_loads_from_yaml(tmp_path):
+    """``resume_cap: N`` in lotsa.yaml overrides the default."""
+    config_file = tmp_path / "lotsa.yaml"
+    config_file.write_text(yaml.dump({"resume_cap": 5}))
+    config = LotsaConfig.load(config_path=config_file)
+    assert config.resume_cap == 5
+
+
+def test_shutdown_grace_seconds_default_is_thirty():
+    """The graceful-drain window defaults to ~30s (ADR-040 R5)."""
+    config = LotsaConfig()
+    assert config.shutdown_grace_seconds == 30.0
+
+
+def test_shutdown_grace_seconds_loads_from_yaml(tmp_path):
+    """``shutdown_grace_seconds: N`` in lotsa.yaml overrides the default."""
+    config_file = tmp_path / "lotsa.yaml"
+    config_file.write_text(yaml.dump({"shutdown_grace_seconds": 10.0}))
+    config = LotsaConfig.load(config_path=config_file)
+    assert config.shutdown_grace_seconds == 10.0
