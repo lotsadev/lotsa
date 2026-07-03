@@ -1610,11 +1610,9 @@ class OrchestratorService:
         Runs the same first-step dispatch :meth:`create_task` would have, now
         that the operator's attachments have been uploaded and recorded in
         ``tasks.metadata`` — so the first agent prompt materializes them (Path
-        A). The task's current row state already reflects its initial queued
-        state (``backlog`` for a normal first step, the step's ``queue_state``
-        for a conversational one), so ``_dispatch_next_step`` picks the right
-        step; a conversational first step also needs the operator's original
-        message replayed as ``feedback``.
+        A). Delegates to :meth:`_release_first_step` for the actual dispatch (a
+        helper shared with the restart-recovery sweep, which releases a task
+        stranded in this same never-dispatched shape).
 
         No-op if the task has vanished. Guarded against re-dispatch: a task is
         only releasable while it is still un-dispatched — ``current_step`` unset
@@ -1640,11 +1638,24 @@ class OrchestratorService:
                 f"Task {task_id} has already been dispatched — /dispatch only releases the "
                 "held first step of a task created with defer_dispatch=True."
             )
+        await self._release_first_step(row)
+
+    async def _release_first_step(self, row: TaskRow) -> None:
+        """Dispatch the held first step of a deferred task.
+
+        Shared by :meth:`dispatch_created` (the operator's release after the
+        upload sequence) and the restart-recovery sweep (which releases a task
+        stranded in the deferred, never-dispatched shape). The row already sits
+        in its initial queued state (``backlog`` for a normal first step, the
+        step's ``queue_state`` for a conversational one), so
+        ``_dispatch_next_step`` picks the right step; a conversational first step
+        also needs the operator's original message replayed as ``feedback``.
+        """
         flow = self.root_flow_for(row)
         first_step = flow.steps[0] if flow and flow.steps else None
         feedback: str | None = None
         if first_step is not None and first_step.conversational:
-            chats = await self.db.get_messages(task_id, msg_type="chat")
+            chats = await self.db.get_messages(row.id, msg_type="chat")
             feedback = chats[0].content if chats else None
         item = Item(
             id=row.id,
@@ -2737,7 +2748,45 @@ class OrchestratorService:
         row = await self.db.get_task(task_id)
         if row is None:
             raise StopNotAllowed(f"Task {task_id} not found")
-        if row.status != "working" or task_id not in self._in_flight:
+        if row.status != "working":
+            raise StopNotAllowed(
+                f"stop() requires an actively-working agent (status='working' and in-flight), got status={row.status!r}"
+            )
+        if task_id not in self._in_flight:
+            # A task created with defer_dispatch=True but never released sits at
+            # status='working' with current_step=None and NO in-flight agent —
+            # if the operator's browser closed between create and the follow-up
+            # dispatch() (no restart to auto-heal it), it is otherwise stuck at
+            # "Agent is working…" forever with no recovery path. There is no
+            # agent to cancel, but park it at blocked so Retry can re-dispatch
+            # the held first step (or Archive can discard it). A genuinely-
+            # working task is always in _in_flight, and a working task with
+            # current_step set is a natural-completion race (drainer will land
+            # it) — so gate on current_step is None to hit only the deferred
+            # shape, and keep raising for everything else.
+            if row.current_step is None:
+                # Fire the park CAS. It writes the audit row only on win; if it
+                # loses (a racing restart-recovery release or concurrent stop
+                # already moved the row) it's a clean no-op. No side effect
+                # follows the CAS, so there is nothing to gate on ``won``.
+                await self.db.atomic_transition(
+                    task_id,
+                    from_status="working",
+                    from_state=row.state,
+                    to_state=row.state,
+                    to_status="blocked",
+                    to_current_step=row.state,
+                    audit_on_win=AuditRow(
+                        role="system",
+                        step_name=row.state,
+                        content=(
+                            "Task was created but never started (attachment upload "
+                            "abandoned) — parked. Click Retry to start it."
+                        ),
+                        msg_type="status_change",
+                    ),
+                )
+                return
             raise StopNotAllowed(
                 f"stop() requires an actively-working agent (status='working' and in-flight), got status={row.status!r}"
             )
@@ -4219,6 +4268,25 @@ class OrchestratorService:
         ``atomic_transition`` (won-checked) so the sweep is safe against the
         drainer/monitor loops ``start()`` launches immediately after.
         """
+        # Never-dispatched deferred task (ADR-034 attachment flow): a task
+        # created with ``defer_dispatch=True`` sits at ``status='working'`` with
+        # ``current_step=None`` until ``dispatch_created`` releases it. If the
+        # server restarts (or the operator's browser closed) inside that window,
+        # there is no interrupted step to *resume* — the first step never ran.
+        # Release it now (resumptive, per ADR-040): whatever attachments landed
+        # are materialized on dispatch. Any genuinely-dispatched task has
+        # ``current_step`` set, so this discriminator is exact.
+        if row.current_step is None:
+            await self.db.add_message(
+                row.id,
+                "system",
+                row.state,
+                "Server restarted before this task's first step was dispatched — starting it now.",
+                "status_change",
+            )
+            await self._release_first_step(row)
+            return
+
         resume_count = int((row.metadata or {}).get("resume_count", 0))
         step_label = row.current_step or row.state
 

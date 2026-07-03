@@ -6280,3 +6280,67 @@ class TestAttachmentMaterialization:
         assert [p.name for p in attach_dir.iterdir()] == ["bug.png"]
         assert ".lotsa/attachments/bug.png" in call["user_prompt"]
         assert run(service.db.get_task(task_id)).status == "waiting"
+
+    def test_restart_recovery_starts_never_dispatched_deferred_task(self, service, run):
+        """A deferred task stranded across a restart must be STARTED by the
+        recovery sweep, not blocked with a misleading "couldn't resume" message.
+
+        A task created with ``defer_dispatch=True`` sits at ``status='working'``,
+        ``current_step=None`` until ``dispatch_created()`` releases it. If the
+        server restarts inside that window there is no interrupted step to
+        resume — the first step never ran — so the sweep's
+        ``_classify_and_resume`` must recognise the never-dispatched shape and
+        release the first step (materializing whatever attachments landed).
+
+        Fails against the pre-fix code: ``_classify_and_resume`` fell into
+        ``_redispatch_current_step``, found no step for ``current_step=None``,
+        and parked the task at ``blocked`` with "Couldn't resolve the
+        interrupted step to resume — click Retry." (the runner never ran).
+        """
+        task = run(service.create_task("Attach task", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        assert not service.runner.calls, "deferred create must not dispatch"
+        # Attachments landed before the (simulated) restart.
+        self._seed_attachment(service, run, task.id, data=b"PNGDATA")
+
+        # Simulate the startup recovery sweep encountering this working row.
+        row = run(service.db.get_task(task.id))
+        assert row.status == "working" and row.current_step is None
+        run(service._classify_and_resume(row))
+        run(asyncio.sleep(0.2))
+
+        # The first step actually ran (with the attachment), and the task is NOT
+        # stuck at an un-resumable blocked.
+        assert len(service.runner.calls) == 1, "recovery must release the held first step"
+        assert ".lotsa/attachments/bug.png" in service.runner.calls[0]["user_prompt"]
+        fresh = run(service.db.get_task(task.id))
+        assert fresh.status != "blocked", "never-dispatched deferred task must not be parked as un-resumable"
+
+    def test_stop_parks_never_dispatched_deferred_task_for_retry(self, service, run):
+        """If the operator's browser closes between ``create(defer)`` and the
+        follow-up ``dispatch()`` (no restart to auto-heal it), the task is stuck
+        at ``status='working'`` with no in-flight agent. ``stop()`` must park it
+        so ``retry()`` can start it — otherwise it shows "Agent is working…"
+        forever with no recovery path.
+
+        Fails against the pre-fix code: ``stop()``'s guard raised
+        ``StopNotAllowed`` for any non-in-flight task, so the deferred-and-
+        abandoned task had no recovery path (``retry()`` requires ``blocked``;
+        ``stop()`` required an in-flight agent).
+        """
+        task = run(service.create_task("Attach task", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        assert not service.runner.calls
+        assert task.id not in service._in_flight, "deferred task has no in-flight agent"
+
+        # No restart — the operator hits Stop on the wedged task.
+        run(service.stop(task.id))
+        parked = run(service.db.get_task(task.id))
+        assert parked.status == "blocked", "stop() must park the stuck deferred task at blocked"
+
+        # And Retry now re-dispatches the held first step (with attachments).
+        self._seed_attachment(service, run, task.id, data=b"PNGDATA")
+        run(service.retry(task.id))
+        run(asyncio.sleep(0.2))
+        assert len(service.runner.calls) == 1, "retry must start the parked deferred task"
+        assert ".lotsa/attachments/bug.png" in service.runner.calls[0]["user_prompt"]

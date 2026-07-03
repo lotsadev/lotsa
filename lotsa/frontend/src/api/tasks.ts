@@ -53,9 +53,6 @@ export const createTask = (data: {
 export const dispatchTask = (taskId: string) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/dispatch`, { method: 'POST' })
 
-export const fetchAttachments = (taskId: string) =>
-  apiFetch<Attachment[]>(`/api/tasks/${taskId}/attachments`)
-
 // Raw-body upload — one file per request. Bypasses apiFetch (which forces a
 // JSON Content-Type); the filename rides as a query param and the body is the
 // raw bytes. The server sanitizes the filename and enforces the size/count caps.
