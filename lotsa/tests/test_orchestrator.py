@@ -6201,6 +6201,67 @@ class TestAttachmentMaterialization:
             run(svc.shutdown())
             run(db.close())
 
+    def test_dispatch_created_refuses_second_call_on_active_task(self, tmp_path, _loop, run):
+        """A repeat ``/dispatch`` on an already-dispatched, still-running task must
+        NOT spawn a second concurrent agent against the same worktree.
+
+        Regression for the missing precondition on ``dispatch_created``. Uses a
+        hang runner so the first step stays ``in_flight`` (status=working,
+        state=active_state) when the second call arrives — the exact window in
+        which ``_dispatch_next_step``'s "active state — re-dispatch" self-loop
+        CAS (``from_state == to_state``, ``working → working``) *always* wins.
+
+        Fails against the pre-fix code: without the guard the second call
+        re-enters ``_dispatch_next_step``, the self-loop CAS wins, a second
+        ``_run_agent`` is scheduled (``runner.calls`` → 2, overwriting
+        ``_in_flight[id]`` and orphaning the first agent), and no exception is
+        raised — so both the ``pytest.raises`` and the ``== 1`` assertion below
+        trip.
+        """
+        from lotsa.orchestrator import DispatchNotAllowed
+
+        data_dir = tmp_path / "tasks"
+        data_dir.mkdir()
+        flow_yaml = tmp_path / "flow.yaml"
+        # Non-conversational first step: state goes backlog → active_state on
+        # the first dispatch, which is where the dangerous self-loop lives.
+        flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    type: agent\n")
+        config = LotsaConfig(
+            data_dir=data_dir,
+            work_dir=data_dir.parent,
+            flow="custom",
+            flow_file=flow_yaml,
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(data_dir / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+        svc.runner = _RecordingHangRunner()
+        run(svc.start())
+        try:
+            task = run(svc.create_task(message="Build it", defer_dispatch=True))
+            run(asyncio.sleep(0.2))
+            assert not svc.runner.calls, "deferred create must not dispatch"
+
+            # First release: the agent is now recorded and hanging in-flight.
+            run(svc.dispatch_created(task.id))
+            run(asyncio.sleep(0.2))
+            assert len(svc.runner.calls) == 1
+            fresh = run(svc.db.get_task(task.id))
+            assert fresh.status == "working" and fresh.current_step == "coding"
+            assert task.id in svc._in_flight
+
+            # Second release on the still-active task must be refused, not
+            # re-dispatched.
+            with pytest.raises(DispatchNotAllowed, match="already been dispatched"):
+                run(svc.dispatch_created(task.id))
+            run(asyncio.sleep(0.2))
+            assert len(svc.runner.calls) == 1, "a second /dispatch must NOT spawn a second agent"
+        finally:
+            run(svc.shutdown())
+            run(db.close())
+
     def test_materialization_is_idempotent_across_redispatch(self, service, run):
         run(service.create_task("Attach task"))
         run(asyncio.sleep(0.2))

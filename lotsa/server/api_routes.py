@@ -25,6 +25,7 @@ from lotsa.orchestrator import (
     ApproveNotAllowed,
     ArchiveFailed,
     ArchiveNotAllowed,
+    DispatchNotAllowed,
     OrchestratorService,
     ProcessNotFound,
     ProjectNotFound,
@@ -501,7 +502,10 @@ async def dispatch_task(request: Request, task_id: str) -> TaskDetailFullRespons
     row = await service.db.get_task(task_id)
     if row is None:
         raise _not_found()
-    await service.dispatch_created(task_id)
+    try:
+        await service.dispatch_created(task_id)
+    except DispatchNotAllowed as exc:
+        raise _bad_request(exc, "DISPATCH_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)
 
 

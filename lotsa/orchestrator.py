@@ -140,6 +140,16 @@ class ReviseNotAllowed(Exception):
     """Raised when revise()/send_message() is called from a non-actionable status."""
 
 
+class DispatchNotAllowed(Exception):
+    """Raised when dispatch_created() targets a task that was not created
+    deferred, or has already had its first step dispatched.
+
+    ``POST /tasks/{id}/dispatch`` only releases the held first step of a task
+    created with ``defer_dispatch=True``. Calling it on an already-dispatched
+    task would re-enter ``_dispatch_next_step`` on a live worktree — the guard
+    turns that into a clean 4xx instead of a second concurrent agent run."""
+
+
 class StopNotAllowed(Exception):
     """Raised when stop() is called on a task with no actively-working agent.
 
@@ -1519,13 +1529,30 @@ class OrchestratorService:
         step; a conversational first step also needs the operator's original
         message replayed as ``feedback``.
 
-        No-op if the task has vanished. Race-safe against a double call:
-        ``_dispatch_step`` CASes from ``status='working'``, so a second
-        invocation loses and dispatches nothing.
+        No-op if the task has vanished. Guarded against re-dispatch: a task is
+        only releasable while it is still un-dispatched — ``current_step`` unset
+        (``create_task`` leaves it ``None`` until the first ``_dispatch_step``
+        writes ``step.name``) and absent from ``_in_flight``. Once the first
+        step has run this raises :class:`DispatchNotAllowed` rather than
+        re-entering ``_dispatch_next_step``: an already-active task
+        (``state == step.active_state``) would otherwise hit that method's
+        "active state — re-dispatch" branch, whose self-loop CAS
+        (``from_state == to_state``, ``working → working``) *always* wins on a
+        sequential call and would spawn a second ``_run_agent`` against the same
+        worktree — orphaning the first agent in ``_in_flight`` and violating the
+        single-process dispatch guarantee (Constitution §3.3). The first (real)
+        dispatch is a genuine ``queue_state → active_state`` transition, so
+        concurrent double-calls before either dispatches are still resolved by
+        ``_dispatch_step``'s CAS; this guard closes the *sequential* re-call.
         """
         row = await self.db.get_task(task_id)
         if row is None:
             return
+        if row.current_step is not None or task_id in self._in_flight:
+            raise DispatchNotAllowed(
+                f"Task {task_id} has already been dispatched — /dispatch only releases the "
+                "held first step of a task created with defer_dispatch=True."
+            )
         flow = self.root_flow_for(row)
         first_step = flow.steps[0] if flow and flow.steps else None
         feedback: str | None = None

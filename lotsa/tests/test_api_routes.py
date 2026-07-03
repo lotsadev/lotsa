@@ -1011,6 +1011,32 @@ class TestAttachmentsEndpoint:
 
         run(_test())
 
+    def test_second_dispatch_is_rejected(self, app_with_service, run):
+        """A repeat ``POST /dispatch`` on an already-released task is a clean 400,
+        not a silent second dispatch. Guards the orchestrator-owned single-agent
+        invariant at the HTTP boundary (see the orchestrator-level regression for
+        the mid-run self-loop it prevents)."""
+        app, service = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                created = await client.post(
+                    "/api/tasks",
+                    json={"message": "Build this", "defer_dispatch": True},
+                )
+                task_id = created.json()["task"]["id"]
+
+                first = await client.post(f"/api/tasks/{task_id}/dispatch")
+                assert first.status_code == 200
+                await wait_for_status(service, task_id, "waiting")
+
+                second = await client.post(f"/api/tasks/{task_id}/dispatch")
+                assert second.status_code == 400
+                assert second.json()["detail"]["code"] == "DISPATCH_NOT_ALLOWED"
+
+        run(_test())
+
     def test_dispatch_unknown_task_is_404(self, app_with_service, run):
         app, _ = app_with_service
 
