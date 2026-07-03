@@ -1259,7 +1259,9 @@ def test_execute_push_no_github_parks_task_in_awaiting_operator(tmp_path):
         try:
             run(svc.start())
             try:
-                task = run(svc.db.create_task("No GitHub (legacy push)", state="pushing", metadata={"process_name": "build"}))
+                task = run(
+                    svc.db.create_task("No GitHub (legacy push)", state="pushing", metadata={"process_name": "build"})
+                )
                 # Enter at the genuine push precondition PUSH_START claims.
                 run(
                     svc.db.claim_task_transition(
@@ -1271,7 +1273,9 @@ def test_execute_push_no_github_parks_task_in_awaiting_operator(tmp_path):
                         to_current_step="push",
                     )
                 )
-                item = Item(id=task.id, state="pushing", title="No GitHub (legacy push)", metadata={"process_name": "build"})
+                item = Item(
+                    id=task.id, state="pushing", title="No GitHub (legacy push)", metadata={"process_name": "build"}
+                )
                 run(svc._execute_push(item))
 
                 row = run(svc.db.get_task(task.id))
