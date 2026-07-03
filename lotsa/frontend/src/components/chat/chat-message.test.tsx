@@ -109,6 +109,55 @@ describe('ChatMessage — awaiting-input accent (R2)', () => {
   })
 })
 
+describe('ChatMessage — soft line breaks (remark-breaks)', () => {
+  // Per CommonMark a single `\n` is a soft break (rendered as a space). The
+  // chat expectation is that a single newline shows a visible line break, so
+  // both ReactMarkdown calls must include `remark-breaks`, turning `\n` into
+  // a <br>. `\n\n` must still separate paragraphs (not collapse into one).
+
+  it('renders a single newline in an agent message as a <br>, not a collapsed space', () => {
+    const msg = makeMessage({ role: 'agent', type: 'output', content: 'line one\nline two' })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    // With only remark-gfm the newline collapses to whitespace and no <br> exists.
+    expect(container.querySelector('br')).not.toBeNull()
+  })
+
+  it('renders a single newline in a plain operator/user message as a <br>', () => {
+    // Operator/user text flows through the same MarkdownContent path — one
+    // render path, fixed once. A single newline must break there too.
+    const msg = makeMessage({ role: 'user', type: 'chat', content: 'first\nsecond' })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    expect(container.querySelector('br')).not.toBeNull()
+  })
+
+  it('breaks single newlines in the large-content preview path too', () => {
+    // Large content renders via the *second* ReactMarkdown call (the truncated
+    // preview). remark-breaks must be wired into that call as well, so the
+    // first preview lines still break on single newlines.
+    // Mirrors the component's LARGE_CONTENT_THRESHOLD (10_000 chars); anything
+    // larger routes through the truncated-preview render path.
+    const content = 'alpha\nbeta\ngamma\n' + 'x'.repeat(10_100)
+    const msg = makeMessage({ role: 'agent', type: 'output', content })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    // Confirm we're on the preview path (the "Render full content" button shows).
+    expect(container.textContent).toMatch(/Render full content/)
+    expect(container.querySelector('br')).not.toBeNull()
+  })
+
+  it('keeps a blank line as separate paragraphs (does not merge on soft breaks)', () => {
+    // Guard: remark-breaks must not collapse a paragraph break — `\n\n` stays
+    // two <p> elements. (This holds pre-fix too; it protects against a
+    // regression where enabling breaks flattens paragraph structure.)
+    const msg = makeMessage({ role: 'agent', type: 'output', content: 'para one\n\npara two' })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    expect(container.querySelectorAll('p').length).toBeGreaterThanOrEqual(2)
+  })
+})
+
 describe('ChatMessage — overflow containment (R1)', () => {
   it('scopes a horizontal scrollbar to code blocks inside the bubble', () => {
     const msg = makeMessage({
