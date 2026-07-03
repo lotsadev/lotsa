@@ -360,7 +360,7 @@ Start the dashboard. Reads `lotsa.yaml` from `--data-dir` (default `~/.lotsa`). 
 
 ```bash
 lotsa serve                                # dashboard on 127.0.0.1:8420
-lotsa serve --flow full                    # use the bundled full process
+lotsa serve --flow build                   # use the bundled Build (Execute) process
 lotsa serve --process marketing            # use an inline process from lotsa.yaml
 lotsa serve --flow-file my.yaml            # use a standalone process.yaml
 lotsa serve --model opus                   # use a specific model
