@@ -1,8 +1,19 @@
-import { describe, it, expect } from 'vitest'
-import { render } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ChatInput } from './chat-input'
 import type { Flow, TaskDetail, TaskDetailFull } from '@/api/types'
+
+// Spy only the two calls the partial-upload regression drives; keep every other
+// export (fetchProcesses etc., used by PromoteDialog's subtree) real so the
+// component renders. No submit hits the network — reviseTask is stubbed.
+const uploadAttachment = vi.fn()
+const reviseTask = vi.fn()
+vi.mock('@/api/tasks', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api/tasks')>()),
+  uploadAttachment: (...args: unknown[]) => uploadAttachment(...args),
+  reviseTask: (...args: unknown[]) => reviseTask(...args),
+}))
 
 // Spec (mobile-first redesign, AC#6): the chat-input action button row
 // (Send / Stop / Accept / override / Promote / Retry) must wrap or reflow
@@ -94,5 +105,49 @@ describe('ChatInput action row reflow', () => {
   it('still renders the Send control', () => {
     const { getByRole } = renderChatInput()
     expect(getByRole('button', { name: 'Send' })).toBeInTheDocument()
+  })
+})
+
+describe('ChatInput partial-upload retry', () => {
+  beforeEach(() => {
+    uploadAttachment.mockReset()
+    reviseTask.mockReset()
+    reviseTask.mockResolvedValue({})
+  })
+
+  // Regression: uploadPending() must drop each successfully-uploaded file from
+  // the picker as its POST resolves, even when a *later* file in the batch
+  // fails. Before the fix `setFiles([])` only ran on full success, so a partial
+  // failure left the already-durable files selected and the next Send
+  // re-uploaded them — duplicate suffixed records + burning the 10-file cap.
+  it('does not re-upload already-uploaded files after a mid-batch failure', async () => {
+    // File 1 uploads fine; file 2 fails.
+    uploadAttachment
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('502 Bad Gateway'))
+
+    const { container, findByText } = renderChatInput()
+    const textarea = container.querySelector('textarea')!
+    fireEvent.change(textarea, { target: { value: 'here are two files' } })
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const fileA = new File([new Uint8Array([1])], 'a.png', { type: 'image/png' })
+    const fileB = new File([new Uint8Array([2])], 'b.png', { type: 'image/png' })
+    fireEvent.change(fileInput, { target: { files: [fileA, fileB] } })
+
+    // First Send: uploads a.png (ok) then b.png (fails), aborting the action.
+    fireEvent.submit(container.querySelector('form')!)
+    await findByText(/Failed to attach b\.png/)
+    expect(reviseTask).not.toHaveBeenCalled()
+    // The failed file's chip stays; the uploaded one is gone.
+    expect(container.querySelector('[aria-label="Remove b.png"]')).not.toBeNull()
+    expect(container.querySelector('[aria-label="Remove a.png"]')).toBeNull()
+
+    // Second Send: only b.png is retried — a.png is never re-uploaded.
+    uploadAttachment.mockResolvedValue({})
+    fireEvent.submit(container.querySelector('form')!)
+    await waitFor(() => expect(reviseTask).toHaveBeenCalledTimes(1))
+    const uploadedNames = uploadAttachment.mock.calls.map((c) => (c[1] as File).name)
+    expect(uploadedNames).toEqual(['a.png', 'b.png', 'b.png'])
+    expect(uploadedNames.filter((n) => n === 'a.png')).toHaveLength(1)
   })
 })

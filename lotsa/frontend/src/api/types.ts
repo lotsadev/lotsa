@@ -116,6 +116,16 @@ export interface Project {
   path: string
 }
 
+// One prompt-attachment record (Path A) from
+// GET/POST /api/tasks/{id}/attachments. Bytes live on disk; this is metadata.
+export interface Attachment {
+  filename: string
+  rel_path: string
+  mime: string
+  size_bytes: number
+  created_at: string
+}
+
 // ADR-017 — one in-flight agent activity event surfaced by
 // GET /api/tasks/{id}/agent-activity.
 export interface AgentActivityEvent {

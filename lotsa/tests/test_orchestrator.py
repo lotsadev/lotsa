@@ -6060,3 +6060,316 @@ class TestPrLifetimeMonitoringDeferredCompletion:
             "the drainer must apply the deferred terminal after the agent's routing; "
             f"got status={fresh.status!r} state={fresh.state!r}"
         )
+
+
+class TestAttachmentMaterialization:
+    """Dispatch-time materialization of prompt attachments (Path A).
+
+    At every agent dispatch the orchestrator copies the task's durable
+    attachments into ``{work_dir}/.lotsa/attachments/``, git-excludes them, and
+    appends a prompt block listing the relative paths. Written before the
+    feature exists, so ``_run_agent`` injects nothing yet — the prompt-block
+    assertions fail as the expected red.
+    """
+
+    @staticmethod
+    def _seed_attachment(service, run, task_id, name="bug.png", data=b"PNGDATA"):
+        """Place a durable attachment on disk + in metadata, as the upload
+        endpoint would, without depending on that endpoint existing yet."""
+        attach_dir = service.config.data_dir / "attachments" / "default" / task_id
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        (attach_dir / name).write_bytes(data)
+        row = run(service.db.get_task(task_id))
+        meta = dict(row.metadata)
+        meta.setdefault("attachments", [])
+        meta["attachments"].append(
+            {
+                "filename": name,
+                "rel_path": f".lotsa/attachments/{name}",
+                "mime": "image/png",
+                "size_bytes": len(data),
+                "created_at": "2026-07-02T00:00:00+00:00",
+            }
+        )
+        run(service.db.update_task(task_id, metadata=meta))
+
+    def test_no_attachments_leaves_prompt_untouched(self, service, run):
+        run(service.create_task("Plain task"))
+        run(asyncio.sleep(0.2))
+        assert service.runner.calls, "first step should have dispatched"
+        assert ".lotsa/attachments" not in service.runner.calls[0]["user_prompt"]
+
+    def test_attachment_copied_into_worktree_and_listed_in_prompt(self, service, run):
+        run(service.create_task("Attach task"))
+        run(asyncio.sleep(0.2))
+        task_id = run(service.list_tasks_async())[0].id
+        assert run(service.db.get_task(task_id)).status == "waiting"
+
+        self._seed_attachment(service, run, task_id, data=b"PNGDATA")
+
+        before = len(service.runner.calls)
+        run(service.revise(task_id, "Please look at the screenshot"))
+        run(asyncio.sleep(0.2))
+        assert len(service.runner.calls) > before, "revise must re-dispatch the agent"
+
+        call = service.runner.calls[-1]
+        # The prompt block names the worktree-relative path for the Read tool.
+        assert ".lotsa/attachments/bug.png" in call["user_prompt"]
+        assert "Read" in call["user_prompt"]
+
+        # The file was copied into the worktree the agent actually ran in.
+        work_dir = Path(call["work_dir"])
+        copied = work_dir / ".lotsa" / "attachments" / "bug.png"
+        assert copied.exists()
+        assert copied.read_bytes() == b"PNGDATA"
+        # And the managed ignore is in place so it never gets committed.
+        assert "*" in (work_dir / ".lotsa" / ".gitignore").read_text()
+
+    def test_deferred_create_holds_first_dispatch_until_attachments_uploaded(self, service, run):
+        """The create-then-upload flow must reach the FIRST agent step.
+
+        Regression for the ordering bug: ``create_task`` used to dispatch the
+        first step immediately, before the empty-state form could POST its
+        files — so ``_run_agent`` read ``tasks.metadata`` with no attachment
+        records and the first prompt silently missed them. With
+        ``defer_dispatch=True`` the dispatch is held until ``dispatch_created``.
+
+        Fails against the pre-fix code: without deferral the first step
+        dispatches at create time, so ``runner.calls`` is non-empty right after
+        create (the ``assert not service.runner.calls`` line) and that first
+        prompt never lists the attachment (uploaded only afterwards).
+        """
+        task = run(service.create_task("Attach task", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        # Deferred: nothing dispatched yet, so the operator's upload can land
+        # before the first agent ever runs.
+        assert not service.runner.calls, "deferred create must NOT dispatch the first step"
+
+        # Upload happens now (as the endpoint would), THEN we release dispatch.
+        self._seed_attachment(service, run, task.id, data=b"PNGDATA")
+        run(service.dispatch_created(task.id))
+        run(asyncio.sleep(0.2))
+
+        assert len(service.runner.calls) == 1, "dispatch_created must run the first step exactly once"
+        call = service.runner.calls[0]
+        assert ".lotsa/attachments/bug.png" in call["user_prompt"]
+        assert "Read" in call["user_prompt"]
+        # The file reached the worktree the first step actually ran in.
+        copied = Path(call["work_dir"]) / ".lotsa" / "attachments" / "bug.png"
+        assert copied.read_bytes() == b"PNGDATA"
+
+    def test_deferred_conversational_create_replays_message_on_dispatch(self, tmp_path, _loop, run):
+        """A deferred conversational first step (the default ``chat`` new-task
+        flow) still replays the operator's message as feedback on dispatch.
+
+        ``dispatch_created`` recovers the original message from the chat log and
+        passes it as ``feedback`` — matching what ``create_task`` would have done
+        inline — so the held conversational step receives both the message and
+        the attachment path when it finally runs.
+        """
+        data_dir = tmp_path / "tasks"
+        data_dir.mkdir()
+        flow_yaml = tmp_path / "chat_flow.yaml"
+        # Use the ``coding`` prompt name (which resolves in the bundled prompts)
+        # for a conversational first step — mirrors the ``chat`` process shape.
+        flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    type: agent\n    conversational: true\n")
+        config = LotsaConfig(
+            data_dir=data_dir,
+            work_dir=data_dir.parent,
+            flow="custom",
+            flow_file=flow_yaml,
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(data_dir / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+        svc.runner = FakeRunner()
+        run(svc.start())
+        try:
+            task = run(svc.create_task(message="Build from this mockup", defer_dispatch=True))
+            run(asyncio.sleep(0.2))
+            assert not svc.runner.calls, "deferred conversational create must not dispatch"
+
+            self._seed_attachment(svc, run, task.id, data=b"PNGDATA")
+            run(svc.dispatch_created(task.id))
+            run(asyncio.sleep(0.2))
+
+            assert len(svc.runner.calls) == 1
+            prompt = svc.runner.calls[0]["user_prompt"]
+            assert "Build from this mockup" in prompt, "the original message must be replayed as feedback"
+            assert ".lotsa/attachments/bug.png" in prompt
+        finally:
+            run(svc.shutdown())
+            run(db.close())
+
+    def test_dispatch_created_refuses_second_call_on_active_task(self, tmp_path, _loop, run):
+        """A repeat ``/dispatch`` on an already-dispatched, still-running task must
+        NOT spawn a second concurrent agent against the same worktree.
+
+        Regression for the missing precondition on ``dispatch_created``. Uses a
+        hang runner so the first step stays ``in_flight`` (status=working,
+        state=active_state) when the second call arrives — the exact window in
+        which ``_dispatch_next_step``'s "active state — re-dispatch" self-loop
+        CAS (``from_state == to_state``, ``working → working``) *always* wins.
+
+        Fails against the pre-fix code: without the guard the second call
+        re-enters ``_dispatch_next_step``, the self-loop CAS wins, a second
+        ``_run_agent`` is scheduled (``runner.calls`` → 2, overwriting
+        ``_in_flight[id]`` and orphaning the first agent), and no exception is
+        raised — so both the ``pytest.raises`` and the ``== 1`` assertion below
+        trip.
+        """
+        from lotsa.orchestrator import DispatchNotAllowed
+
+        data_dir = tmp_path / "tasks"
+        data_dir.mkdir()
+        flow_yaml = tmp_path / "flow.yaml"
+        # Non-conversational first step: state goes backlog → active_state on
+        # the first dispatch, which is where the dangerous self-loop lives.
+        flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    type: agent\n")
+        config = LotsaConfig(
+            data_dir=data_dir,
+            work_dir=data_dir.parent,
+            flow="custom",
+            flow_file=flow_yaml,
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(data_dir / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+        svc.runner = _RecordingHangRunner()
+        run(svc.start())
+        try:
+            task = run(svc.create_task(message="Build it", defer_dispatch=True))
+            run(asyncio.sleep(0.2))
+            assert not svc.runner.calls, "deferred create must not dispatch"
+
+            # First release: the agent is now recorded and hanging in-flight.
+            run(svc.dispatch_created(task.id))
+            run(asyncio.sleep(0.2))
+            assert len(svc.runner.calls) == 1
+            fresh = run(svc.db.get_task(task.id))
+            assert fresh.status == "working" and fresh.current_step == "coding"
+            assert task.id in svc._in_flight
+
+            # Second release on the still-active task must be refused, not
+            # re-dispatched.
+            with pytest.raises(DispatchNotAllowed, match="already been dispatched"):
+                run(svc.dispatch_created(task.id))
+            run(asyncio.sleep(0.2))
+            assert len(svc.runner.calls) == 1, "a second /dispatch must NOT spawn a second agent"
+        finally:
+            run(svc.shutdown())
+            run(db.close())
+
+    def test_materialization_is_idempotent_across_redispatch(self, service, run):
+        run(service.create_task("Attach task"))
+        run(asyncio.sleep(0.2))
+        task_id = run(service.list_tasks_async())[0].id
+        self._seed_attachment(service, run, task_id, data=b"PNGDATA")
+
+        run(service.revise(task_id, "first pass"))
+        run(asyncio.sleep(0.2))
+        run(service.revise(task_id, "second pass"))
+        run(asyncio.sleep(0.2))
+
+        call = service.runner.calls[-1]
+        work_dir = Path(call["work_dir"])
+        attach_dir = work_dir / ".lotsa" / "attachments"
+        # Re-dispatch neither duplicated the file nor errored the task.
+        assert [p.name for p in attach_dir.iterdir()] == ["bug.png"]
+        assert ".lotsa/attachments/bug.png" in call["user_prompt"]
+        assert run(service.db.get_task(task_id)).status == "waiting"
+
+    def test_restart_recovery_starts_never_dispatched_deferred_task(self, service, run):
+        """A deferred task stranded across a restart must be STARTED by the
+        recovery sweep, not blocked with a misleading "couldn't resume" message.
+
+        A task created with ``defer_dispatch=True`` sits at ``status='working'``,
+        ``current_step=None`` until ``dispatch_created()`` releases it. If the
+        server restarts inside that window there is no interrupted step to
+        resume — the first step never ran — so the sweep's
+        ``_classify_and_resume`` must recognise the never-dispatched shape and
+        release the first step (materializing whatever attachments landed).
+
+        Fails against the pre-fix code: ``_classify_and_resume`` fell into
+        ``_redispatch_current_step``, found no step for ``current_step=None``,
+        and parked the task at ``blocked`` with "Couldn't resolve the
+        interrupted step to resume — click Retry." (the runner never ran).
+        """
+        task = run(service.create_task("Attach task", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        assert not service.runner.calls, "deferred create must not dispatch"
+        # Attachments landed before the (simulated) restart.
+        self._seed_attachment(service, run, task.id, data=b"PNGDATA")
+
+        # Simulate the startup recovery sweep encountering this working row.
+        row = run(service.db.get_task(task.id))
+        assert row.status == "working" and row.current_step is None
+        run(service._classify_and_resume(row))
+        run(asyncio.sleep(0.2))
+
+        # The first step actually ran (with the attachment), and the task is NOT
+        # stuck at an un-resumable blocked.
+        assert len(service.runner.calls) == 1, "recovery must release the held first step"
+        assert ".lotsa/attachments/bug.png" in service.runner.calls[0]["user_prompt"]
+        fresh = run(service.db.get_task(task.id))
+        assert fresh.status != "blocked", "never-dispatched deferred task must not be parked as un-resumable"
+
+    def test_stop_parks_never_dispatched_deferred_task_for_retry(self, service, run):
+        """If the operator's browser closes between ``create(defer)`` and the
+        follow-up ``dispatch()`` (no restart to auto-heal it), the task is stuck
+        at ``status='working'`` with no in-flight agent. ``stop()`` must park it
+        so ``retry()`` can start it — otherwise it shows "Agent is working…"
+        forever with no recovery path.
+
+        Fails against the pre-fix code: ``stop()``'s guard raised
+        ``StopNotAllowed`` for any non-in-flight task, so the deferred-and-
+        abandoned task had no recovery path (``retry()`` requires ``blocked``;
+        ``stop()`` required an in-flight agent).
+        """
+        task = run(service.create_task("Attach task", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        assert not service.runner.calls
+        assert task.id not in service._in_flight, "deferred task has no in-flight agent"
+
+        # No restart — the operator hits Stop on the wedged task.
+        run(service.stop(task.id))
+        parked = run(service.db.get_task(task.id))
+        assert parked.status == "blocked", "stop() must park the stuck deferred task at blocked"
+
+        # And Retry now re-dispatches the held first step (with attachments).
+        self._seed_attachment(service, run, task.id, data=b"PNGDATA")
+        run(service.retry(task.id))
+        run(asyncio.sleep(0.2))
+        assert len(service.runner.calls) == 1, "retry must start the parked deferred task"
+        assert ".lotsa/attachments/bug.png" in service.runner.calls[0]["user_prompt"]
+
+    def test_stop_does_not_park_interrupted_mid_flow_row(self, service, run):
+        """The deferred-shape park in ``stop()`` must NOT swallow a genuinely-
+        interrupted mid-flow row that happens to carry ``current_step=None``.
+
+        A working row parked in an *active* state (here ``coding``, not the
+        initial ``backlog``) with no in-flight agent is an interrupted/legacy
+        task, not a never-dispatched deferred one — ``stop()`` must keep raising
+        ``StopNotAllowed`` for it (restart recovery owns that shape), rather than
+        parking it as though its first step had never run.
+
+        Fails against a too-broad ``current_step is None`` discriminator: that
+        form parks this row at ``blocked`` and the ``pytest.raises`` below never
+        fires (the same over-broad match that mis-routed the ADR-021 recovery
+        sweep rows).
+        """
+        from lotsa.orchestrator import StopNotAllowed
+
+        # A working row in an active (non-initial) state, current_step unset,
+        # never entered _in_flight — the interrupted-mid-flow shape.
+        row = run(service.db.create_task("interrupted mid-flow", state="coding", status="working"))
+        assert row.current_step is None and row.id not in service._in_flight
+
+        with pytest.raises(StopNotAllowed, match="actively-working agent"):
+            run(service.stop(row.id))
+        # Untouched — not parked at blocked by the deferred branch.
+        assert run(service.db.get_task(row.id)).status == "working"

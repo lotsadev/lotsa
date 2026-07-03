@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from lotsa.engines.pr_monitor import PrMonitorConfig
 
+from lotsa.attachments import materialize_into_worktree
 from lotsa.config import LotsaConfig, resolve_project_specs
 from lotsa.db import (
     PUSH_START,
@@ -137,6 +138,16 @@ class AcknowledgeOverrideNotAllowed(Exception):
 
 class ReviseNotAllowed(Exception):
     """Raised when revise()/send_message() is called from a non-actionable status."""
+
+
+class DispatchNotAllowed(Exception):
+    """Raised when dispatch_created() targets a task that was not created
+    deferred, or has already had its first step dispatched.
+
+    ``POST /tasks/{id}/dispatch`` only releases the held first step of a task
+    created with ``defer_dispatch=True``. Calling it on an already-dispatched
+    task would re-enter ``_dispatch_next_step`` on a live worktree — the guard
+    turns that into a clean 4xx instead of a second concurrent agent run."""
 
 
 class StopNotAllowed(Exception):
@@ -1508,6 +1519,7 @@ class OrchestratorService:
         message: str | None = None,
         process_name: str | None = None,
         project_id: str | None = None,
+        defer_dispatch: bool = False,
     ) -> TaskRow:
         """Create a new task and dispatch its first step.
 
@@ -1531,6 +1543,15 @@ class OrchestratorService:
                           the name in metadata and every routing decision
                           resolves against it. An unknown name (not in the
                           catalog) raises ``ProcessNotFound``.
+            defer_dispatch: When True, create the task and store its first
+                          message but do **not** dispatch the first step —
+                          the caller must call :meth:`dispatch_created` once
+                          it is ready. This exists so the create-then-upload
+                          attachment flow (empty-state form) can upload the
+                          operator's files *before* the first agent dispatch:
+                          otherwise ``_run_agent``'s ``_materialize_attachments``
+                          reads ``tasks.metadata`` before any attachment record
+                          exists and the first step silently misses them.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
@@ -1611,7 +1632,8 @@ class OrchestratorService:
                 metadata=metadata,
             )
             await self.db.add_message(task.id, "user", first_step.job_type, chat_content, "chat")
-            await self._dispatch_step(item, first_step, feedback=chat_content)
+            if not defer_dispatch:
+                await self._dispatch_step(item, first_step, feedback=chat_content)
             return task
 
         # Normal flow: create in backlog, dispatch immediately
@@ -1628,8 +1650,101 @@ class OrchestratorService:
         if message is not None:
             step_name = first_step.job_type if first_step else ""
             await self.db.add_message(task.id, "user", step_name, message, "chat")
-        await self._dispatch_next_step(item)
+        if not defer_dispatch:
+            await self._dispatch_next_step(item)
         return task
+
+    async def dispatch_created(self, task_id: str) -> None:
+        """Dispatch the first step of a task created with ``defer_dispatch=True``.
+
+        Runs the same first-step dispatch :meth:`create_task` would have, now
+        that the operator's attachments have been uploaded and recorded in
+        ``tasks.metadata`` — so the first agent prompt materializes them (Path
+        A). Delegates to :meth:`_release_first_step` for the actual dispatch (a
+        helper shared with the restart-recovery sweep, which releases a task
+        stranded in this same never-dispatched shape).
+
+        No-op if the task has vanished. Guarded against re-dispatch: a task is
+        only releasable while it is still un-dispatched — ``current_step`` unset
+        (``create_task`` leaves it ``None`` until the first ``_dispatch_step``
+        writes ``step.name``) and absent from ``_in_flight``. Once the first
+        step has run this raises :class:`DispatchNotAllowed` rather than
+        re-entering ``_dispatch_next_step``: an already-active task
+        (``state == step.active_state``) would otherwise hit that method's
+        "active state — re-dispatch" branch, whose self-loop CAS
+        (``from_state == to_state``, ``working → working``) *always* wins on a
+        sequential call and would spawn a second ``_run_agent`` against the same
+        worktree — orphaning the first agent in ``_in_flight`` and violating the
+        single-process dispatch guarantee (Constitution §3.3). The first (real)
+        dispatch is a genuine ``queue_state → active_state`` transition, so
+        concurrent double-calls before either dispatches are still resolved by
+        ``_dispatch_step``'s CAS; this guard closes the *sequential* re-call.
+        """
+        row = await self.db.get_task(task_id)
+        if row is None:
+            return
+        if row.current_step is not None or task_id in self._in_flight:
+            raise DispatchNotAllowed(
+                f"Task {task_id} has already been dispatched — /dispatch only releases the "
+                "held first step of a task created with defer_dispatch=True."
+            )
+        await self._release_first_step(row)
+
+    async def _release_first_step(self, row: TaskRow) -> None:
+        """Dispatch the held first step of a deferred task.
+
+        Shared by :meth:`dispatch_created` (the operator's release after the
+        upload sequence) and the restart-recovery sweep (which releases a task
+        stranded in the deferred, never-dispatched shape). The row already sits
+        in its initial queued state (``backlog`` for a normal first step, the
+        step's ``queue_state`` for a conversational one), so
+        ``_dispatch_next_step`` picks the right step; a conversational first step
+        also needs the operator's original message replayed as ``feedback``.
+        """
+        flow = self.root_flow_for(row)
+        first_step = flow.steps[0] if flow and flow.steps else None
+        feedback: str | None = None
+        if first_step is not None and first_step.conversational:
+            chats = await self.db.get_messages(row.id, msg_type="chat")
+            feedback = chats[0].content if chats else None
+        item = Item(
+            id=row.id,
+            state=row.state,
+            priority=row.priority,
+            title=row.title,
+            body=row.body,
+            metadata=row.metadata,
+        )
+        await self._dispatch_next_step(item, feedback=feedback)
+
+    def _is_never_dispatched_deferred(self, row: TaskRow) -> bool:
+        """True when ``row`` is a task whose first step never ran — the shape a
+        ``defer_dispatch=True`` create leaves behind until ``dispatch_created``
+        releases it (or the browser/server dies in that window).
+
+        The shape is ``current_step is None`` **and** the row still sits in the
+        exact state ``create_task`` parks a not-yet-dispatched task in: the
+        literal ``backlog`` for a normal first step, or the step's
+        ``queue_state`` for a conversational one. ``current_step is None`` alone
+        is NOT sufficient — a genuinely-interrupted mid-flow row (legacy, or a
+        synthetic recovery row) can also carry ``current_step=None`` while
+        sitting in an *active/action* state (e.g. ``coding``/``deploy``); those
+        must route through the normal recovery path, not be mistaken for a
+        never-dispatched task. Restricting to the initial queued state keeps the
+        two apart.
+
+        Used by both restart recovery (:meth:`_classify_and_resume`) and
+        :meth:`stop` so the deferred shape is recognised identically on both
+        surfaces.
+        """
+        if row.current_step is not None:
+            return False
+        flow = self.root_flow_for(row)
+        first_step = flow.steps[0] if flow and flow.steps else None
+        if first_step is None:
+            return False
+        initial_state = first_step.queue_state if first_step.conversational else "backlog"
+        return row.state == initial_state
 
     async def _chat_transcript(self, task_id: str) -> str:
         """Render a task's chat conversation as a transcript for promotion handover.
@@ -2712,7 +2827,46 @@ class OrchestratorService:
         row = await self.db.get_task(task_id)
         if row is None:
             raise StopNotAllowed(f"Task {task_id} not found")
-        if row.status != "working" or task_id not in self._in_flight:
+        if row.status != "working":
+            raise StopNotAllowed(
+                f"stop() requires an actively-working agent (status='working' and in-flight), got status={row.status!r}"
+            )
+        if task_id not in self._in_flight:
+            # A task created with defer_dispatch=True but never released sits at
+            # status='working' with current_step=None in its initial queued
+            # state and NO in-flight agent — if the operator's browser closed
+            # between create and the follow-up dispatch() (no restart to
+            # auto-heal it), it is otherwise stuck at "Agent is working…" forever
+            # with no recovery path. There is no agent to cancel, but park it at
+            # blocked so Retry can re-dispatch the held first step (or Archive
+            # can discard it). A genuinely-working task is always in _in_flight,
+            # and a working task with current_step set is a natural-completion
+            # race (drainer will land it) — so gate on the never-dispatched
+            # deferred shape (the same discriminator restart recovery uses) to
+            # hit only that case, and keep raising for everything else.
+            if self._is_never_dispatched_deferred(row):
+                # Fire the park CAS. It writes the audit row only on win; if it
+                # loses (a racing restart-recovery release or concurrent stop
+                # already moved the row) it's a clean no-op. No side effect
+                # follows the CAS, so there is nothing to gate on ``won``.
+                await self.db.atomic_transition(
+                    task_id,
+                    from_status="working",
+                    from_state=row.state,
+                    to_state=row.state,
+                    to_status="blocked",
+                    to_current_step=row.state,
+                    audit_on_win=AuditRow(
+                        role="system",
+                        step_name=row.state,
+                        content=(
+                            "Task was created but never started (attachment upload "
+                            "abandoned) — parked. Click Retry to start it."
+                        ),
+                        msg_type="status_change",
+                    ),
+                )
+                return
             raise StopNotAllowed(
                 f"stop() requires an actively-working agent (status='working' and in-flight), got status={row.status!r}"
             )
@@ -4294,6 +4448,29 @@ class OrchestratorService:
         ``atomic_transition`` (won-checked) so the sweep is safe against the
         drainer/monitor loops ``start()`` launches immediately after.
         """
+        # Never-dispatched deferred task (ADR-034 attachment flow): a task
+        # created with ``defer_dispatch=True`` sits at ``status='working'`` with
+        # ``current_step=None`` in its initial queued state until
+        # ``dispatch_created`` releases it. If the server restarts (or the
+        # operator's browser closed) inside that window, there is no interrupted
+        # step to *resume* — the first step never ran. Release it now
+        # (resumptive, per ADR-040): whatever attachments landed are
+        # materialized on dispatch. The discriminator gates on the *initial*
+        # state as well as ``current_step`` so a genuinely-interrupted mid-flow
+        # row (which can also carry ``current_step=None``) still routes through
+        # the normal recovery path below rather than being re-dispatched from
+        # its first step.
+        if self._is_never_dispatched_deferred(row):
+            await self.db.add_message(
+                row.id,
+                "system",
+                row.state,
+                "Server restarted before this task's first step was dispatched — starting it now.",
+                "status_change",
+            )
+            await self._release_first_step(row)
+            return
+
         resume_count = int((row.metadata or {}).get("resume_count", 0))
         step_label = row.current_step or row.state
 
@@ -4907,6 +5084,20 @@ class OrchestratorService:
                     user_prompt += f"\n\n## Revision Feedback\n\n{info.feedback}"
 
             work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
+
+            # Materialize operator-attached files into the worktree and append a
+            # path block so the agent can Read them (Path A). Idempotent — runs
+            # on every dispatch (creation, revision, next steps, pr-fix), so a
+            # file attached after the first dispatch still reaches later steps.
+            rel_paths = await self._materialize_attachments(item, work_dir)
+            if rel_paths:
+                listed = ", ".join(f"`{p}`" for p in rel_paths)
+                user_prompt += (
+                    "\n\n## Operator-attached files\n\n"
+                    "The operator attached these files — read them with the Read tool: "
+                    f"{listed}."
+                )
+
             result = await runner.run(
                 system_prompt=system,
                 user_prompt=user_prompt,
@@ -6596,6 +6787,30 @@ class OrchestratorService:
         if project is not None:
             return Path(project.path)
         return Path(self.config.work_dir)
+
+    async def _materialize_attachments(self, item: Item, work_dir: Path) -> list[str]:
+        """Copy the task's durable attachments into the worktree and return the
+        worktree-relative paths for the prompt block (Path A).
+
+        Re-reads the task row so a file attached *after* this dispatch was queued
+        is still picked up. Idempotent and best-effort — the copy runs off the
+        event loop (Constitution §2.1) and a missing durable source is skipped,
+        not fatal.
+        """
+        row = await self.db.get_task(item.id)
+        if row is None:
+            return []
+        records = row.metadata.get("attachments") or []
+        if not records:
+            return []
+        return await asyncio.to_thread(
+            materialize_into_worktree,
+            records,
+            self.config.data_dir,
+            row.project_id,
+            item.id,
+            work_dir,
+        )
 
     async def _sync_projects(self) -> None:
         """Seed/sync the ``projects`` table from ``lotsa.yaml`` at startup.
