@@ -72,7 +72,22 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
       // Release the deferred first dispatch now that uploads have run (even on a
       // partial failure — a stranded, never-dispatched task is worse than one
       // that starts with whatever attached). Only needed when we deferred.
-      if (hasFiles) await dispatchTask(result.task.id)
+      //
+      // Treat a dispatch failure the same way as an upload failure: record it
+      // but do NOT rethrow. Letting it hit the outer catch would set the
+      // generic "Failed to create task" and skip onTaskCreated, stranding a
+      // task that already exists server-side with its first step never
+      // dispatched — and a resubmit would create a duplicate. Instead we
+      // surface the error and still navigate to the created task so the
+      // operator lands on it (with the failure shown) rather than losing
+      // track of it.
+      if (hasFiles) {
+        try {
+          await dispatchTask(result.task.id)
+        } catch (e) {
+          attachError = attachError ?? `Failed to start task: ${(e as Error).message}`
+        }
+      }
       if (project) localStorage.setItem(LAST_PROJECT_KEY, project)
       setMessage('')
       setFiles([])
