@@ -197,6 +197,24 @@ class AgentRunner(Protocol):
         """
         ...
 
+    @property
+    def supports_resume(self) -> bool:
+        """Whether this runner can reattach to a prior session across a restart
+        (ADR-040 R3).
+
+        ``True`` means a persisted ``session_id`` survives a daemon restart and
+        the runner threads it into a resume (``--resume`` for the CLI runners),
+        so the orchestrator resumes the interrupted step instead of re-running
+        it from scratch. ``False`` routes interrupted steps to the safe
+        idempotent re-run-from-start path.
+
+        Declared explicitly on every concrete runner (same simultaneous-update
+        discipline as ``dispatch_shape_prompt``). The orchestrator still reads
+        it defensively (``getattr(runner, "supports_resume", False)``) so a
+        mid-rollout runner or a test double without it falls back to re-run.
+        """
+        ...
+
 
 class ClaudeCodeRunner:
     """AgentRunner implementation using the Claude Code CLI.
@@ -298,6 +316,11 @@ class ClaudeCodeRunner:
     def dispatch_shape_prompt(self) -> str:
         """CLI-shaped dispatch fragment (``claude --print`` one-shot)."""
         return CLI_DISPATCH_SHAPE_FRAGMENT
+
+    # ADR-040: the CLI runner threads ``session_id`` into ``--resume`` (see
+    # ``run`` below) and its session JSONL persists on disk under the worktree
+    # agent-home, so it survives a daemon restart and can be resumed.
+    supports_resume = True
 
     async def read_activity(
         self,

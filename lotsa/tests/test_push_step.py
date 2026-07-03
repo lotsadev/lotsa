@@ -302,6 +302,53 @@ async def test_execute_push_skips_create_pr_when_pr_exists(monkeypatch, tmp_path
 
 
 # ---------------------------------------------------------------------------
+# ADR-040 R1 — a resumed push must not open a duplicate PR
+# ---------------------------------------------------------------------------
+
+
+async def test_resumed_push_with_pr_number_opens_no_duplicate_pr(monkeypatch, tmp_path):
+    """When an interrupted push is re-dispatched, the existing ``pr_number``
+    (read from task metadata) is passed in, so ``execute_push`` re-pushes the
+    branch idempotently and calls ``create_pr`` ZERO times — no duplicate PR
+    (ADR-040 R1 / acceptance criterion 1).
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    remote_patch, changes_patch = _patch_helpers(_HTTPS_REMOTE, False)
+    head_patch, normalize_patch = _patch_git_helpers()
+    proc = _make_proc_mock(returncode=0)
+
+    mock_client = AsyncMock()
+    mock_client.create_pr = AsyncMock(return_value=1234)
+    mock_client.close = AsyncMock()
+
+    with (
+        remote_patch,
+        changes_patch,
+        head_patch,
+        normalize_patch,
+        patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)),
+        patch("os.fdopen"),
+        patch("os.chmod"),
+        patch("os.unlink"),
+        patch("tempfile.mkstemp", return_value=(99, "/tmp/fake-askpass.py")),
+        patch("lotsa.push_step.GitHubClient", return_value=mock_client),
+    ):
+        # First (interrupted) push already created PR #77; the resume passes it back.
+        pr_num, _url, _owner, _repo = await execute_push(
+            tmp_path,
+            "task-1",
+            77,  # pr_number known from metadata
+            "main",
+            title=None,
+            body=None,
+        )
+
+    assert pr_num == 77
+    mock_client.create_pr.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # execute_push — push-by-HEAD refspec
 # ---------------------------------------------------------------------------
 

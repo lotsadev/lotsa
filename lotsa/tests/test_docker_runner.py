@@ -367,3 +367,14 @@ async def test_run_uses_construction_model_when_no_override(runner, tmp_path):
     cmd = mock_run.call_args[0][0]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "sonnet"
+
+
+# ---------------------------------------------------------------------------
+# ADR-040 — resume-capability signal
+# ---------------------------------------------------------------------------
+
+
+def test_docker_runner_supports_resume(runner):
+    """The docker runner passes ``--resume`` inside the container and mounts a
+    persisted agent-home, so it reports resume support (ADR-040 R3)."""
+    assert runner.supports_resume is True

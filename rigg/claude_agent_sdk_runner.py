@@ -132,6 +132,14 @@ class ClaudeAgentSDKRunner:
         """SDK-shaped dispatch fragment (programmatic, single-turn for now)."""
         return SDK_DISPATCH_SHAPE_FRAGMENT
 
+    # ADR-040: the SDK runner passes ``resume=session_id`` programmatically, but
+    # cross-restart session durability is unverified (ADR-028 Phase 4 / SDK
+    # parity is deferred). Report *no* resume support so the orchestrator routes
+    # its interrupted steps to the safe idempotent re-run-from-start path rather
+    # than a resume that may silently start a fresh conversation. Flip to True
+    # once SDK session persistence across a daemon restart is confirmed.
+    supports_resume = False
+
     async def read_activity(
         self,
         session_id: str,

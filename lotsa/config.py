@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 # hazard.
 _PROJECT_ID_RE = re.compile(r"[a-z0-9_-]{1,64}")
 
+# ADR-040 — the production default graceful-drain window (seconds). Kept as a
+# module constant (read via ``shutdown_grace_seconds``'s default_factory) so the
+# test suite can shrink it in one place — a deliberately-hung in-flight agent
+# must not add the full 30s to every teardown — without changing the shipped
+# default.
+_DEFAULT_SHUTDOWN_GRACE_SECONDS = 30.0
+
 
 @dataclass
 class LotsaConfig:
@@ -36,6 +43,15 @@ class LotsaConfig:
     work_dir: Path = field(default_factory=lambda: Path("."))
     model: str = "sonnet"
     budget: float = 5.0
+    # ADR-040 — restart-resilient orchestration. On startup an interrupted
+    # (``status='working'``) task is auto-resumed rather than flipped straight
+    # to ``blocked``. ``resume_cap`` bounds how many times a single task may be
+    # auto-resumed before falling back to ``blocked`` (so a crash-looping agent
+    # doesn't resume forever); ``shutdown_grace_seconds`` is the bounded window
+    # ``shutdown()`` waits for in-flight agents to drain before cancelling
+    # survivors. Both are plain YAML scalars (no migration).
+    resume_cap: int = 2
+    shutdown_grace_seconds: float = field(default_factory=lambda: _DEFAULT_SHUTDOWN_GRACE_SECONDS)
     # Cap on tokens Claude Code may emit in a single response. ``None`` means
     # "don't set it — let Claude Code use its built-in default (32000 as of
     # mid-2026) or any value the operator has exported via the

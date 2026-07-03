@@ -42,7 +42,7 @@ class OverrideHandler(Protocol):
         """Return ``True`` if *task* is currently blocked by this guard."""
         ...
 
-    async def acknowledge(self, task: TaskRow, operator_reason: str | None, db: TaskDB) -> None:
+    async def acknowledge(self, task: TaskRow, db: TaskDB) -> None:
         """Clear the block and write the audit row.
 
         Performs no state-transition side effects beyond what is necessary to
@@ -171,7 +171,7 @@ class PrFixBudgetOverride:
         content = latest.content
         return content.startswith(_CAP_FIRE_PREFIX) or _SKIP_CAP_FIRE_MARKER in content
 
-    async def acknowledge(self, task: TaskRow, operator_reason: str | None, db: TaskDB) -> None:
+    async def acknowledge(self, task: TaskRow, db: TaskDB) -> None:
         # Reset the counters via an inline read-merge-write (not
         # ``_merge_task_metadata``, which takes an ``Item``). Safe because the
         # task is ``status="blocked"`` and not in-flight.
@@ -189,10 +189,10 @@ class PrFixBudgetOverride:
 
         # Write the audit row directly (bypassing ``_record_pr_decision`` so the
         # new ``"overridden"`` enum value isn't constrained by that helper's
-        # four-value Literal). ``role="user"`` — operator action (D3).
+        # four-value Literal). ``role="user"`` — operator action (D3). The row
+        # content is bare — the operator-reason field was removed (ADR-019
+        # revised 2026-07-02); rationale, when wanted, is a normal chat message.
         content = "Operator acknowledged budget cap"
-        if operator_reason:
-            content += f" — {operator_reason}"
         await db.add_message(
             task.id,
             "user",
