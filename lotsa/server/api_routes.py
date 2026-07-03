@@ -13,12 +13,19 @@ from pydantic import BaseModel
 from starlette.requests import Request
 
 from lotsa import overrides
+from lotsa.attachments import (
+    MAX_FILE_BYTES,
+    MAX_FILES_PER_TASK,
+    remove_attachment_file,
+    write_attachment,
+)
 from lotsa.orchestrator import (
     AcknowledgeOverrideNotAllowed,
     AnswerNotAllowed,
     ApproveNotAllowed,
     ArchiveFailed,
     ArchiveNotAllowed,
+    DispatchNotAllowed,
     OrchestratorService,
     ProcessNotFound,
     ProjectNotFound,
@@ -30,6 +37,7 @@ from lotsa.orchestrator import (
 from lotsa.server.schemas import (
     AgentActivityEventResponse,
     AgentActivityResponse,
+    AttachmentResponse,
     AvailableOverride,
     DiffResponse,
     FlowResponse,
@@ -61,6 +69,11 @@ class CreateTaskRequest(BaseModel):
     # when omitted the orchestrator picks the ``default`` project (or the sole
     # registered one). An unknown/non-git project yields ``PROJECT_NOT_FOUND``.
     project: str | None = None
+    # When True, create the task but hold the first dispatch — the caller then
+    # uploads any prompt attachments and calls ``POST /tasks/{id}/dispatch`` to
+    # start it. Without this, the first agent step is dispatched before the
+    # create-then-upload frontend can post its files, silently missing them.
+    defer_dispatch: bool = False
 
 
 class ProjectSummary(BaseModel):
@@ -253,6 +266,106 @@ async def get_task_diff(request: Request, task_id: str) -> DiffResponse:
     return DiffResponse(diff=diff)
 
 
+@router.get("/tasks/{task_id}/attachments")
+async def list_attachments(request: Request, task_id: str) -> list[AttachmentResponse]:
+    """List the prompt attachments recorded for a task (Path A).
+
+    Reads the JSON records from ``tasks.metadata`` — the bytes stay on disk and
+    are never returned here. A genuinely-unknown task is a 404.
+    """
+    service = _get_service(request)
+    row = await service.db.get_task(task_id)
+    if row is None:
+        raise _not_found()
+    records = row.metadata.get("attachments") or []
+    return [AttachmentResponse(**a) for a in records]
+
+
+@router.post("/tasks/{task_id}/attachments")
+async def upload_attachment(request: Request, task_id: str, filename: str) -> AttachmentResponse:
+    """Upload one file to a task's prompt attachments (Path A).
+
+    Raw-body upload: the file bytes are the request body and ``filename`` is a
+    query param (the ``Content-Type`` header supplies the MIME hint). Bytes are
+    stored on disk under ``{data_dir}/attachments/{project_id}/{task_id}/``;
+    only a JSON metadata record lands in ``tasks.metadata`` — never the audit
+    log. Any file type is accepted (no MIME/extension filtering); safety rests
+    on filename sanitization, the size/count caps, and the read-only sandbox.
+    """
+    service = _get_service(request)
+    row = await service.db.get_task(task_id)
+    if row is None:
+        raise _not_found()
+
+    # Reject oversized uploads by their declared Content-Length *before* reading
+    # any bytes — the cheap fast-path for an honest client. A non-integer header
+    # is a clean 400.
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"error": "File exceeds the 25 MB limit", "code": "ATTACHMENT_TOO_LARGE"},
+                )
+        except ValueError:
+            raise _bad_request(ValueError("Invalid Content-Length header"), "ATTACHMENT_BAD_LENGTH") from None
+
+    # Stream the body with a hard cap, aborting the moment the accumulated size
+    # exceeds the limit — so a client that omits or understates Content-Length
+    # still can't force us to buffer an unbounded payload into memory. This
+    # streaming bound (not the header pre-check) is the authority on size.
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={"error": "File exceeds the 25 MB limit", "code": "ATTACHMENT_TOO_LARGE"},
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    if not data:
+        raise _bad_request(ValueError("Empty file"), "ATTACHMENT_EMPTY")
+
+    existing = row.metadata.get("attachments") or []
+    # Pre-check for a clean 4xx in the common case; the append's WHERE clause is
+    # the race-safe authority.
+    if len(existing) >= MAX_FILES_PER_TASK:
+        raise _bad_request(
+            ValueError(f"Attachment limit ({MAX_FILES_PER_TASK}) reached for this task"),
+            "ATTACHMENT_LIMIT",
+        )
+
+    try:
+        record = await asyncio.to_thread(
+            write_attachment,
+            service.config.data_dir,
+            row.project_id,
+            task_id,
+            filename,
+            data,
+            {a["filename"] for a in existing},
+            request.headers.get("content-type"),
+        )
+    except ValueError as exc:  # unusable / traversal-only filename
+        raise _bad_request(exc, "ATTACHMENT_BAD_FILENAME") from None
+
+    appended = await service.db.append_attachment(task_id, record, cap=MAX_FILES_PER_TASK)
+    if not appended:
+        # Lost the count-cap race (or the task vanished mid-upload): drop the
+        # just-written bytes so they don't orphan on disk, then 4xx.
+        await asyncio.to_thread(
+            remove_attachment_file, service.config.data_dir, row.project_id, task_id, record["filename"]
+        )
+        raise _bad_request(
+            ValueError(f"Attachment limit ({MAX_FILES_PER_TASK}) reached for this task"),
+            "ATTACHMENT_LIMIT",
+        )
+    return AttachmentResponse(**record)
+
+
 @router.get("/tasks/{task_id}/agent-activity")
 async def get_agent_activity(
     request: Request,
@@ -360,6 +473,7 @@ async def create_task(request: Request, body: CreateTaskRequest) -> TaskDetailFu
             message=body.message,
             process_name=body.process,
             project_id=body.project,
+            defer_dispatch=body.defer_dispatch,
         )
     except ProcessNotFound as exc:
         # Unknown name (not in the catalog at all) — operator action is "add it
@@ -373,6 +487,25 @@ async def create_task(request: Request, body: CreateTaskRequest) -> TaskDetailFu
         # registered (ADR-029) — operator action is "pick a registered project".
         raise _bad_request(exc, "PROJECT_NOT_FOUND") from None
     return await _build_task_detail(service, task.id)
+
+
+@router.post("/tasks/{task_id}/dispatch")
+async def dispatch_task(request: Request, task_id: str) -> TaskDetailFullResponse:
+    """Start a task created with ``defer_dispatch=true`` (attachment flow).
+
+    The create-then-upload sequence creates the task deferred, POSTs its
+    attachments, then calls this to run the first step — so the first agent
+    prompt sees the uploaded files. A genuinely-unknown task is a 404.
+    """
+    service = _get_service(request)
+    row = await service.db.get_task(task_id)
+    if row is None:
+        raise _not_found()
+    try:
+        await service.dispatch_created(task_id)
+    except DispatchNotAllowed as exc:
+        raise _bad_request(exc, "DISPATCH_NOT_ALLOWED") from None
+    return await _build_task_detail(service, task_id)
 
 
 @router.post("/tasks/{task_id}/approve")

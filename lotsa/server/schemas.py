@@ -127,6 +127,17 @@ class DiffResponse(BaseModel):
     diff: str | None
 
 
+class AttachmentResponse(BaseModel):
+    """One prompt-attachment record (Path A). Stored as JSON in tasks.metadata;
+    the bytes live on disk under {data_dir}/attachments/{project}/{task}/."""
+
+    filename: str
+    rel_path: str
+    mime: str
+    size_bytes: int
+    created_at: str
+
+
 class TotalsResponse(BaseModel):
     """Token/cost totals for a task."""
 

@@ -10,8 +10,10 @@ import {
   retryTask,
   stopAgent,
   acknowledgeOverride,
+  uploadAttachment,
 } from '@/api/tasks'
 import type { TaskDetailFull } from '@/api/types'
+import { AttachmentPicker } from '@/components/attachment-picker'
 import { PromoteDialog } from './promote-dialog'
 
 interface ChatInputProps {
@@ -20,10 +22,43 @@ interface ChatInputProps {
 
 export function ChatInput({ data }: ChatInputProps) {
   const [inputValue, setInputValue] = useState('')
+  const [files, setFiles] = useState<File[]>([])
+  const [attachError, setAttachError] = useState<string | null>(null)
   const [promoteOpen, setPromoteOpen] = useState(false)
   const queryClient = useQueryClient()
   const { task } = data
   const availableOverrides = data.available_overrides ?? []
+
+  // Upload any pending attachments to this task before the message dispatches,
+  // so the next step materializes them. Throws (aborting the send) if an upload
+  // fails, surfacing the error inline rather than sending a message that
+  // references files that never arrived.
+  //
+  // A successfully-uploaded file is dropped from `files` as soon as its POST
+  // resolves — even when a *later* file in the batch fails. Otherwise a partial
+  // failure would leave the already-durable files selected, and the next
+  // Send/Approve/Retry would re-upload them, creating duplicate suffixed
+  // records (`name (1).png`) and burning the per-task count cap. The failed
+  // file and any not-yet-attempted ones stay selected so a retry re-sends only
+  // those.
+  const uploadPending = async () => {
+    setAttachError(null)
+    const remaining = [...files]
+    try {
+      while (remaining.length > 0) {
+        const f = remaining[0]
+        try {
+          await uploadAttachment(task.id, f)
+        } catch (e) {
+          setAttachError(`Failed to attach ${f.name}: ${(e as Error).message}`)
+          throw e
+        }
+        remaining.shift() // Uploaded durably — never re-send it on a retry.
+      }
+    } finally {
+      setFiles(remaining)
+    }
+  }
 
   // ADR-027 — promotion is valid from any non-terminal state. Mirror the
   // server-side guard in promote_task exactly: it rejects terminal tasks on
@@ -40,18 +75,60 @@ export function ChatInput({ data }: ChatInputProps) {
     setInputValue('')
   }
 
-  const sendMutation = useMutation({ mutationFn: () => sendMessage(task.id, inputValue), onSuccess })
-  const reviseMutation = useMutation({ mutationFn: () => reviseTask(task.id, inputValue), onSuccess })
-  const answerMutation = useMutation({ mutationFn: () => answerTask(task.id, inputValue), onSuccess })
-  const approveMutation = useMutation({ mutationFn: () => approveTask(task.id), onSuccess })
-  const retryMutation = useMutation({ mutationFn: () => retryTask(task.id), onSuccess })
+  const sendMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return sendMessage(task.id, inputValue)
+    },
+    onSuccess,
+  })
+  const reviseMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return reviseTask(task.id, inputValue)
+    },
+    onSuccess,
+  })
+  const answerMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return answerTask(task.id, inputValue)
+    },
+    onSuccess,
+  })
+  // Accept / Retry / Acknowledge all (re)dispatch a step that materializes the
+  // task's attachments, so pending files must be uploaded first — otherwise a
+  // file attached-then-Accepted is silently dropped from that dispatch. Upload
+  // is awaited before the action; a failed upload aborts it with an inline
+  // error (same contract as Send/Revise), rather than advancing without the file.
+  const approveMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return approveTask(task.id)
+    },
+    onSuccess,
+  })
+  const retryMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return retryTask(task.id)
+    },
+    onSuccess,
+  })
+  // Stop is a halt, not a dispatch — it must stay reliable, so it does NOT
+  // upload (a transient upload failure can't be allowed to block stopping a
+  // runaway agent). Any pending files stay selected in the picker and go out
+  // with the operator's next Send.
   const stopMutation = useMutation({ mutationFn: () => stopAgent(task.id), onSuccess })
   // Acknowledge a fired guard: reset the guard and resume the step in one bare
   // action (no reason field — ADR-019 revised 2026-07-02). On success the task
   // query is invalidated: the new audit row appears and detect() now returns
   // False, so the override button disappears.
   const overrideMutation = useMutation({
-    mutationFn: (guardName: string) => acknowledgeOverride(task.id, guardName),
+    mutationFn: async (guardName: string) => {
+      await uploadPending()
+      return acknowledgeOverride(task.id, guardName)
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', task.id] })
     },
@@ -240,6 +317,15 @@ export function ChatInput({ data }: ChatInputProps) {
         }}
         className="flex flex-wrap items-end gap-2"
       >
+        {task.status !== 'complete' && task.status !== 'abandoned' && (
+          <AttachmentPicker
+            files={files}
+            onChange={setFiles}
+            disabled={isPending}
+            error={attachError}
+            className="w-full basis-full"
+          />
+        )}
         <AutoGrowTextarea
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
