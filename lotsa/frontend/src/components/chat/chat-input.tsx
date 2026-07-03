@@ -24,8 +24,6 @@ export function ChatInput({ data }: ChatInputProps) {
   const [inputValue, setInputValue] = useState('')
   const [files, setFiles] = useState<File[]>([])
   const [attachError, setAttachError] = useState<string | null>(null)
-  const [reasonOpen, setReasonOpen] = useState(false)
-  const [reasonText, setReasonText] = useState('')
   const [promoteOpen, setPromoteOpen] = useState(false)
   const queryClient = useQueryClient()
   const { task } = data
@@ -122,18 +120,17 @@ export function ChatInput({ data }: ChatInputProps) {
   // runaway agent). Any pending files stay selected in the picker and go out
   // with the operator's next Send.
   const stopMutation = useMutation({ mutationFn: () => stopAgent(task.id), onSuccess })
-  // Acknowledge a fired guard. Empty reason submits as null. On success the
-  // task query is invalidated: the new audit row appears and detect() now
-  // returns False, so the override button disappears.
+  // Acknowledge a fired guard: reset the guard and resume the step in one bare
+  // action (no reason field — ADR-019 revised 2026-07-02). On success the task
+  // query is invalidated: the new audit row appears and detect() now returns
+  // False, so the override button disappears.
   const overrideMutation = useMutation({
     mutationFn: async (guardName: string) => {
       await uploadPending()
-      return acknowledgeOverride(task.id, guardName, reasonText.trim() || null)
+      return acknowledgeOverride(task.id, guardName)
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', task.id] })
-      setReasonText('')
-      setReasonOpen(false)
     },
   })
 
@@ -305,29 +302,6 @@ export function ChatInput({ data }: ChatInputProps) {
           )}
           {(feedbackCount ?? 0) > 0 && (
             <span> · {feedbackCount} comment{feedbackCount === 1 ? '' : 's'}</span>
-          )}
-        </div>
-      )}
-
-      {availableOverrides.length > 0 && (
-        <div className="mb-2 text-xs">
-          {reasonOpen ? (
-            <textarea
-              value={reasonText}
-              onChange={(e) => setReasonText(e.target.value)}
-              placeholder="Add reason (optional)"
-              rows={2}
-              disabled={isPending}
-              className="w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => setReasonOpen(true)}
-              className="text-muted-foreground underline"
-            >
-              Add reason (optional)
-            </button>
           )}
         </div>
       )}

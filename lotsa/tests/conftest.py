@@ -56,6 +56,28 @@ def _isolated_registry():
     ar.restore(runner_snap)
 
 
+@pytest.fixture(autouse=True)
+def _fast_shutdown_drain(request, monkeypatch):
+    """Shrink the ADR-040 graceful-drain window for the test suite.
+
+    ``shutdown()`` now awaits in-flight agents up to
+    ``config.shutdown_grace_seconds`` (default 30s in production) before
+    cancelling them. Many tests deliberately freeze an agent in-flight (a
+    never-set ``asyncio.Event``) and rely on teardown cancelling it — with the
+    30s default each such teardown would stall the full window. Patching the
+    module-level default to a tiny value keeps teardown fast without weakening
+    any assertion. ``test_config`` is exempt: it verifies the shipped 30s
+    default. Tests that assert on the drain window itself set
+    ``config.shutdown_grace_seconds`` explicitly on the instance, which wins
+    over this default.
+    """
+    if not request.module.__name__.endswith("test_config"):
+        import lotsa.config as _cfg
+
+        monkeypatch.setattr(_cfg, "_DEFAULT_SHUTDOWN_GRACE_SECONDS", 0.05, raising=False)
+    yield
+
+
 @pytest.fixture
 def tasks_dir(tmp_path: Path) -> Path:
     """Legacy fixture name retained for tests that still use it as a workspace.

@@ -269,3 +269,38 @@ def test_module_uses_async_subprocess_not_blocking():
     assert "subprocess.run" not in src, "commit_step must use asyncio.create_subprocess_exec, not subprocess.run"
     assert "shell=True" not in src, "commit_step must never invoke git via a shell"
     assert "create_subprocess_exec" in src
+
+
+# ---------------------------------------------------------------------------
+# ADR-040 R1 — at-least-once (re-run) idempotency
+# ---------------------------------------------------------------------------
+
+
+async def test_second_commit_after_first_is_noop(git_repo: Path):
+    """Re-running the commit step on an already-committed (now-clean) worktree
+    is a no-op — no second commit, HEAD unchanged (ADR-040 R1: steps are safe
+    to execute at-least-once).
+    """
+    from lotsa.commit_step import execute_commit
+
+    (git_repo / "feature.py").write_text("print('hi')\n")
+    first = await execute_commit(
+        work_dir=git_repo,
+        task_id="task-1",
+        task_title="Add feature",
+        step_name="code",
+    )
+    assert first.committed is True
+    head_after_first = _head_sha(git_repo)
+
+    # Interrupted-then-resumed: the step runs again on the same worktree.
+    second = await execute_commit(
+        work_dir=git_repo,
+        task_id="task-1",
+        task_title="Add feature",
+        step_name="code",
+    )
+
+    assert second.committed is False, "a resumed commit on a clean tree must not create a duplicate commit"
+    assert second.sha is None
+    assert _head_sha(git_repo) == head_after_first, "HEAD must not move on the re-run"

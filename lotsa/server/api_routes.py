@@ -120,7 +120,6 @@ class MessageRequest(BaseModel):
 
 class AcknowledgeOverrideRequest(BaseModel):
     guard_name: str
-    reason: str | None = None
 
 
 class JumpRequest(BaseModel):
@@ -618,7 +617,7 @@ async def acknowledge_override(
 ) -> TaskDetailFullResponse:
     service = _get_service(request)
     try:
-        await service.acknowledge_override(task_id, body.guard_name, body.reason)
+        await service.acknowledge_override(task_id, body.guard_name)
     except AcknowledgeOverrideNotAllowed as exc:
         raise _bad_request(exc, "ACKNOWLEDGE_OVERRIDE_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)

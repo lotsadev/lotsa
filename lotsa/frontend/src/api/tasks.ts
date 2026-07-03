@@ -115,11 +115,13 @@ export const jumpToStep = (taskId: string, stepName: string) =>
 
 // Acknowledge a fired guard (ADR-019). Resets the guard's block, writes an
 // audit row, and resumes the step in one action (acknowledge_override calls
-// retry() downstream — ADR-019 revised 2026-06-16).
-export const acknowledgeOverride = (taskId: string, guardName: string, reason: string | null) =>
+// retry() downstream — ADR-019 revised 2026-06-16). The request carries only
+// the guard name — the operator-reason field was removed (ADR-019 revised
+// 2026-07-02); rationale, when wanted, is a normal chat message.
+export const acknowledgeOverride = (taskId: string, guardName: string) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/acknowledge-override`, {
     method: 'POST',
-    body: JSON.stringify({ guard_name: guardName, reason }),
+    body: JSON.stringify({ guard_name: guardName }),
   })
 
 // Stop the running agent and park the task at blocked (Retry resumes it).

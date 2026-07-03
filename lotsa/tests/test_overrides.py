@@ -21,6 +21,7 @@ pattern ``test_pr_flow_integration._stub_full_process_service`` uses with
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -96,7 +97,7 @@ class _FakeOverride:
     async def detect(self, task, db) -> bool:
         return self._detects
 
-    async def acknowledge(self, task, operator_reason, db) -> None:
+    async def acknowledge(self, task, db) -> None:
         return None
 
 
@@ -325,7 +326,7 @@ class TestPrFixBudgetAcknowledge:
         db = _make_db(tmp_path, run)
         try:
             task = self._blocked_task(db, run)
-            run(self._handler().acknowledge(task, "looks good, continue", db))
+            run(self._handler().acknowledge(task, db))
             after = run(db.get_task(task.id))
             assert after.metadata.get("pr_fix_round_count") == 0
         finally:
@@ -353,7 +354,7 @@ class TestPrFixBudgetAcknowledge:
             )
             _seed_cap_fire_row(db, run, task.id)
             row = run(db.get_task(task.id))
-            run(self._handler().acknowledge(row, "continue", db))
+            run(self._handler().acknowledge(row, db))
             after = run(db.get_task(task.id))
             assert after.metadata.get("pr_fix_round_count") == 0
             assert after.metadata.get("pr_fix_consecutive_skipped") == 0
@@ -365,7 +366,7 @@ class TestPrFixBudgetAcknowledge:
         try:
             task = self._blocked_task(db, run)
             before = run(db.get_messages(task.id, msg_type="pr_decision"))
-            run(self._handler().acknowledge(task, "reviewed by me", db))
+            run(self._handler().acknowledge(task, db))
             after = run(db.get_messages(task.id, msg_type="pr_decision"))
             new_rows = [m for m in after if m.metadata.get("decision") == "overridden"]
             assert len(after) == len(before) + 1
@@ -383,22 +384,16 @@ class TestPrFixBudgetAcknowledge:
         finally:
             run(db.close())
 
-    def test_acknowledge_includes_reason_in_content(self, tmp_path, run):
+    def test_acknowledge_writes_bare_content(self, tmp_path, run):
+        """The override audit row content is always the bare
+        ``"Operator acknowledged budget cap"`` — no reason suffix. The reason
+        field was removed (ADR-019 revised 2026-07-02); rationale, when the
+        operator wants it, is a normal chat message, not a coupled annotation
+        on the ``overridden`` decision row."""
         db = _make_db(tmp_path, run)
         try:
             task = self._blocked_task(db, run)
-            run(self._handler().acknowledge(task, "bot already approved", db))
-            rows = run(db.get_messages(task.id, msg_type="pr_decision"))
-            row = [m for m in rows if m.metadata.get("decision") == "overridden"][0]
-            assert row.content == "Operator acknowledged budget cap — bot already approved"
-        finally:
-            run(db.close())
-
-    def test_acknowledge_without_reason_omits_suffix(self, tmp_path, run):
-        db = _make_db(tmp_path, run)
-        try:
-            task = self._blocked_task(db, run)
-            run(self._handler().acknowledge(task, None, db))
+            run(self._handler().acknowledge(task, db))
             rows = run(db.get_messages(task.id, msg_type="pr_decision"))
             row = [m for m in rows if m.metadata.get("decision") == "overridden"][0]
             assert row.content == "Operator acknowledged budget cap"
@@ -409,7 +404,7 @@ class TestPrFixBudgetAcknowledge:
         db = _make_db(tmp_path, run)
         try:
             task = self._blocked_task(db, run)
-            run(self._handler().acknowledge(task, None, db))
+            run(self._handler().acknowledge(task, db))
             after = run(db.get_task(task.id))
             # Handler does not transition the task — acknowledge_override calls retry() downstream.
             assert after.status == "blocked"
@@ -458,9 +453,12 @@ class TestAcknowledgeOverrideEndpoint:
             task = await self._cap_blocked_task(service)
             transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://test") as client:
+                # No reason field — the override is a bare reset-and-resume
+                # (ADR-019 revised 2026-07-02). The request carries only the
+                # guard name.
                 resp = await client.post(
                     f"/api/tasks/{task.id}/acknowledge-override",
-                    json={"guard_name": "pr_fix_budget", "reason": "reviewed"},
+                    json={"guard_name": "pr_fix_budget"},
                 )
                 assert resp.status_code == 200, resp.text
                 data = resp.json()
@@ -472,6 +470,8 @@ class TestAcknowledgeOverrideEndpoint:
                 ]
                 assert len(overridden) == 1
                 assert overridden[0]["role"] == "user"
+                # Bare content end-to-end through the endpoint — no " — <reason>" suffix.
+                assert overridden[0]["content"] == "Operator acknowledged budget cap"
                 # detect() now returns False (latest decision is "overridden"),
                 # so the override button disappears.
                 assert data["available_overrides"] == []
@@ -495,7 +495,7 @@ class TestAcknowledgeOverrideEndpoint:
         async def _test():
             task = await self._cap_blocked_task(service)
             with patch.object(service, "retry", new=AsyncMock()) as mock_retry:
-                await service.acknowledge_override(task.id, "pr_fix_budget", "reviewed")
+                await service.acknowledge_override(task.id, "pr_fix_budget")
                 mock_retry.assert_awaited_once_with(task.id)
             after = await service.db.get_task(task.id)
             assert after.metadata.get("pr_fix_round_count") == 0, "the acknowledge reset must run before the resume"
@@ -520,7 +520,7 @@ class TestAcknowledgeOverrideEndpoint:
             service.flow = None  # simulate pre-start()
             try:
                 with pytest.raises(RuntimeError, match="not started"):
-                    await service.acknowledge_override(task.id, "pr_fix_budget", "reviewed")
+                    await service.acknowledge_override(task.id, "pr_fix_budget")
             finally:
                 service.flow = original_flow
             # No partial mutation: counter untouched and no overridden row.
@@ -579,8 +579,8 @@ class TestAcknowledgeOverrideEndpoint:
             # The real resume is covered by test_acknowledge_override_resumes_via_retry.
             with patch.object(service, "retry", new=AsyncMock()):
                 results = await asyncio.gather(
-                    service.acknowledge_override(task.id, "pr_fix_budget_yielding", "a"),
-                    service.acknowledge_override(task.id, "pr_fix_budget_yielding", "b"),
+                    service.acknowledge_override(task.id, "pr_fix_budget_yielding"),
+                    service.acknowledge_override(task.id, "pr_fix_budget_yielding"),
                     return_exceptions=True,
                 )
             # Neither call raises — the loser bails cleanly via the guard.
@@ -678,3 +678,52 @@ class TestAcknowledgeOverrideEndpoint:
                     assert "available_overrides" not in item
 
         run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Reason field removed (ADR-019 revised 2026-07-02)
+#
+# The guard override drops the operator-reason coupling entirely: the override
+# is a bare reset-and-resume, and rationale — when wanted — is a normal chat
+# message (a ``user`` audit row), not an annotation on the ``overridden``
+# decision row. These tests pin the removal of the ``reason`` /
+# ``operator_reason`` parameter at every layer of the call chain, so a dead or
+# mismatched vestige can't linger.
+# ---------------------------------------------------------------------------
+
+
+class TestReasonFieldRemoved:
+    def test_override_handler_protocol_acknowledge_drops_operator_reason(self):
+        """The ``OverrideHandler.acknowledge`` protocol signature is
+        ``(self, task, db)`` — no ``operator_reason`` parameter."""
+        from lotsa.overrides import OverrideHandler
+
+        params = inspect.signature(OverrideHandler.acknowledge).parameters
+        assert "operator_reason" not in params
+        assert list(params) == ["self", "task", "db"]
+
+    def test_pr_fix_budget_handler_acknowledge_drops_operator_reason(self):
+        """The built-in ``PrFixBudgetOverride.acknowledge`` drops the
+        ``operator_reason`` parameter."""
+        from lotsa.overrides import PrFixBudgetOverride
+
+        params = inspect.signature(PrFixBudgetOverride.acknowledge).parameters
+        assert "operator_reason" not in params
+        assert list(params) == ["self", "task", "db"]
+
+    def test_orchestrator_acknowledge_override_drops_reason(self):
+        """``OrchestratorService.acknowledge_override`` takes only
+        ``(task_id, guard_name)`` — the ``reason`` parameter is gone."""
+        from lotsa.orchestrator import OrchestratorService
+
+        params = inspect.signature(OrchestratorService.acknowledge_override).parameters
+        assert "reason" not in params
+        assert list(params) == ["self", "task_id", "guard_name"]
+
+    def test_acknowledge_override_request_has_no_reason_field(self):
+        """The endpoint request model drops the ``reason`` field — the override
+        request body is just ``{"guard_name": ...}``."""
+        from lotsa.server.api_routes import AcknowledgeOverrideRequest
+
+        assert "reason" not in AcknowledgeOverrideRequest.model_fields
+        assert set(AcknowledgeOverrideRequest.model_fields) == {"guard_name"}

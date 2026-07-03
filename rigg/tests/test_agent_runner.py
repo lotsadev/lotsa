@@ -265,3 +265,16 @@ async def test_claude_code_runner_uses_construction_model_when_no_override(tmp_p
     cmd = mock_run.call_args[0][0]
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "haiku"
+
+
+# ---------------------------------------------------------------------------
+# ADR-040 — resume-capability signal
+# ---------------------------------------------------------------------------
+
+
+def test_claude_code_runner_supports_resume():
+    """The CLI runner threads ``session_id`` into ``--resume`` and its session
+    JSONL survives a restart on disk, so it reports resume support (ADR-040 R3).
+    """
+    runner = ClaudeCodeRunner(model="sonnet", budget_usd=5.0)
+    assert runner.supports_resume is True

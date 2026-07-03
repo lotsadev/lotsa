@@ -272,6 +272,27 @@ channel — but on the operational rules below, Lotsa wins.
 
 """
 
+
+# ADR-040 R4 — appended to the layered system prompt (ADR-025) only when a
+# dispatch resumes/re-runs an interrupted step. Deliberately NOT part of
+# ``OPERATIONAL_PREAMBLE`` (which must stay true for *every* dispatch): a fresh
+# dispatch has done no prior work, so the "check what you already did" framing
+# would be false there. Composed after the runner's dispatch-shape fragment in
+# ``_build_system_prompt``.
+RESUME_PROMPT_NOTE = """\
+### Resumed work
+
+You may have been interrupted and resumed. Before continuing, check what
+you have already done (git status, the worktree, existing files, prior
+tool output) and do not redo completed work."""
+
+# ADR-040 — bound on how long ``shutdown()`` waits for the completion drainer to
+# *apply* completions that landed inside the grace window (state CAS + in-flight
+# pop), after the in-flight agents themselves have finished. Small: the backlog
+# is DB writes, not agent work, so this is not a second grace window. A drainer
+# still wedged past this bound is abandoned and recovered by the next resume sweep.
+_DRAIN_APPLY_TIMEOUT_SECONDS = 5.0
+
 _NEEDS_INPUT_RE = re.compile(r"^NEEDS_INPUT:\s*(.+)", re.MULTILINE)
 
 _MAX_TITLE_LEN = 80
@@ -492,6 +513,11 @@ class InFlightStep:
     # Plumbed to the ``pr_decision`` audit row so an operator can cross-
     # reference the decision with the ``pr_feedback`` rows it responded to.
     triggering_comment_ids: list[int] = field(default_factory=list)
+    # ADR-040 — set when this dispatch is a restart-resume of an interrupted
+    # step. Drives (a) threading the persisted ``session_id`` into the runner
+    # (``--resume``) when the runner supports it, and (b) the resumed-agent note
+    # in the layered system prompt. Defaults False for every normal dispatch.
+    is_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -633,6 +659,10 @@ class OrchestratorService:
         self._in_flight: dict[str, InFlightStep] = {}
         self._drainer_task: asyncio.Task | None = None
         self._shutdown_event: asyncio.Event = asyncio.Event()
+        # ADR-040 — dispatch gate for the graceful drain. ``shutdown()`` flips
+        # this False so no new agent enters ``_in_flight`` while in-flight work
+        # drains; the dispatch entry points check it before tracking a step.
+        self._accepting: bool = True
         # ADR-021 — the derived per-process state below replaces the former
         # singletons (``_pr_monitor`` / ``_pr_monitor_config`` /
         # ``_action_states`` / ``_monitor_state``). Each is keyed by the
@@ -724,12 +754,16 @@ class OrchestratorService:
         return resolve_runner(model)
 
     async def start(self) -> None:
-        """Load flow, kill orphaned in-flight tasks, start the drainer.
+        """Load flow, resume interrupted tasks, start the drainer.
 
-        Restart safety: any task with status='working' was mid-execution when
-        the server died. We mark it blocked with an explicit message and let
-        the user explicitly retry. We do NOT try to reconstruct in-memory
-        state from the DB — restart is destructive on purpose.
+        Restart is resumptive, not destructive (ADR-040). A ``status='working'``
+        task was mid-execution when the server died; the recovery sweep treats it
+        as *interrupted* — records ``interrupted_at`` + ``resume_count`` in
+        metadata and auto-dispatches a continuation (resume the agent via
+        ``--resume`` where the runner supports it, else idempotently re-run the
+        step), bounded by ``resume_cap`` before falling back to ``blocked``. The
+        DB is the state of record; in-memory dispatch state is a cache, so no
+        reconstruction from it is needed. See ``_classify_and_resume``.
         """
         # Register built-in + user-supplied tools and engines BEFORE the YAML
         # parser runs so any ``tool:``/``engine:`` reference in process.yaml
@@ -1032,18 +1066,31 @@ class OrchestratorService:
                 # ``push_state`` branch below would flip it to ``blocked``.
                 if row.status in ("blocked", "archived"):
                     continue
-                if row.status == "working" or push_state:
+                # ADR-040 — a genuinely interrupted task (mid-execution when the
+                # server died) is ``status='working'``. Resume it instead of
+                # destroying it: classify + auto-dispatch a continuation (resume
+                # the agent or idempotently re-run the step), bounded by the
+                # ``resume_cap`` fallback to ``blocked``. This covers modern
+                # mid-action tasks too — an action job (e.g. ``push_pr``) that was
+                # executing when the server died is ``status='working'`` with
+                # ``state`` in the action set. (``rebasing`` is always paired with
+                # ``status='blocked'`` — see the ``to_status='blocked'`` rebase
+                # transitions — so it is skipped above, not resumed here.)
+                if row.status == "working":
+                    await self._classify_and_resume(row)
+                    continue
+                # Non-``working`` push-state rows are pre-ADR-014 legacy shapes
+                # (``status='waiting_for_pr'`` with ``state`` in the push set, or
+                # the dead synthetic ``waiting_for_pr`` state itself) — no modern
+                # row reaches here, and they have no safe resume, so keep today's
+                # push-state block-with-recovery-message contract.
+                if push_state:
                     await self._set_status(row.id, "blocked", row.current_step or row.state)
-                    msg = (
-                        f"Server restarted while task was {row.state} — moved to blocked. Retry when ready."
-                        if push_state
-                        else "Agent killed by server restart — click Retry."
-                    )
                     await self.db.add_message(
                         row.id,
                         "system",
                         row.current_step or row.state,
-                        msg,
+                        f"Server restarted while task was {row.state} — moved to blocked. Retry when ready.",
                         "status_change",
                     )
             except Exception:
@@ -1059,8 +1106,47 @@ class OrchestratorService:
             self._pr_monitor_tasks_by_process[proc_name] = asyncio.create_task(engine.run())
 
     async def shutdown(self) -> None:
-        """Cancel all background work and clean up."""
+        """Graceful drain then cancel all background work and clean up (ADR-040 R5).
+
+        Stop accepting new dispatches, give in-flight agents a bounded grace
+        window (``shutdown_grace_seconds``) to finish on their own, then cancel
+        survivors and tear everything down. Only agents still running past the
+        window need resuming on the next start — which minimises how many tasks
+        hit the resume path at all.
+        """
+        # Stop accepting new dispatches FIRST so nothing new enters ``_in_flight``
+        # while we drain (the dispatch entry points check ``_accepting``).
+        self._accepting = False
         self._shutdown_event.set()
+
+        # Graceful drain: await in-flight agents up to the grace window. The
+        # drainer is still running here, so a completion landing inside the
+        # window is processed rather than lost; because ``_accepting`` is False,
+        # the drained task's *next* step is refused and parks for the next
+        # start()'s resume sweep. Survivors past the window are cancelled below.
+        inflight = [info.task for info in self._in_flight.values() if info.task and not info.task.done()]
+        if inflight:
+            await asyncio.wait(inflight, timeout=self.config.shutdown_grace_seconds)
+
+        # Apply the completions those finished agents enqueued *before* the
+        # drainer is cancelled below. ``_run_agent`` ends at
+        # ``_completions.put(info)``; the state-transition CAS and ``_in_flight``
+        # pop happen later in ``_completion_drainer``. Without this join, an
+        # agent that finished cleanly inside the grace window has its completion
+        # silently discarded when the drainer is cancelled — the DB row stays
+        # ``status='working'`` and burns a wasted resume cycle on the next start.
+        # Bounded so a wedged drainer can't hang shutdown; the backlog is just
+        # DB writes, so ``_DRAIN_APPLY_TIMEOUT_SECONDS`` is small (a survivor past
+        # this bound is recovered by the next start()'s resume sweep).
+        if self._drainer_task and not self._drainer_task.done():
+            try:
+                await asyncio.wait_for(self._completions.join(), timeout=_DRAIN_APPLY_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning(
+                    "shutdown: completion drain timed out after %.1fs; unapplied completions "
+                    "will be recovered by the next start()'s resume sweep",
+                    _DRAIN_APPLY_TIMEOUT_SECONDS,
+                )
 
         # Cancel ALL monitor tasks first, then await them concurrently — a
         # serial cancel+await would make worst-case shutdown 5s × N processes.
@@ -1090,8 +1176,9 @@ class OrchestratorService:
         for info in list(self._in_flight.values()):
             if info.task and not info.task.done():
                 info.task.cancel()
-        # Don't await in-flight tasks — they run subprocess.run in threads
-        # that can't be interrupted. Just abandon them and exit.
+        # Survivors past the grace window are abandoned — they run subprocess.run
+        # in threads that can't be interrupted. The next start()'s resume sweep
+        # recovers them (ADR-040).
         self._in_flight.clear()
 
     # ── Queries ────────────────────────────────────────────────────────
@@ -2961,7 +3048,7 @@ class OrchestratorService:
         finally:
             self._dispatching_jump.discard(task_id)
 
-    async def acknowledge_override(self, task_id: str, guard_name: str, reason: str | None) -> None:
+    async def acknowledge_override(self, task_id: str, guard_name: str) -> None:
         """Acknowledge a fired guard via its registered override handler (ADR-019).
 
         Looks the handler up in the override registry and invokes its
@@ -3014,7 +3101,7 @@ class OrchestratorService:
         try:
             if not await handler.detect(task, self.db):
                 raise AcknowledgeOverrideNotAllowed(f"Override {guard_name!r} is not applicable to this task")
-            await handler.acknowledge(task, reason, self.db)
+            await handler.acknowledge(task, self.db)
         finally:
             self._acknowledging_override.discard(task_id)
 
@@ -4051,6 +4138,15 @@ class OrchestratorService:
                 # matches the won-check pattern at every other CAS site in
                 # this file.
                 return
+            # ADR-040 — landing in a monitor state is forward progress past the
+            # (possibly interrupted) prior step. Clear the resume-cap markers
+            # here too: the monitor branch ``return``s before the generic
+            # active-state path below, where the sibling clear lives, so an
+            # interrupted step that routes straight into a monitor would
+            # otherwise strand ``resume_count``/``interrupted_at`` — the same
+            # gap ``_execute_action_step``'s action→monitor fold closes.
+            if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+                await self._clear_interruption_markers(item)
             return
 
         # Single CAS: state → active_state, status → working, current_step →
@@ -4072,12 +4168,31 @@ class OrchestratorService:
             return
         item.state = step.active_state
 
+        # ADR-040 — the task just advanced into a new step's active state, i.e.
+        # it made forward progress past whatever step it may have been
+        # interrupted on. ``resume_count`` bounds repeated failure at a *single*
+        # interruption, not the task's whole life; a routine deploy that
+        # interrupts a step which then completes must not accumulate toward the
+        # cap. Clear the interruption markers on this forward-progress edge. The
+        # two sibling forward-progress paths that bypass this generic CAS clear
+        # the same markers themselves: the monitor branch above and
+        # ``_execute_action_step``'s action-success CAS.
+        if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+            await self._clear_interruption_markers(item)
+
         # Create or reuse a git worktree for this task (under the task's project)
         try:
             wt_path = await self._worktree_manager_for_task(item).create(item.id)
         except Exception:
             logger.warning("Worktree creation failed for %s, using project work_dir", item.id)
             wt_path = self._fallback_work_dir(item)
+
+        # ADR-040 graceful drain — refuse new dispatches once shutdown has begun
+        # so no fresh agent enters ``_in_flight`` while in-flight work drains.
+        # The task stays at its just-CAS'd active state; the next start()'s
+        # resume sweep re-dispatches it.
+        if not self._accepting:
+            return
 
         info = InFlightStep(
             item=item,
@@ -4089,6 +4204,114 @@ class OrchestratorService:
         # Branch on the typed job's execution mode.
         #   * ``agent``: existing _run_agent path (loads prompts, runs runner).
         #   * ``action``: dispatch via the registered tool callable.
+        self._in_flight[item.id] = info
+        if step.type == "action":
+            info.task = asyncio.create_task(self._execute_action_step(info))
+        else:
+            info.task = asyncio.create_task(self._run_agent(info))
+
+    async def _classify_and_resume(self, row: TaskRow) -> None:
+        """Restart recovery for one interrupted task (ADR-040 R2/R3).
+
+        Either resume/re-run the interrupted step, or — once the per-task
+        ``resume_cap`` is exhausted — fall back to today's ``blocked`` with an
+        explicit "couldn't resume" message. Every state change is a CAS via
+        ``atomic_transition`` (won-checked) so the sweep is safe against the
+        drainer/monitor loops ``start()`` launches immediately after.
+        """
+        resume_count = int((row.metadata or {}).get("resume_count", 0))
+        step_label = row.current_step or row.state
+
+        # Cap exhausted → block (the genuine crash-loop fallback).
+        if resume_count >= self.config.resume_cap:
+            result = await self.db.atomic_transition(
+                row.id,
+                from_status=row.status,
+                from_state=row.state,
+                to_status="blocked",
+                to_state=row.state,
+                to_current_step=step_label,
+                audit_on_win=AuditRow(
+                    role="system",
+                    step_name=step_label,
+                    content=(f"Couldn't resume after {resume_count} attempts — click Retry."),
+                    msg_type="status_change",
+                ),
+            )
+            if not result.won:
+                return
+            return
+
+        # Otherwise mark interrupted (metadata only — no new columns) and claim
+        # the row with a self-transition CAS, then re-dispatch its current step.
+        new_meta = {
+            **(row.metadata or {}),
+            "interrupted_at": datetime.now(UTC).isoformat(),
+            "resume_count": resume_count + 1,
+        }
+        result = await self.db.atomic_transition(
+            row.id,
+            from_status=row.status,
+            from_state=row.state,
+            to_status=row.status,
+            to_state=row.state,
+            to_current_step=row.current_step,
+            to_metadata=new_meta,
+            audit_on_win=AuditRow(
+                role="system",
+                step_name=step_label,
+                content=f"Interrupted by restart — resuming (attempt {resume_count + 1}).",
+                msg_type="status_change",
+            ),
+        )
+        if not result.won:
+            return
+
+        fresh = await self.db.get_task(row.id)
+        if fresh is None:
+            return
+        await self._redispatch_current_step(fresh, is_resume=True)
+
+    async def _redispatch_current_step(self, row: TaskRow, *, is_resume: bool) -> None:
+        """Re-dispatch a task's *current* step in place (ADR-040 R3).
+
+        Unlike ``_dispatch_step``, this does not advance state — an interrupted
+        task is already sitting in its active state, so it recreates the
+        in-flight record for the resolved step and spawns the same coroutine the
+        normal dispatch would (``_run_agent`` / ``_execute_action_step``). The
+        ``is_resume`` flag threads through to the runner (``--resume``) and the
+        resumed-agent prompt note.
+        """
+        item = Item(id=row.id, state=row.state, title=row.title, body=row.body, metadata=row.metadata)
+        active_flow = self._resolve_flow(item)
+        step = next((s for s in active_flow.steps if s.name == row.current_step), None)
+        if step is None:
+            # No resolvable step — cannot resume; park it for an operator.
+            await self._set_status(row.id, "blocked", row.current_step or row.state)
+            await self.db.add_message(
+                row.id,
+                "system",
+                row.current_step or row.state,
+                "Couldn't resolve the interrupted step to resume — click Retry.",
+                "status_change",
+            )
+            return
+
+        try:
+            wt_path = await self._worktree_manager_for_task(item).create(item.id)
+        except Exception:
+            logger.warning("Worktree creation failed for %s during resume, using project work_dir", item.id)
+            wt_path = self._fallback_work_dir(item)
+
+        # ADR-040 graceful drain — check ``_accepting`` immediately before the
+        # synchronous ``_in_flight`` mutation (after the last await), matching
+        # ``_dispatch_step``. Checking earlier leaves a window where a
+        # ``shutdown()`` racing this resume sweep could add a task the drain
+        # snapshot has already taken, so it gets cancelled with no grace window.
+        if not self._accepting:
+            return
+
+        info = InFlightStep(item=item, step=step, step_work_dir=wt_path, is_resume=is_resume)
         self._in_flight[item.id] = info
         if step.type == "action":
             info.task = asyncio.create_task(self._execute_action_step(info))
@@ -4411,6 +4634,16 @@ class OrchestratorService:
         if not result_cas.won:
             return
         item.state = success_state
+        # ADR-040 — an action step completing and advancing is forward progress
+        # past the (possibly interrupted) action step. Clear the resume-cap
+        # markers here so the action→monitor fold below — which folds
+        # ``to_status="waiting_for_pr"`` into its own CAS and never routes
+        # through ``_dispatch_step``'s generic clear — doesn't strand stale
+        # ``resume_count``/``interrupted_at``. (The action→non-monitor case is
+        # already cleared one hop later by ``_dispatch_next_step``; clearing
+        # here makes both sibling paths symmetric.)
+        if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+            await self._clear_interruption_markers(item)
         # Sub-flow exit: an action that lands the task into a monitor state
         # (e.g. ``push_pr`` → ``wait_for_pr_signal``) is the canonical return
         # to the root flow. Reset ``current_flow`` to the task's OWN process's
@@ -4516,10 +4749,32 @@ class OrchestratorService:
             runner = resolved.runner
             info.agent_runner_name = resolved.name
 
-            system = self._build_system_prompt(step, item, runner=runner)
+            system = self._build_system_prompt(step, item, runner=runner, resume=info.is_resume)
 
+            # ADR-040 — a restart-resume threads the persisted session id into
+            # the runner (``--resume``) only when the runner reports resume
+            # support; otherwise the step re-runs from start (session_id stays
+            # None). Resume-vs-re-run is selected via the capability signal, not
+            # the runner's type.
+            #
+            # ``metadata["session_id"]`` is a single global slot overwritten by
+            # whichever agent step last completed (see the drainer's
+            # ``session_id`` persist). A step that is interrupted before it
+            # produces its own session — and does not declare ``resume: true``
+            # (e.g. ``plan``/``review``/``pr_summary``) — would otherwise
+            # reattach to the *previous, unrelated* step's conversation. Gate the
+            # restart-resume on ``session_step`` so we only ``--resume`` when the
+            # persisted session belongs to the step being resumed; otherwise fall
+            # through to the safe idempotent re-run-from-start.
             session_id = None
-            if (step.resume_session or (step.conversational and info.feedback)) and "session_id" in item.metadata:
+            want_resume = (
+                info.is_resume
+                and getattr(runner, "supports_resume", False)
+                and item.metadata.get("session_step") == step.name
+            )
+            if (
+                step.resume_session or (step.conversational and info.feedback) or want_resume
+            ) and "session_id" in item.metadata:
                 session_id = item.metadata["session_id"]
 
             # For resumed conversational sessions, send just the user's message
@@ -4658,7 +4913,13 @@ class OrchestratorService:
                 self._in_flight.pop(item.id, None)
 
                 if result.session_id:
-                    await self._merge_task_metadata(item, {"session_id": result.session_id})
+                    # Persist which step owns this session (ADR-040): the
+                    # restart-resume gate reattaches to a session only when it
+                    # belongs to the step being resumed, never a stale sibling.
+                    await self._merge_task_metadata(
+                        item,
+                        {"session_id": result.session_id, "session_step": info.step.name},
+                    )
 
                 if not result.success:
                     if self.flow is None:
@@ -5597,6 +5858,14 @@ class OrchestratorService:
                     except Exception:
                         logger.exception("Failed to block task %s after completion error", info.item.id)
             finally:
+                if info is not None:
+                    # ADR-040: mark the dequeued completion done so shutdown()'s
+                    # bounded ``_completions.join()`` can tell when the
+                    # grace-window backlog has actually been *applied* (state
+                    # CAS + ``_in_flight`` pop), not merely dequeued. Synchronous
+                    # and first in the ``finally`` so it runs on every exit path
+                    # (including cancellation mid-terminal-apply below).
+                    self._completions.task_done()
                 # ADR-030: apply a deferred PR terminal once the agent's own
                 # routing (the try body above) has completed — the happens-before
                 # the ADR requires. Runs on every exit path (the body's many
@@ -5872,6 +6141,25 @@ class OrchestratorService:
         if fresh is None:
             return
         fresh.metadata.update(updates)
+        item.metadata = fresh.metadata
+        await self.db.update_task(item.id, metadata=fresh.metadata)
+
+    async def _clear_interruption_markers(self, item: Item) -> None:
+        """Drop the ADR-040 resume-cap markers once a task makes forward progress.
+
+        ``resume_count`` / ``interrupted_at`` track *repeated failure at a single
+        interruption* so a genuine crash-loop still falls back to ``blocked``.
+        They must not accumulate across the task's whole life: once the
+        interrupted step completes and the task advances, the cap resets. A fresh
+        read (like ``_merge_task_metadata``) avoids clobbering concurrent writers;
+        this is a best-effort cache reset, not a state transition, so it stays a
+        plain metadata write rather than a CAS.
+        """
+        fresh = await self.db.get_task(item.id)
+        if fresh is None:
+            return
+        fresh.metadata.pop("resume_count", None)
+        fresh.metadata.pop("interrupted_at", None)
         item.metadata = fresh.metadata
         await self.db.update_task(item.id, metadata=fresh.metadata)
 
@@ -6347,7 +6635,12 @@ class OrchestratorService:
             await self._worktree_manager_for_task(item).remove(item.id)
 
     def _build_system_prompt(
-        self, step: FlowStep, item: Item | None = None, *, runner: AgentRunner | None = None
+        self,
+        step: FlowStep,
+        item: Item | None = None,
+        *,
+        runner: AgentRunner | None = None,
+        resume: bool = False,
     ) -> str:
         """Load prompt file, prepend operational preamble.
 
@@ -6359,6 +6652,11 @@ class OrchestratorService:
         ``dispatch_shape_prompt()`` is injected so the prompt describes the
         dispatch shape that will actually run. Callers without a resolved runner
         (e.g. direct unit tests) get the service's current ``runner``.
+
+        *resume* (ADR-040 R4) appends the interrupted-and-resumed note as a
+        composed-in fragment — never baked into ``OPERATIONAL_PREAMBLE`` (which
+        must stay true for every dispatch), only present when this dispatch
+        resumes/re-runs an interrupted step.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
@@ -6398,7 +6696,11 @@ class OrchestratorService:
         # followed by the active runner's dispatch-shape fragment (CLI
         # one-shot vs. SDK programmatic), then the per-step prompt.
         active_runner = runner if runner is not None else self.runner
-        return OPERATIONAL_PREAMBLE + "\n\n" + active_runner.dispatch_shape_prompt() + "\n\n" + base
+        parts = [OPERATIONAL_PREAMBLE, active_runner.dispatch_shape_prompt()]
+        if resume:
+            parts.append(RESUME_PROMPT_NOTE)
+        parts.append(base)
+        return "\n\n".join(parts)
 
 
 def _build_runner(config: LotsaConfig) -> AgentRunner:
