@@ -2973,7 +2973,7 @@ class OrchestratorService:
         finally:
             self._dispatching_jump.discard(task_id)
 
-    async def acknowledge_override(self, task_id: str, guard_name: str, reason: str | None) -> None:
+    async def acknowledge_override(self, task_id: str, guard_name: str) -> None:
         """Acknowledge a fired guard via its registered override handler (ADR-019).
 
         Looks the handler up in the override registry and invokes its
@@ -3026,7 +3026,7 @@ class OrchestratorService:
         try:
             if not await handler.detect(task, self.db):
                 raise AcknowledgeOverrideNotAllowed(f"Override {guard_name!r} is not applicable to this task")
-            await handler.acknowledge(task, reason, self.db)
+            await handler.acknowledge(task, self.db)
         finally:
             self._acknowledging_override.discard(task_id)
 

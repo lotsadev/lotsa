@@ -1,8 +1,41 @@
 # ADR-019: Operator-acknowledged overrides for Lotsa guard conditions
 
-**Status**: Implemented (revised 2026-06-16 — override now resumes; see Revision note)
+**Status**: Implemented (revised 2026-06-16 — override now resumes; revised 2026-07-02 — reason field removed; see Revision notes)
 **Date**: 2026-05-26
 **Related**: ADR-014 (jobs as unified primitive — establishes the action-vocabulary the new override action joins), ADR-015 (merge-conflict handling — formerly a planned instantiation; its 2026-06-12 revision escalates via `NEEDS_INPUT` instead, see Out of scope), ADR-017 (soft timeout indicator — a second future instantiation), PR #72 / task `<redacted>` (the prompting incident).
+
+---
+
+## Revision note (2026-07-02)
+
+The operator-**reason** coupling is removed. The original design (Commitment 2
+step 2, Commitment 4) let the operator type an optional free-text reason that
+was appended to the `overridden` decision row (`"Operator acknowledged budget
+cap — <reason>"`) and surfaced in the UI as a collapsed "Add reason (optional)"
+textarea next to the override button.
+
+In practice this was a confusing two-field pattern: one action button sitting
+next to an optional free-text field whose only effect was an audit-row suffix.
+This revision drops it:
+
+- The override is now a **bare reset-and-resume**. Clicking "Acknowledge &
+  continue" resets the guard counters and resumes the step in one action, with
+  no intermediate reason entry.
+- The `overridden` audit row content is always the bare `"Operator
+  acknowledged budget cap"` — no `" — <reason>"` suffix.
+- The `reason`/`operator_reason` parameter is removed end-to-end: the
+  `OverrideHandler.acknowledge` protocol, the `pr_fix_budget` handler,
+  `OrchestratorService.acknowledge_override`, the
+  `POST /acknowledge-override` request body, and the frontend
+  `acknowledgeOverride` client all drop it.
+- Operators who want to record *why* they overrode a guard type a normal chat
+  message (a `user` audit row). The tight coupling of the reason to the
+  `overridden` decision row is intentionally dropped — audit-via-chat is
+  accepted as sufficient for this version of the product.
+
+This changes, not preserves, this ADR's original Commitment 2 (reason appended
+to the decision row) and Commitment 4 (the reason field). The sections below
+are annotated to point here.
 
 ---
 
@@ -83,12 +116,13 @@ class OverrideHandler(Protocol):
     async def acknowledge(
         self,
         task: TaskRow,
-        operator_reason: str | None,
         db: TaskDB,
     ) -> None:
         """Clear the block. Write the audit row. No state-transition
         side effects beyond what is necessary to clear the specific
         block this guard imposes."""
+        # Note: the ``operator_reason`` parameter was removed 2026-07-02;
+        # see the 2026-07-02 Revision note.
 ```
 
 A module-level `_handlers: dict[str, OverrideHandler] = {}` plus `register_override(handler)` / `get_override(name)` / `list_available_for(task, db)` give the orchestrator and the API layer a uniform lookup. `list_available_for` iterates registered handlers, calls each one's `detect(task, db)`, and returns the matches — so the `db: TaskDB` argument has to flow through to make `detect()` callable.
@@ -106,7 +140,7 @@ A built-in handler with `guard_name = "pr_fix_budget"`:
      - `role="user"` (operator action — consistent with how `feedback`, `answer`, `chat` are recorded)
      - `step_name="pr-fix"`
      - `type="pr_decision"` (same shape as the cap-fire row at `lotsa/orchestrator.py:2806`)
-     - `content="Operator acknowledged budget cap"` + `f" — {operator_reason}"` if a reason was supplied
+     - `content="Operator acknowledged budget cap"` (bare — the reason suffix was removed 2026-07-02; see the Revision note)
      - `metadata = {"decision": "overridden", "round": <round_at_which_cap_fired>, "triggering_comment_ids": [], "commit_sha": None, "duration_ms": None, "cost_usd": None}`
   3. **Resumes the blocked step in the same action** (revised 2026-06-16). After the reset + audit row, `acknowledge_override` re-dispatches via the normal `retry()` path (for pr-fix, this re-fetches PR feedback per #145). The audit trail still records two distinct rows — the `overridden` pr_decision here and the `Retrying` row from the resume — so override and dispatch remain separately auditable; only the operator's click count collapses to one. See the Revision note for why the original decouple-into-two-clicks design was reversed.
 
@@ -116,13 +150,16 @@ A new action endpoint joining the existing family in `lotsa/server/api_routes.py
 
 ```
 POST /api/tasks/{task_id}/acknowledge-override
-Request:  {"guard_name": str, "reason": str | None}
+Request:  {"guard_name": str}
 Response: TaskDetailFullResponse
 ```
 
+(The request body originally carried an optional `"reason": str | None`; it was
+removed 2026-07-02 — see the Revision note.)
+
 Status guard: HTTP 400 via a new `AcknowledgeOverrideNotAllowed` exception (parallel to `ApproveNotAllowed` / `RetryNotAllowed` defined at `lotsa/orchestrator.py:43-56`), raised when the named guard's `detect()` returns False for this task — preventing the operator from triggering an override action that doesn't apply. The same exception (and same 400 response) covers the case where `guard_name` is not in the registry at all; treating both as "this override isn't applicable to this task" keeps the client-side error handling uniform and avoids leaking registry contents through differentiated status codes.
 
-The endpoint calls a new `OrchestratorService.acknowledge_override(task_id, guard_name, reason)` that looks up the handler in the registry and invokes its `acknowledge()`. Standard request body model added to `lotsa/server/api_routes.py` (next to `FeedbackRequest`, `AnswerRequest`, etc. — sibling request models at lines 45-59).
+The endpoint calls a new `OrchestratorService.acknowledge_override(task_id, guard_name)` that looks up the handler in the registry and invokes its `acknowledge()`. (Originally `acknowledge_override(task_id, guard_name, reason)`; the `reason` parameter was removed 2026-07-02 — see the Revision note.) Standard request body model added to `lotsa/server/api_routes.py` (next to `FeedbackRequest`, `AnswerRequest`, etc. — sibling request models at lines 45-59).
 
 The response shape — `TaskDetailFullResponse` — is the existing uniform action response. Frontend re-fetches the task detail on success and the new audit row appears in the chat immediately, same way `answer` and `feedback` updates appear today.
 
@@ -134,7 +171,7 @@ Concretely:
 
 - **Backend** enriches `TaskDetailFullResponse` (or `TaskSummaryResponse`, depending on cost) with an `available_overrides: list[AvailableOverride]` field, where `AvailableOverride = {guard_name: str, label: str, description: str}`. Populated by iterating registered handlers and calling each one's `detect()`. For most tasks, the list is empty (zero-cost).
 - **Frontend**: when `available_overrides` is non-empty, render one button per override in `ChatInput`'s action button row; the bare **Retry** is hidden in that case (the override's "Acknowledge & continue" now resets *and* resumes — revised 2026-06-16). Retry still renders for plain blocks with no override. Default label: "Acknowledge & continue" (or the handler's custom `label`).
-- **Reason field**: an inline expandable textarea — collapsed by default with a "Add reason (optional)" affordance. Empty submission is allowed; the cap-fire incident this ADR was prompted by usually has its reason already in the latest bot review.
+- **Reason field**: ~~an inline expandable textarea — collapsed by default with a "Add reason (optional)" affordance.~~ **Removed 2026-07-02** (see the Revision note). The override is a single bare button with no textarea; the override request carries only the guard name. Operators who want to record rationale type a normal chat message (a `user` audit row) — the chat input remains available on a blocked task.
 - **On success**: standard React Query invalidation pattern at `chat-input.tsx:24` — the task detail refetches, the new `pr_decision` row is visible in the chat alongside the original cap-fire row, the override button disappears (because `detect()` now returns False for this guard).
 
 ### 5. Operator-initiated paths bypass autonomous-action budget caps
@@ -182,7 +219,7 @@ The pattern matters more as Lotsa broadens beyond engineering: a research proces
 **Pros:**
 
 - **One pattern, many guards.** ADR-017's timeout dismiss and any future Lotsa guard inherit the same UI surface and audit shape. Each handler is ~30 LOC + a registration line.
-- **First-class audit trail.** The override is its own `pr_decision` row, with the round it overrode and the operator's reason preserved. Reviewers reading the message history see the cap fire, the override, and the subsequent retry as three distinct events.
+- **First-class audit trail.** The override is its own `pr_decision` row, recording the round it overrode. Reviewers reading the message history see the cap fire, the override, and the subsequent retry as three distinct events. (The row originally also preserved an operator-supplied reason; that coupling was removed 2026-07-02 — rationale, when the operator wants it, is now a normal chat message. See the Revision note.)
 - **Reuses existing patterns.** The action endpoint, the request schema shape, the exception-on-precondition-failure, the React Query invalidation pattern — all already established. Nothing new to learn for an implementer.
 - **Doesn't change guard semantics.** The cap still fires the same way at the same thresholds. The override is purely a *response* mechanism. Operators who don't want to override (or who set `max_pr_fix_rounds=0` to disable the cap globally) see no behaviour change.
 - **One action, two audit rows** (revised 2026-06-16). "Acknowledge & continue" resets the guard *and* resumes the blocked step in a single operator click — matching this ADR's own stated intent (Context: "a single in-Lotsa action … that the operator clicks to clear the block"). The audit trail still carries both the `overridden` row and the `Retrying` row, so the two events stay independently explainable; the operator just doesn't perform two clicks for one decision. (The original design decoupled them into Acknowledge-then-Retry for audit tidiness; in practice that read as "I acknowledged and nothing happened," and three separate tasks stranded on it — see the Revision note.)
