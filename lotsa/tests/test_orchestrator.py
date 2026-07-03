@@ -6344,3 +6344,30 @@ class TestAttachmentMaterialization:
         run(asyncio.sleep(0.2))
         assert len(service.runner.calls) == 1, "retry must start the parked deferred task"
         assert ".lotsa/attachments/bug.png" in service.runner.calls[0]["user_prompt"]
+
+    def test_stop_does_not_park_interrupted_mid_flow_row(self, service, run):
+        """The deferred-shape park in ``stop()`` must NOT swallow a genuinely-
+        interrupted mid-flow row that happens to carry ``current_step=None``.
+
+        A working row parked in an *active* state (here ``coding``, not the
+        initial ``backlog``) with no in-flight agent is an interrupted/legacy
+        task, not a never-dispatched deferred one — ``stop()`` must keep raising
+        ``StopNotAllowed`` for it (restart recovery owns that shape), rather than
+        parking it as though its first step had never run.
+
+        Fails against a too-broad ``current_step is None`` discriminator: that
+        form parks this row at ``blocked`` and the ``pytest.raises`` below never
+        fires (the same over-broad match that mis-routed the ADR-021 recovery
+        sweep rows).
+        """
+        from lotsa.orchestrator import StopNotAllowed
+
+        # A working row in an active (non-initial) state, current_step unset,
+        # never entered _in_flight — the interrupted-mid-flow shape.
+        row = run(service.db.create_task("interrupted mid-flow", state="coding", status="working"))
+        assert row.current_step is None and row.id not in service._in_flight
+
+        with pytest.raises(StopNotAllowed, match="actively-working agent"):
+            run(service.stop(row.id))
+        # Untouched — not parked at blocked by the deferred branch.
+        assert run(service.db.get_task(row.id)).status == "working"

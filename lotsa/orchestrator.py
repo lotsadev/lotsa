@@ -1667,6 +1667,35 @@ class OrchestratorService:
         )
         await self._dispatch_next_step(item, feedback=feedback)
 
+    def _is_never_dispatched_deferred(self, row: TaskRow) -> bool:
+        """True when ``row`` is a task whose first step never ran — the shape a
+        ``defer_dispatch=True`` create leaves behind until ``dispatch_created``
+        releases it (or the browser/server dies in that window).
+
+        The shape is ``current_step is None`` **and** the row still sits in the
+        exact state ``create_task`` parks a not-yet-dispatched task in: the
+        literal ``backlog`` for a normal first step, or the step's
+        ``queue_state`` for a conversational one. ``current_step is None`` alone
+        is NOT sufficient — a genuinely-interrupted mid-flow row (legacy, or a
+        synthetic recovery row) can also carry ``current_step=None`` while
+        sitting in an *active/action* state (e.g. ``coding``/``deploy``); those
+        must route through the normal recovery path, not be mistaken for a
+        never-dispatched task. Restricting to the initial queued state keeps the
+        two apart.
+
+        Used by both restart recovery (:meth:`_classify_and_resume`) and
+        :meth:`stop` so the deferred shape is recognised identically on both
+        surfaces.
+        """
+        if row.current_step is not None:
+            return False
+        flow = self.root_flow_for(row)
+        first_step = flow.steps[0] if flow and flow.steps else None
+        if first_step is None:
+            return False
+        initial_state = first_step.queue_state if first_step.conversational else "backlog"
+        return row.state == initial_state
+
     async def _chat_transcript(self, task_id: str) -> str:
         """Render a task's chat conversation as a transcript for promotion handover.
 
@@ -2754,17 +2783,18 @@ class OrchestratorService:
             )
         if task_id not in self._in_flight:
             # A task created with defer_dispatch=True but never released sits at
-            # status='working' with current_step=None and NO in-flight agent —
-            # if the operator's browser closed between create and the follow-up
-            # dispatch() (no restart to auto-heal it), it is otherwise stuck at
-            # "Agent is working…" forever with no recovery path. There is no
-            # agent to cancel, but park it at blocked so Retry can re-dispatch
-            # the held first step (or Archive can discard it). A genuinely-
-            # working task is always in _in_flight, and a working task with
-            # current_step set is a natural-completion race (drainer will land
-            # it) — so gate on current_step is None to hit only the deferred
-            # shape, and keep raising for everything else.
-            if row.current_step is None:
+            # status='working' with current_step=None in its initial queued
+            # state and NO in-flight agent — if the operator's browser closed
+            # between create and the follow-up dispatch() (no restart to
+            # auto-heal it), it is otherwise stuck at "Agent is working…" forever
+            # with no recovery path. There is no agent to cancel, but park it at
+            # blocked so Retry can re-dispatch the held first step (or Archive
+            # can discard it). A genuinely-working task is always in _in_flight,
+            # and a working task with current_step set is a natural-completion
+            # race (drainer will land it) — so gate on the never-dispatched
+            # deferred shape (the same discriminator restart recovery uses) to
+            # hit only that case, and keep raising for everything else.
+            if self._is_never_dispatched_deferred(row):
                 # Fire the park CAS. It writes the audit row only on win; if it
                 # loses (a racing restart-recovery release or concurrent stop
                 # already moved the row) it's a clean no-op. No side effect
@@ -4270,13 +4300,17 @@ class OrchestratorService:
         """
         # Never-dispatched deferred task (ADR-034 attachment flow): a task
         # created with ``defer_dispatch=True`` sits at ``status='working'`` with
-        # ``current_step=None`` until ``dispatch_created`` releases it. If the
-        # server restarts (or the operator's browser closed) inside that window,
-        # there is no interrupted step to *resume* — the first step never ran.
-        # Release it now (resumptive, per ADR-040): whatever attachments landed
-        # are materialized on dispatch. Any genuinely-dispatched task has
-        # ``current_step`` set, so this discriminator is exact.
-        if row.current_step is None:
+        # ``current_step=None`` in its initial queued state until
+        # ``dispatch_created`` releases it. If the server restarts (or the
+        # operator's browser closed) inside that window, there is no interrupted
+        # step to *resume* — the first step never ran. Release it now
+        # (resumptive, per ADR-040): whatever attachments landed are
+        # materialized on dispatch. The discriminator gates on the *initial*
+        # state as well as ``current_step`` so a genuinely-interrupted mid-flow
+        # row (which can also carry ``current_step=None``) still routes through
+        # the normal recovery path below rather than being re-dispatched from
+        # its first step.
+        if self._is_never_dispatched_deferred(row):
             await self.db.add_message(
                 row.id,
                 "system",
