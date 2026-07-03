@@ -35,17 +35,31 @@ export function ChatInput({ data }: ChatInputProps) {
   // so the next step materializes them. Throws (aborting the send) if an upload
   // fails, surfacing the error inline rather than sending a message that
   // references files that never arrived.
+  //
+  // A successfully-uploaded file is dropped from `files` as soon as its POST
+  // resolves — even when a *later* file in the batch fails. Otherwise a partial
+  // failure would leave the already-durable files selected, and the next
+  // Send/Approve/Retry would re-upload them, creating duplicate suffixed
+  // records (`name (1).png`) and burning the per-task count cap. The failed
+  // file and any not-yet-attempted ones stay selected so a retry re-sends only
+  // those.
   const uploadPending = async () => {
     setAttachError(null)
-    for (const f of files) {
-      try {
-        await uploadAttachment(task.id, f)
-      } catch (e) {
-        setAttachError(`Failed to attach ${f.name}: ${(e as Error).message}`)
-        throw e
+    const remaining = [...files]
+    try {
+      while (remaining.length > 0) {
+        const f = remaining[0]
+        try {
+          await uploadAttachment(task.id, f)
+        } catch (e) {
+          setAttachError(`Failed to attach ${f.name}: ${(e as Error).message}`)
+          throw e
+        }
+        remaining.shift() // Uploaded durably — never re-send it on a retry.
       }
+    } finally {
+      setFiles(remaining)
     }
-    setFiles([])
   }
 
   // ADR-027 — promotion is valid from any non-terminal state. Mirror the
