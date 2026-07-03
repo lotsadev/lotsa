@@ -315,6 +315,118 @@ def test_mark_complete_endpoint_returns_503_when_mark_complete_fails(app_with_se
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# mark_complete from ANY non-terminal state (ADR-043 headline: "from ANY
+# non-terminal state"). The happy-path tests above all start from
+# ``(waiting, reviewing)``; these assert the breadth the CAS actually claims —
+# the escape-hatch state itself, a SM sink, and the PR-monitor-untrack branch.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_mark_complete_from_awaiting_operator(tmp_path, run):
+    """The escape hatch's raison d'être: a task parked at ``awaiting_operator``
+    (the GitHub-less push park) is driven to ``complete`` by the operator.
+
+    This is the state the whole action exists to close, yet none of the
+    happy-path tests start from it — assert it directly.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Parked awaiting operator",
+                state="awaiting_operator",
+                status="awaiting_operator",
+                current_step="push",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert row.current_step is None
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_from_blocked(tmp_path, run):
+    """mark_complete works from ``blocked`` — a SM sink. An Execute run that
+    couldn't reach a PR terminal on its own (e.g. a push failure) is parked at
+    ``blocked``; completion is global truth, not a flow edge, so the
+    non-edge-gated CAS (ADR-030 pattern) still lands from this sink.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Blocked then completed",
+                state="pushing",
+                status="blocked",
+                current_step="push",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_from_waiting_for_pr_untracks_monitor(tmp_path, run):
+    """mark_complete on a task parked at the PR monitor stops it being polled:
+    the monitor engine's ``untrack`` is invoked before the terminal CAS, mirroring
+    archive()/block() teardown. Without it, a completed task would keep being
+    polled by pr_monitor. Asserted via a spy wrapping the REAL engine's untrack
+    (resolved against the task's own process), not a hand-rolled fake, so the
+    ``_monitor_engine_for`` resolution is exercised too.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        engine = svc._pr_monitors_by_process["build"]
+        untracked: list[str] = []
+        real_untrack = engine.untrack
+
+        def spy_untrack(task_id: str) -> None:
+            untracked.append(task_id)
+            real_untrack(task_id)
+
+        engine.untrack = spy_untrack  # type: ignore[method-assign]
+
+        # ``wait_for_pr_signal`` is build's monitor state; ``waiting_for_pr`` the
+        # paired status. This is the exact shape a parked, PR-watching task holds.
+        task = run(
+            svc.db.create_task(
+                "Watching a PR",
+                state="wait_for_pr_signal",
+                status="waiting_for_pr",
+                current_step="wait_for_pr_signal",
+                metadata={"process_name": "build", "pr_number": 7},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert task.id in untracked, "mark_complete must untrack a PR-monitored task before completing it"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Legacy-row routing on restart (plan §9, acceptance #10)
 # ───────────────────────────────────────────────────────────────────────────
 

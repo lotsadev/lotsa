@@ -1,4 +1,4 @@
-"""Task status enum constants — single source of truth for the eight-state model.
+"""Task status enum constants — single source of truth for the nine-state model.
 
 The enum is exported as a class with string-valued class attributes (not
 ``enum.Enum``) so that JSON-serialisable values can be passed directly

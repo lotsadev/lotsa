@@ -350,7 +350,18 @@ export function ChatInput({ data }: ChatInputProps) {
           onChange={(e) => setInputValue(e.target.value)}
           onSubmit={submitForStatus}
           placeholder={placeholders[task.status] ?? ''}
-          disabled={isPending || task.status === 'complete' || task.status === 'abandoned'}
+          disabled={
+            isPending ||
+            task.status === 'complete' ||
+            task.status === 'abandoned' ||
+            // ``awaiting_operator`` is not a text-input state — the operator's
+            // action is the "Mark complete" button, not a typed message. The
+            // textarea stays disabled (matching ``complete``/``abandoned``) so
+            // typing + Enter/Send can't silently no-op (submitForStatus/
+            // submitDisabled have no ``awaiting_operator`` case). The static
+            // placeholder is a hint on the disabled field, like the terminal ones.
+            task.status === 'awaiting_operator'
+          }
           className="min-w-0 flex-1"
         />
         <div className="flex flex-wrap items-center gap-2">
