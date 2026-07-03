@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
@@ -10,6 +11,10 @@ import type { Message } from '@/api/types'
 
 interface ChatMessageProps {
   message: Message
+  // Set by chat-panel's needs-input collapse: this agent chat/output bubble is
+  // the single "awaiting your answer" bubble a duplicate question folded into
+  // (R2). Renders the amber needs-input accent.
+  awaitingInput?: boolean
 }
 
 function formatBytes(bytes: number): string {
@@ -39,7 +44,26 @@ function TruncatedFooter({ message }: { message: Message }) {
 }
 
 const LARGE_CONTENT_THRESHOLD = 10_000 // chars
-const PROSE_CLASSES = "prose prose-sm dark:prose-invert max-w-none [&_h1]:text-lg [&_h1]:font-bold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_h4]:text-sm [&_h4]:font-medium [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-xs [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_a]:text-primary [&_a]:underline"
+// R1 — overflow containment. `break-words [overflow-wrap:anywhere]` wraps long
+// unbroken strings/URLs; `[&_pre]:overflow-x-auto [&_pre]:max-w-full` scopes a
+// horizontal scrollbar to code blocks inside the bubble instead of widening it;
+// `[&_a]:break-words` wraps long link text. Wide tables are wrapped in a scroll
+// container by MARKDOWN_COMPONENTS below.
+const PROSE_CLASSES = "prose prose-sm dark:prose-invert max-w-none break-words [overflow-wrap:anywhere] [&_h1]:text-lg [&_h1]:font-bold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_h4]:text-sm [&_h4]:font-medium [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-xs [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_pre]:overflow-x-auto [&_pre]:max-w-full [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_a]:text-primary [&_a]:underline [&_a]:break-words"
+
+// R1 — wide tables scroll horizontally inside their own container rather than
+// widening the bubble. The prose [&_table]/[&_th]/[&_td] selectors still apply:
+// the table stays a descendant of the prose div.
+const MARKDOWN_COMPONENTS: Components = {
+  // Destructure `node` out so react-markdown's AST node isn't spread onto the
+  // <table> DOM element (which would warn); only the real table props pass through.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  table: ({ node, ...props }) => (
+    <div className="max-w-full overflow-x-auto">
+      <table {...props} />
+    </div>
+  ),
+}
 
 export function MarkdownContent({ content }: { content: string }) {
   const [expanded, setExpanded] = useState(false)
@@ -54,7 +78,7 @@ export function MarkdownContent({ content }: { content: string }) {
       <div className="space-y-2">
         {/* Show first few lines as preview */}
         <div className={cn(PROSE_CLASSES, "line-clamp-6 opacity-70")}>
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
             {lines.slice(0, 8).join('\n')}
           </ReactMarkdown>
         </div>
@@ -76,7 +100,7 @@ export function MarkdownContent({ content }: { content: string }) {
 
   return (
     <div className={PROSE_CLASSES}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
         {content}
       </ReactMarkdown>
     </div>
@@ -106,7 +130,7 @@ function MessageMetadata({ metadata, createdAt }: { metadata: Record<string, unk
   )
 }
 
-export function ChatMessage({ message }: ChatMessageProps) {
+export function ChatMessage({ message, awaitingInput = false }: ChatMessageProps) {
   // Hide internal events — not user-facing
   if (
     message.type === 'status_change' ||
@@ -155,11 +179,34 @@ export function ChatMessage({ message }: ChatMessageProps) {
     )
   }
 
-  // Feedback — centered system note
+  // Operator-authored messages (chat/answer/feedback + user) — right-aligned
+  // "You" bubble in a distinct primary tint (R4). Checked BEFORE `feedback` so
+  // approve/revise/pr-fix feedback (stored as type="feedback", role="user")
+  // reads as "You" rather than a centered status note.
+  if (message.role === 'user') {
+    return (
+      <div className="flex justify-end py-1.5">
+        <div className="max-w-[90%] min-w-0">
+          <div className="mb-1 text-right font-mono text-xs text-muted-foreground">
+            You
+          </div>
+          <div className="rounded-xl border border-primary/30 bg-primary/10 px-4 py-2.5">
+            <MarkdownContent content={message.content} />
+            <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // Feedback — centered, system-authored status note. Width-constrained +
+  // wrapping (R4) so long text can't overflow the viewport.
   if (message.type === 'feedback') {
     return (
-      <div className="py-2 text-center">
-        <span className="text-xs text-muted-foreground">{message.content}</span>
+      <div className="flex justify-center py-2">
+        <span className="max-w-[90%] break-words text-center text-xs text-muted-foreground">
+          {message.content}
+        </span>
       </div>
     )
   }
@@ -168,27 +215,10 @@ export function ChatMessage({ message }: ChatMessageProps) {
   if (message.type === 'error') {
     return (
       <div className="flex justify-start py-1.5">
-        <div className="max-w-[80%] rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-2.5">
+        <div className="max-w-[90%] min-w-0 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-2.5">
           <MarkdownContent content={message.content} />
           <TruncatedFooter message={message} />
           <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
-        </div>
-      </div>
-    )
-  }
-
-  // User messages (chat+user, answer+user) — right-aligned
-  if (message.role === 'user') {
-    return (
-      <div className="flex justify-end py-1.5">
-        <div className="max-w-[80%]">
-          <div className="mb-1 text-right font-mono text-xs text-muted-foreground">
-            You
-          </div>
-          <div className="rounded-xl bg-muted px-4 py-2.5">
-            <MarkdownContent content={message.content} />
-            <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
-          </div>
         </div>
       </div>
     )
@@ -198,7 +228,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
   if (message.type === 'question') {
     return (
       <div className="flex justify-start py-1.5">
-        <div className="max-w-[80%]">
+        <div className="max-w-[90%] min-w-0">
           <div className="mb-1 font-mono text-xs text-amber-500">
             {message.step_name} Agent
           </div>
@@ -211,7 +241,10 @@ export function ChatMessage({ message }: ChatMessageProps) {
     )
   }
 
-  // Agent messages (chat+agent, output+agent) — left-aligned with agent label
+  // Agent messages (chat+agent, output+agent) — left-aligned with agent label.
+  // When `awaitingInput` (R2), this is the single bubble a duplicate
+  // needs-input question collapsed into: render the amber "awaiting your
+  // answer" accent instead of the neutral card.
   if (message.role === 'agent') {
     const agentModel = message.metadata?.agent_model
       ? ` · ${message.metadata.agent_model}`
@@ -219,11 +252,24 @@ export function ChatMessage({ message }: ChatMessageProps) {
 
     return (
       <div className="flex justify-start py-1.5">
-        <div className="max-w-[80%]">
-          <div className="mb-1 font-mono text-xs text-primary">
+        <div className="max-w-[90%] min-w-0">
+          <div
+            className={cn(
+              'mb-1 font-mono text-xs',
+              awaitingInput ? 'text-amber-500' : 'text-primary'
+            )}
+          >
             {message.step_name} Agent{agentModel}
+            {awaitingInput && ' · awaiting your answer'}
           </div>
-          <div className="rounded-xl border border-border bg-card px-4 py-2.5">
+          <div
+            className={cn(
+              'rounded-xl px-4 py-2.5',
+              awaitingInput
+                ? 'border border-amber-500/30 bg-amber-500/10'
+                : 'border border-border bg-card'
+            )}
+          >
             <MarkdownContent content={message.content} />
             <TruncatedFooter message={message} />
             <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
@@ -236,7 +282,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
   // Fallback — render as left-aligned plain message
   return (
     <div className="flex justify-start py-1.5">
-      <div className="max-w-[80%] rounded-xl border border-border bg-card px-4 py-2.5">
+      <div className="max-w-[90%] min-w-0 rounded-xl border border-border bg-card px-4 py-2.5">
         <MarkdownContent content={message.content} />
         <TruncatedFooter message={message} />
         <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />

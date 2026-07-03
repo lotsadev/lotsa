@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 60" width="64" height="60">
+<style>
+@keyframes wv  { to { transform: translateX(-20px); } }
+@keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-1.7px); } }
+@keyframes rock{ 0%,100% { transform: rotate(-1.5deg); } 50% { transform: rotate(1.5deg); } }
+@keyframes puff{ 0% { opacity:0; } 18% { opacity:.5; } 100% { opacity:0; } }
+.wvB { animation: wv 5.2s linear infinite; }
+.wvF { animation: wv 3.4s linear infinite; }
+.bob { animation: bob 3.2s ease-in-out infinite; }
+.rock{ animation: rock 4.6s ease-in-out infinite; transform-box: view-box; transform-origin: 32px 50px; }
+.smoke circle { opacity:0; }
+.smoke circle { animation: puff 2.7s linear infinite; }
+.smoke circle:nth-child(2){ animation-delay:.9s; }
+.smoke circle:nth-child(3){ animation-delay:1.8s; }
+@media (prefers-reduced-motion: reduce){
+  .wvB,.wvF,.bob,.rock { animation: none !important; }
+  .smoke circle { animation: none !important; opacity:0 !important; }
+}
+.smk { animation: rise 2.7s linear infinite; } @keyframes rise{0%{transform:translate(0,8px);}100%{transform:translate(-4px,-6px);}} @media (prefers-reduced-motion: reduce){ .smk{animation:none!important;} }</style>
+<defs><clipPath id="cap"><rect width="64" height="60"/></clipPath></defs><g clip-path="url(#cap)"><g class="wvB"><path d="M-40 53 q5 -2.0 10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 " fill="none" stroke="#D6A24C" stroke-width="2" stroke-linecap="round" opacity="0.4"/></g><g class="bob"><g class="rock"><path fill="#D6A24C" d="M9 40 L54 40 L56 33 L59.5 34 L57.5 41 L50 49 L16 49 Z"/><path fill-rule="evenodd" fill="#D6A24C" d="M18 26 h15 a2 2 0 0 1 2 2 v12 h-19 v-12 a2 2 0 0 1 2 -2 Z M21 30 h4 v4 h-4 Z M28 30 h4 v4 h-4 Z"/><path fill="#D6A24C" d="M38 28 h7 v12 h-7 Z"/><rect x="38" y="31" width="7" height="2.2" fill="#0C0C0E"/><rect x="25" y="20" width="1.8" height="6" fill="#D6A24C"/></g></g><g class="wvF"><path d="M-40 50 q5 -2.8 10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 t10 0 " fill="none" stroke="#D6A24C" stroke-width="2.4" stroke-linecap="round"/></g><g class="smoke smk"><circle cx="40" cy="16" r="3"/><circle cx="40" cy="16" r="3"/><circle cx="40" cy="16" r="3"/></g></g></svg>
