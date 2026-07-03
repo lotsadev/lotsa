@@ -337,7 +337,7 @@ Lives at `~/.lotsa/lotsa.yaml` by default (alongside `lotsa.db` and the per-task
 model: sonnet                 # claude model
 budget: 5.0                   # max USD per agent run
 # max_output_tokens: 128000   # cap per response — uncomment to raise the 32000 default
-flow: chat                    # default-selected process: bundled name (chat/simple/standard/full/quickfix) or an inline process name. The full catalog always loads; this only sets the picker's pre-selected default
+flow: chat                    # default-selected process: bundled name (chat/build/fix) or an inline process name. The full catalog always loads; this only sets the picker's pre-selected default
 prompts_dir: prompts/         # custom prompt templates (optional)
 
 # Projects — the git repos Lotsa can run tasks against. Each id must match

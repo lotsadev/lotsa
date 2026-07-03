@@ -52,10 +52,11 @@ def init(data_dir: Path | None) -> None:
                 {
                     "model": "sonnet",
                     "budget": 5.0,
-                    # ADR-034 §2 — new tasks default to ``chat`` (start as a
-                    # conversation, promote into a structured process when
-                    # ready). The full catalog still loads; ``flow:`` only picks
-                    # which process the new-task picker pre-selects.
+                    # ADR-034 §2 / ADR-043 — new tasks default to ``chat`` (start
+                    # as a conversation, hand off into an Execute process
+                    # (``build``/``fix``) when ready). The full catalog still
+                    # loads; ``flow:`` only picks which process the new-task
+                    # picker pre-selects.
                     "flow": "chat",
                 },
                 default_flow_style=False,

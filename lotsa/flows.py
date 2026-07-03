@@ -8,7 +8,7 @@ no synthetic state names — there is no longer a ``pr:`` block, and the
 
 The schema:
 
-    process: software_process
+    process: build
     jobs:
       - { name: code, type: agent, prompt: coding }
       - { name: push_pr, type: action, tool: push_pr }
