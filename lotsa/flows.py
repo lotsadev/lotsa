@@ -899,7 +899,7 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
     Recognized non-job keywords: ``next`` (success edge), the terminal states
     ``blocked`` / ``complete`` / ``abandoned``, and ``needs_input`` — the last
     is special-cased in the completion drainer's PR_FIX_NEEDS_DECISION path
-    (e.g. the bundled ``full`` process's ``pr-fix`` rule routes to it), so it
+    (e.g. the bundled ``build`` process's ``pr-fix`` rule routes to it), so it
     is a legitimate target even though it is not a job.
     """
     sentinels = {"next", "blocked", "complete", "abandoned", "needs_input"}

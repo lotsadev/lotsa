@@ -205,7 +205,7 @@ def promote(task_id: str, process: str, context: str | None, host: str, port: in
     Issues ``POST /api/tasks/<task_id>/promote`` against a running
     ``lotsa serve`` — the orchestrator owns the task's in-memory state, so this
     must talk to the live server rather than spinning up its own. For
-    destination-specific handover (e.g. ``full``'s ``draft_spec``), use the
+    destination-specific handover (e.g. ``build``'s ``draft_spec``), use the
     dashboard's Promote modal; ``--context`` seeds the generic
     ``promotion_context`` artifact.
     """

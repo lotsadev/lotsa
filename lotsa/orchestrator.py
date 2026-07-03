@@ -978,8 +978,9 @@ class OrchestratorService:
         # contributes its own action states, monitor state, monitor engine, and
         # (for pr_monitor) config — keyed by catalog name so a task's routing
         # decisions resolve against its OWN process, not a global active one.
-        # The new full process names its action job ``push_pr`` and its monitor
-        # job ``wait_for_pr_signal`` — replaces the hardcoded ``pushing``/
+        # The Execute processes (``build``/``fix``) name their action job
+        # ``push_pr`` and their monitor job ``wait_for_pr_signal`` — replaces
+        # the hardcoded ``pushing``/
         # ``waiting_for_pr`` synthetic states from the pre-ADR-014 model.
         from lotsa.registry import get_engine
 
