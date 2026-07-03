@@ -186,6 +186,19 @@ class MarkCompleteNotAllowed(Exception):
     """
 
 
+class MarkCompleteFailed(Exception):
+    """Raised when ``mark_complete()``'s terminal CAS never converges.
+
+    Mirror of ``ArchiveFailed``. ``mark_complete()`` re-reads the row and CASes
+    to ``complete`` in a bounded loop to absorb a racing non-terminal shift. If
+    every attempt loses, the task is NOT complete — returning silently would
+    make ``mark_complete_task`` respond HTTP 200 with a non-complete task.
+    Kept distinct from ``MarkCompleteNotAllowed`` (a 400 "don't retry, already
+    terminal" precondition) so the route can surface non-convergence as a
+    retryable 503 instead of a non-retryable 400.
+    """
+
+
 class ProcessNotFound(ValueError):
     """Raised when ``create_task`` is given a ``process_name`` that doesn't
     match any loaded process. The operator's recovery action is "add it to
@@ -3270,7 +3283,9 @@ class OrchestratorService:
         Idempotent only when a concurrent *terminal* outcome (completion /
         merge / archive) wins the race; a lost CAS against a non-terminal shift
         re-reads and retries (up to 5 attempts) rather than silently no-opping.
-        An already-terminal task raises ``MarkCompleteNotAllowed``.
+        An already-terminal task raises ``MarkCompleteNotAllowed`` (→ 400);
+        exhausting all retries without converging raises ``MarkCompleteFailed``
+        (→ 503, retryable) — mirroring ``archive()``/``ArchiveFailed``.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
@@ -3327,9 +3342,12 @@ class OrchestratorService:
             # Lost the CAS against a NON-terminal shift — re-read and retry.
 
         # Every attempt lost against a moving non-terminal state — surface the
-        # non-convergence rather than returning a false success. Effectively
-        # unreachable under CE's single-writer SQLite, but the contract holds.
-        raise MarkCompleteNotAllowed(f"mark_complete() did not converge for task {task_id} after 5 attempts")
+        # non-convergence rather than returning a false success. Raise the
+        # retryable ``MarkCompleteFailed`` (→ 503), NOT ``MarkCompleteNotAllowed``
+        # (→ 400): the task isn't terminal, the operator should retry — mirrors
+        # ``archive()``/``ArchiveFailed``. Effectively unreachable under CE's
+        # single-writer SQLite, but the contract holds.
+        raise MarkCompleteFailed(f"mark_complete() did not converge for task {task_id} after 5 attempts")
 
     async def dispatch_pr_fix(self, task_id: str, feedback: str) -> bool:
         """Dispatch a pr-fix step for a task (used by PrMonitor).

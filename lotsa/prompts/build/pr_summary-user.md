@@ -6,11 +6,7 @@
 
 ### Spec
 
-{artifact:spec}
-
-### Plan
-
-{artifact:plan}
+{artifact:draft_spec}
 
 ---
 

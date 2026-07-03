@@ -228,6 +228,92 @@ def test_mark_complete_api_route_completes_task(app_with_service, run):
     run(_test())
 
 
+def test_mark_complete_raises_failed_when_cas_never_converges(tmp_path, run):
+    """If every terminal CAS loses to a moving non-terminal state, mark_complete()
+    must raise ``MarkCompleteFailed`` (retryable), NOT ``MarkCompleteNotAllowed``
+    (a 400 "already terminal" precondition) and NOT return silently.
+
+    Pre-fix red: the loop-exhausted branch raised ``MarkCompleteNotAllowed``, so
+    a genuine non-convergence was reported as a non-retryable 400. The failure is
+    driven from inside the code under test — a stubbed ``atomic_transition`` makes
+    every ``to_status='complete'`` CAS lose by presenting a bogus ``from_status``.
+    """
+    from lotsa.orchestrator import MarkCompleteFailed, MarkCompleteNotAllowed
+
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Never converges",
+                state="reviewing",
+                status="waiting",
+                current_step="review",
+                metadata={"process_name": "build"},
+            )
+        )
+        real_at = svc.db.atomic_transition
+
+        async def always_lose(task_id, **kwargs):
+            # Force the terminal CAS to lose every iteration: present a bogus
+            # ``from_status`` so ``to_status='complete'`` never lands, simulating
+            # a perpetually-racing non-terminal writer.
+            if kwargs.get("to_status") == "complete":
+                return await real_at(
+                    task_id,
+                    from_status="__never__",
+                    from_state=kwargs["from_state"],
+                    to_state=kwargs["to_state"],
+                    to_status="complete",
+                    to_current_step=kwargs.get("to_current_step"),
+                    audit_on_win=None,
+                )
+            return await real_at(task_id, **kwargs)
+
+        svc.db.atomic_transition = always_lose
+        try:
+            with pytest.raises(MarkCompleteFailed):
+                run(svc.mark_complete(task.id))
+        finally:
+            svc.db.atomic_transition = real_at
+
+        # MarkCompleteFailed must be distinct from the 400 precondition type.
+        assert not issubclass(MarkCompleteFailed, MarkCompleteNotAllowed)
+        # Task is NOT complete on a non-converging run.
+        row = run(svc.db.get_task(task.id))
+        assert row.status != "complete"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_endpoint_returns_503_when_mark_complete_fails(app_with_service, run):
+    """When mark_complete() raises ``MarkCompleteFailed`` (CAS never converged),
+    the route surfaces a 503 with code ``MARK_COMPLETE_FAILED`` rather than a
+    false 200 — mirrors ``archive``'s ``ArchiveFailed`` → 503 contract. A 400
+    (MarkCompleteNotAllowed) here would wrongly tell the client not to retry.
+    """
+    app, service = app_with_service
+
+    async def _test():
+        from lotsa.orchestrator import MarkCompleteFailed
+
+        task = await service.create_task("Mark complete fails")
+        await wait_for_completion(service, task.id)
+
+        async def boom(task_id: str) -> None:
+            raise MarkCompleteFailed("did not converge")
+
+        service.mark_complete = boom  # type: ignore[method-assign]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/tasks/{task.id}/mark-complete")
+            assert resp.status_code == 503
+            assert resp.json()["detail"]["code"] == "MARK_COMPLETE_FAILED"
+
+    run(_test())
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Legacy-row routing on restart (plan §9, acceptance #10)
 # ───────────────────────────────────────────────────────────────────────────

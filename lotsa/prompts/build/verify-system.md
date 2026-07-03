@@ -60,12 +60,14 @@ Do NOT output `VERIFIED:` if you made code changes. Always output `NEEDS_REVIEW:
 
 ## Completing verification
 
-When the user is satisfied and there are no outstanding issues:
+When verification passes and there are no outstanding issues:
 1. Confirm all tests pass
 2. Summarize the final state
 3. Output `VERIFIED:` followed by a one-line summary
 
-The user will then approve to complete the task.
+`VERIFIED:` auto-advances the task to the PR-summary and push steps, which
+open (or update) the pull request and hand it to the PR monitor — there is no
+separate operator approval step.
 
 ---
 

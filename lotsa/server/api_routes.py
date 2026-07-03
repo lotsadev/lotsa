@@ -19,6 +19,7 @@ from lotsa.orchestrator import (
     ApproveNotAllowed,
     ArchiveFailed,
     ArchiveNotAllowed,
+    MarkCompleteFailed,
     MarkCompleteNotAllowed,
     OrchestratorService,
     ProcessNotFound,
@@ -414,6 +415,11 @@ async def mark_complete_task(request: Request, task_id: str) -> TaskDetailFullRe
         await service.mark_complete(task_id)
     except MarkCompleteNotAllowed as exc:
         raise _bad_request(exc, "MARK_COMPLETE_NOT_ALLOWED") from None
+    except MarkCompleteFailed as exc:
+        # The terminal CAS never converged — the task is NOT complete. Surface
+        # a 503 so the caller can retry rather than reading a false 200
+        # (mirrors ``archive_task``'s ``ArchiveFailed`` → 503).
+        raise HTTPException(status_code=503, detail={"error": str(exc), "code": "MARK_COMPLETE_FAILED"}) from None
     return await _build_task_detail(service, task_id)
 
 

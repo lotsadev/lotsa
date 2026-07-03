@@ -8,10 +8,6 @@ Otherwise, ensure all changes are saved to the worktree and the code is ready fo
 
 **Title:** {title}
 
-## Spec
+## Spec (context only — the PR feedback and branch diff are ground truth)
 
-{artifact:spec}
-
-## Plan
-
-{artifact:plan}
+{artifact:draft_spec}
