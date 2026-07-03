@@ -4043,7 +4043,11 @@ class OrchestratorService:
         body: str | None = None
         if pr_number is None:
             pr_description = await self.get_named_artifact(item.id, "pr_description") or ""
-            spec = await self.get_named_artifact(item.id, "spec") or ""
+            # ADR-043 renamed the carried-spec artifact ``spec`` → ``draft_spec``
+            # (the ``spec`` step is gone; chat hands a spec off under ``draft_spec``).
+            # Read the current name so the deterministic fallback still gets the
+            # carried spec as last-resort context.
+            draft_spec = await self.get_named_artifact(item.id, "draft_spec") or ""
             title, body = await build_pr_text(
                 work_dir=work_dir,
                 task_id=item.id,
@@ -4053,7 +4057,7 @@ class OrchestratorService:
                 # the push runs via the push_pr tool or this legacy path.
                 flow_name=self._root_flow_for(item).name,
                 pr_description=pr_description,
-                spec=spec,
+                spec=draft_spec,
             )
 
         try:

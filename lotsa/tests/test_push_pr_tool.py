@@ -49,9 +49,10 @@ def _isolated_registry():
 class _FakeDB:
     """Bare-minimum DB stub satisfying the surface ``push_pr`` touches.
 
-    The tool reads artifacts (spec, plan); the stub answers from an
-    in-memory mapping. Anything the tool doesn't actually touch is omitted
-    deliberately — adding placeholders would hide accidental new dependencies.
+    The tool reads artifacts (``pr_description``, ``draft_spec``); the stub
+    answers from an in-memory mapping. Anything the tool doesn't actually
+    touch is omitted deliberately — adding placeholders would hide accidental
+    new dependencies.
     """
 
     artifacts: dict[str, str] = field(default_factory=dict)
@@ -266,3 +267,35 @@ def test_push_pr_unexpected_exception_returns_failure(tmp_path):
 
     assert result.success is False
     assert result.metadata.get("exception_type") == "RuntimeError"
+
+
+def test_push_pr_passes_carried_draft_spec_to_build_pr_text(tmp_path):
+    """The carried chat spec reaches ``build_pr_text`` as fallback context.
+
+    ADR-043 renamed the carried-spec artifact ``spec`` → ``draft_spec`` (the
+    ``spec`` step was removed). Regression against the rename-sweep miss where
+    ``push_pr`` still read the never-produced ``"spec"`` artifact: with only a
+    ``draft_spec`` artifact present, the value must still flow into
+    ``build_pr_text``'s ``spec`` fallback kwarg. Against the pre-fix code
+    (reading ``"spec"``) the captured kwarg is ``""`` and this fails.
+    """
+    from lotsa.tools.push_pr import push_pr
+
+    captured: dict[str, str] = {}
+
+    async def _fake_build_pr_text(**kwargs):
+        captured["spec"] = kwargs["spec"]
+        return ("feat: x", "body")
+
+    # No pr_number in metadata → PR-creation path → build_pr_text is invoked.
+    ctx = _make_ctx(tmp_path, artifacts={"draft_spec": "The carried chat spec"})
+
+    with (
+        patch("lotsa.tools.push_pr.execute_push", new_callable=AsyncMock) as mock_push,
+        patch("lotsa.tools.push_pr.build_pr_text", new=_fake_build_pr_text),
+    ):
+        mock_push.return_value = (7, "https://github.com/o/r/pull/7", "o", "r")
+        result = asyncio.get_event_loop().run_until_complete(push_pr(ctx, {}))
+
+    assert result.success is True
+    assert captured["spec"] == "The carried chat spec"

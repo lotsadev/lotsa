@@ -36,14 +36,18 @@ async def push_pr(task: TaskContext, config: dict[str, Any]) -> ToolResult:
     body: str | None = None
     if pr_number is None:
         pr_description = await task.get_artifact("pr_description") or ""
-        spec = await task.get_artifact("spec") or ""
+        # ADR-043 renamed the carried-spec artifact ``spec`` → ``draft_spec``
+        # (the ``spec`` step is gone; chat hands a spec off under ``draft_spec``).
+        # Read the current name so the deterministic fallback still gets the
+        # carried spec as last-resort context.
+        draft_spec = await task.get_artifact("draft_spec") or ""
         title, body = await build_pr_text(
             work_dir=task.worktree,
             task_id=task.task_id,
             base_branch=base_branch,
             flow_name=task.flow_name,
             pr_description=pr_description,
-            spec=spec,
+            spec=draft_spec,
         )
 
     try:
