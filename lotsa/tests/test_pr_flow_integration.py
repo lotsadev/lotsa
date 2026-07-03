@@ -1198,6 +1198,109 @@ def test_push_pr_no_github_parks_task_in_awaiting_operator(tmp_path):
         loop.close()
 
 
+def test_execute_push_no_github_parks_task_in_awaiting_operator(tmp_path):
+    """The *legacy* ``_execute_push`` path (``state='pushing'``, reachable via
+    ``retry()`` on a pre-ADR-014 push-state row) parks a GitHub-less push in
+    ``awaiting_operator`` — the ADR-043 escape hatch — NOT ``blocked``.
+
+    This is the sibling of ``test_push_pr_no_github_parks_task_in_awaiting_operator``:
+    the same ``NO_GITHUB:`` → ``awaiting_operator`` handling exists at two
+    push sites (the ``push_pr`` action tool and this legacy ``_execute_push``
+    branch), and only the former was covered. Without the ``_execute_push``
+    branch a GitHub-less operator who lands on the legacy retry path would see
+    ``blocked`` with a token error instead of "Awaiting you".
+
+    The failure is driven from inside the code under test: ``execute_push`` is
+    stubbed to raise the real ``PushError('NO_GITHUB: …')`` contract, and the
+    row enters at the genuine ``(status='working', state='pushing')`` push
+    precondition that ``PUSH_START`` claims — not pre-flipped into the parked
+    state.
+    """
+    import asyncio
+
+    from lotsa.config import LotsaConfig
+    from lotsa.db import TaskDB
+    from lotsa.orchestrator import OrchestratorService
+    from lotsa.push_step import PushError
+    from rigg.models import Item
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        (tmp_path / "data").mkdir()
+        config = LotsaConfig(
+            data_dir=tmp_path / "data",
+            work_dir=tmp_path,
+            flow="build",
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(tmp_path / "data" / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+
+        import lotsa.push_step as push_step
+
+        orig_execute_push = push_step.execute_push
+        orig_build_pr_text = push_step.build_pr_text
+
+        async def stub_execute_push(**kwargs):
+            # Mirror push_step's machine-detectable GitHub-less contract.
+            raise PushError("NO_GITHUB: GITHUB_TOKEN environment variable is not set.")
+
+        async def stub_build_pr_text(**kwargs):
+            # Avoid needing a real git worktree for title/body synthesis;
+            # the push raises before the value is ever used anyway.
+            return ("t", "b")
+
+        push_step.execute_push = stub_execute_push
+        push_step.build_pr_text = stub_build_pr_text
+
+        try:
+            run(svc.start())
+            try:
+                task = run(svc.db.create_task("No GitHub (legacy push)", state="pushing", metadata={"process_name": "build"}))
+                # Enter at the genuine push precondition PUSH_START claims.
+                run(
+                    svc.db.claim_task_transition(
+                        task.id,
+                        from_status=task.status,
+                        from_state=task.state,
+                        to_state="pushing",
+                        to_status="working",
+                        to_current_step="push",
+                    )
+                )
+                item = Item(id=task.id, state="pushing", title="No GitHub (legacy push)", metadata={"process_name": "build"})
+                run(svc._execute_push(item))
+
+                row = run(svc.db.get_task(task.id))
+                assert row.status == "awaiting_operator", (
+                    f"Expected GitHub-less legacy push to park in awaiting_operator, got "
+                    f"status={row.status!r} state={row.state!r}"
+                )
+                assert row.state == "awaiting_operator"
+                # Parked with a status_change (an invitation to act), not an error.
+                msgs = run(svc.db.get_messages(task.id))
+                assert any(m.type == "status_change" and "Mark complete" in m.content for m in msgs), (
+                    "expected an 'awaiting you' status_change audit row inviting Mark complete"
+                )
+                assert not any(m.type == "error" for m in msgs), (
+                    "a GitHub-less park must not surface as an error message"
+                )
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+        finally:
+            push_step.execute_push = orig_execute_push
+            push_step.build_pr_text = orig_build_pr_text
+    finally:
+        loop.close()
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests for the cross-flow step-lookup fallback. ``retry()`` and
 # ``jump_to_step()`` historically scanned only ``self.flow`` (main); under
