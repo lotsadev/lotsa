@@ -77,7 +77,7 @@ def attachments_root(data_dir: Path, project_id: str, task_id: str) -> Path:
 
 def _dedupe_name(name: str, existing: set[str]) -> str:
     """Return ``name`` or a ``bug (1).png``-style suffixed variant if it
-    collides with a name already recorded for the task."""
+    collides with a name in ``existing``."""
     if name not in existing:
         return name
     stem = PurePosixPath(name).stem
@@ -114,11 +114,25 @@ def write_attachment(
         ValueError: if the filename cannot be sanitized to a usable basename.
     """
     safe = sanitize_filename(raw_filename)
-    final = _dedupe_name(safe, existing_names)
-
     root = attachments_root(data_dir, project_id, task_id)
     root.mkdir(parents=True, exist_ok=True)
-    (root / final).write_bytes(data)
+
+    # Dedupe against both the caller's snapshot *and* whatever is already on
+    # disk, then write with exclusive-create (``"xb"``) so two concurrent
+    # uploads of the same original name to the same task can't compute the same
+    # deduped name and silently overwrite each other's bytes (the snapshot is
+    # read before the write, so it can't see a racing sibling). If the exclusive
+    # create loses the race, add the now-present name to the seen set and try the
+    # next suffix.
+    seen = set(existing_names)
+    while True:
+        final = _dedupe_name(safe, seen)
+        try:
+            with open(root / final, "xb") as fh:
+                fh.write(data)
+            break
+        except FileExistsError:
+            seen.add(final)
 
     return {
         "filename": final,

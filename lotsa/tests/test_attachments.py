@@ -164,6 +164,36 @@ class TestWriteAttachment:
         assert (root / "bug.png").read_bytes() == b"AAAA"
         assert (root / "bug (1).png").read_bytes() == b"BBBB"
 
+    def test_stale_snapshot_does_not_overwrite_on_disk(self, tmp_path):
+        # Regression: two concurrent uploads of the same name each read the
+        # metadata snapshot *before* the other's write lands, so both pass
+        # existing_names=set(). The on-disk exclusive-create must still refuse
+        # to overwrite — the second write is suffixed, not clobbered.
+        first = write_attachment(
+            data_dir=tmp_path,
+            project_id="default",
+            task_id="abcd1234",
+            raw_filename="bug.png",
+            data=b"AAAA",
+            existing_names=set(),
+            mime="image/png",
+        )
+        second = write_attachment(
+            data_dir=tmp_path,
+            project_id="default",
+            task_id="abcd1234",
+            raw_filename="bug.png",
+            data=b"BBBB",
+            existing_names=set(),  # stale — did not see the racing sibling
+            mime="image/png",
+        )
+        assert first["filename"] == "bug.png"
+        assert second["filename"] == "bug (1).png"
+
+        root = attachments_root(tmp_path, "default", "abcd1234")
+        assert (root / "bug.png").read_bytes() == b"AAAA"
+        assert (root / "bug (1).png").read_bytes() == b"BBBB"
+
 
 # ── Materialization into the worktree ──────────────────────────────────
 

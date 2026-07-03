@@ -84,15 +84,38 @@ export function ChatInput({ data }: ChatInputProps) {
     },
     onSuccess,
   })
-  const approveMutation = useMutation({ mutationFn: () => approveTask(task.id), onSuccess })
-  const retryMutation = useMutation({ mutationFn: () => retryTask(task.id), onSuccess })
+  // Accept / Retry / Acknowledge all (re)dispatch a step that materializes the
+  // task's attachments, so pending files must be uploaded first — otherwise a
+  // file attached-then-Accepted is silently dropped from that dispatch. Upload
+  // is awaited before the action; a failed upload aborts it with an inline
+  // error (same contract as Send/Revise), rather than advancing without the file.
+  const approveMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return approveTask(task.id)
+    },
+    onSuccess,
+  })
+  const retryMutation = useMutation({
+    mutationFn: async () => {
+      await uploadPending()
+      return retryTask(task.id)
+    },
+    onSuccess,
+  })
+  // Stop is a halt, not a dispatch — it must stay reliable, so it does NOT
+  // upload (a transient upload failure can't be allowed to block stopping a
+  // runaway agent). Any pending files stay selected in the picker and go out
+  // with the operator's next Send.
   const stopMutation = useMutation({ mutationFn: () => stopAgent(task.id), onSuccess })
   // Acknowledge a fired guard. Empty reason submits as null. On success the
   // task query is invalidated: the new audit row appears and detect() now
   // returns False, so the override button disappears.
   const overrideMutation = useMutation({
-    mutationFn: (guardName: string) =>
-      acknowledgeOverride(task.id, guardName, reasonText.trim() || null),
+    mutationFn: async (guardName: string) => {
+      await uploadPending()
+      return acknowledgeOverride(task.id, guardName, reasonText.trim() || null)
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', task.id] })
       setReasonText('')

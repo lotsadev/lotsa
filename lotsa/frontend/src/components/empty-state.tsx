@@ -50,17 +50,24 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
       // The task must exist before attachments can be posted to it, so create
       // first, then upload each file sequentially (the count cap is per task).
       const result = await createTask({ message: trimmed, process, project })
+      // The task now exists server-side. A subsequent attachment failure must
+      // NOT strand it on this form — returning early here would leave an
+      // orphaned task the operator can't see and a resubmit would create a
+      // duplicate. So on an upload error we record it but still navigate to the
+      // created task, where the operator can re-attach via the chat input.
+      let attachError: string | null = null
       for (const f of files) {
         try {
           await uploadAttachment(result.task.id, f)
         } catch (e) {
-          setError(`Failed to attach ${f.name}: ${(e as Error).message}`)
-          return
+          attachError = `Failed to attach ${f.name}: ${(e as Error).message}`
+          break
         }
       }
       if (project) localStorage.setItem(LAST_PROJECT_KEY, project)
       setMessage('')
       setFiles([])
+      if (attachError) setError(attachError)
       onTaskCreated(result.task.id)
     } catch {
       setError('Failed to create task')

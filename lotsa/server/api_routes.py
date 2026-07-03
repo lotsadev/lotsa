@@ -292,6 +292,21 @@ async def upload_attachment(request: Request, task_id: str, filename: str) -> At
     if row is None:
         raise _not_found()
 
+    # Reject oversized uploads by their declared Content-Length *before* reading
+    # the body, so a 25 MB+ payload isn't buffered fully into memory first. This
+    # is the cheap guard; the post-read len(data) check below is the authority
+    # (a client may lie about or omit Content-Length).
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"error": "File exceeds the 25 MB limit", "code": "ATTACHMENT_TOO_LARGE"},
+                )
+        except ValueError:
+            raise _bad_request(ValueError("Invalid Content-Length header"), "ATTACHMENT_BAD_LENGTH") from None
+
     data = await request.body()
     if not data:
         raise _bad_request(ValueError("Empty file"), "ATTACHMENT_EMPTY")
