@@ -2,6 +2,7 @@ import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { FileText, ChevronDown, ExternalLink } from 'lucide-react'
@@ -78,7 +79,7 @@ export function MarkdownContent({ content }: { content: string }) {
       <div className="space-y-2">
         {/* Show first few lines as preview */}
         <div className={cn(PROSE_CLASSES, "line-clamp-6 opacity-70")}>
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+          <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={MARKDOWN_COMPONENTS}>
             {lines.slice(0, 8).join('\n')}
           </ReactMarkdown>
         </div>
@@ -100,7 +101,7 @@ export function MarkdownContent({ content }: { content: string }) {
 
   return (
     <div className={PROSE_CLASSES}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={MARKDOWN_COMPONENTS}>
         {content}
       </ReactMarkdown>
     </div>
