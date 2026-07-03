@@ -6123,6 +6123,84 @@ class TestAttachmentMaterialization:
         # And the managed ignore is in place so it never gets committed.
         assert "*" in (work_dir / ".lotsa" / ".gitignore").read_text()
 
+    def test_deferred_create_holds_first_dispatch_until_attachments_uploaded(self, service, run):
+        """The create-then-upload flow must reach the FIRST agent step.
+
+        Regression for the ordering bug: ``create_task`` used to dispatch the
+        first step immediately, before the empty-state form could POST its
+        files — so ``_run_agent`` read ``tasks.metadata`` with no attachment
+        records and the first prompt silently missed them. With
+        ``defer_dispatch=True`` the dispatch is held until ``dispatch_created``.
+
+        Fails against the pre-fix code: without deferral the first step
+        dispatches at create time, so ``runner.calls`` is non-empty right after
+        create (the ``assert not service.runner.calls`` line) and that first
+        prompt never lists the attachment (uploaded only afterwards).
+        """
+        task = run(service.create_task("Attach task", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        # Deferred: nothing dispatched yet, so the operator's upload can land
+        # before the first agent ever runs.
+        assert not service.runner.calls, "deferred create must NOT dispatch the first step"
+
+        # Upload happens now (as the endpoint would), THEN we release dispatch.
+        self._seed_attachment(service, run, task.id, data=b"PNGDATA")
+        run(service.dispatch_created(task.id))
+        run(asyncio.sleep(0.2))
+
+        assert len(service.runner.calls) == 1, "dispatch_created must run the first step exactly once"
+        call = service.runner.calls[0]
+        assert ".lotsa/attachments/bug.png" in call["user_prompt"]
+        assert "Read" in call["user_prompt"]
+        # The file reached the worktree the first step actually ran in.
+        copied = Path(call["work_dir"]) / ".lotsa" / "attachments" / "bug.png"
+        assert copied.read_bytes() == b"PNGDATA"
+
+    def test_deferred_conversational_create_replays_message_on_dispatch(self, tmp_path, _loop, run):
+        """A deferred conversational first step (the default ``chat`` new-task
+        flow) still replays the operator's message as feedback on dispatch.
+
+        ``dispatch_created`` recovers the original message from the chat log and
+        passes it as ``feedback`` — matching what ``create_task`` would have done
+        inline — so the held conversational step receives both the message and
+        the attachment path when it finally runs.
+        """
+        data_dir = tmp_path / "tasks"
+        data_dir.mkdir()
+        flow_yaml = tmp_path / "chat_flow.yaml"
+        # Use the ``coding`` prompt name (which resolves in the bundled prompts)
+        # for a conversational first step — mirrors the ``chat`` process shape.
+        flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    type: agent\n    conversational: true\n")
+        config = LotsaConfig(
+            data_dir=data_dir,
+            work_dir=data_dir.parent,
+            flow="custom",
+            flow_file=flow_yaml,
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(data_dir / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+        svc.runner = FakeRunner()
+        run(svc.start())
+        try:
+            task = run(svc.create_task(message="Build from this mockup", defer_dispatch=True))
+            run(asyncio.sleep(0.2))
+            assert not svc.runner.calls, "deferred conversational create must not dispatch"
+
+            self._seed_attachment(svc, run, task.id, data=b"PNGDATA")
+            run(svc.dispatch_created(task.id))
+            run(asyncio.sleep(0.2))
+
+            assert len(svc.runner.calls) == 1
+            prompt = svc.runner.calls[0]["user_prompt"]
+            assert "Build from this mockup" in prompt, "the original message must be replayed as feedback"
+            assert ".lotsa/attachments/bug.png" in prompt
+        finally:
+            run(svc.shutdown())
+            run(db.close())
+
     def test_materialization_is_idempotent_across_redispatch(self, service, run):
         run(service.create_task("Attach task"))
         run(asyncio.sleep(0.2))

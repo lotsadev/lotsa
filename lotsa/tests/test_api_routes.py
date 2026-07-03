@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from httpx import ASGITransport, AsyncClient
 
-from lotsa.tests.conftest import wait_for_completion
+from lotsa.tests.conftest import wait_for_completion, wait_for_status
 
 
 class TestAPIRoutes:
@@ -839,6 +841,37 @@ class TestAttachmentsEndpoint:
 
         run(_test())
 
+    def test_rejects_oversized_without_content_length(self, app_with_service, run):
+        """A client that omits Content-Length can't force unbounded buffering.
+
+        Sending a chunked body (async generator → no Content-Length header)
+        bypasses the header pre-check, so only the streaming size cap can stop
+        it. The upload must still be rejected and leave no record.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._new_task(service)
+
+            async def _oversized_chunks():
+                # 26 × 1 MB = 26 MB > the 25 MB cap, streamed without a
+                # Content-Length header (httpx uses chunked transfer-encoding).
+                for _ in range(26):
+                    yield b"\0" * (1024 * 1024)
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    f"/api/tasks/{task.id}/attachments?filename=big.bin",
+                    content=_oversized_chunks(),
+                    headers={"content-type": "application/octet-stream"},
+                )
+                assert resp.status_code == 413
+            fresh = await service.db.get_task(task.id)
+            assert not fresh.metadata.get("attachments")
+
+        run(_test())
+
     def test_rejects_eleventh_file(self, app_with_service, run):
         app, service = app_with_service
 
@@ -928,5 +961,63 @@ class TestAttachmentsEndpoint:
                 messages = await client.get(f"/api/tasks/{task.id}/messages")
                 assert messages.status_code == 200
                 assert all("ATTACHMENT_CONTENT_MARKER_XYZ" not in m["content"] for m in messages.json())
+
+        run(_test())
+
+    def test_deferred_create_then_upload_then_dispatch(self, app_with_service, run):
+        """The create-then-upload flow: POST /tasks with defer_dispatch, upload
+        the file, then POST /tasks/{id}/dispatch to run the first step.
+
+        Holding the first dispatch is what lets the operator's attachment land
+        before the agent runs (spec AC 1). Asserted at the HTTP layer via the
+        gate: a dispatched first step reaches ``waiting``; a deferred one does
+        not, until the dispatch endpoint releases it.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                created = await client.post(
+                    "/api/tasks",
+                    json={"message": "Build this from the screenshot", "defer_dispatch": True},
+                )
+                assert created.status_code == 200
+                task_id = created.json()["task"]["id"]
+
+                # Deferred: the first step has NOT run, so the evaluate gate has
+                # not parked it at ``waiting``.
+                await asyncio.sleep(0.2)
+                row = await service.db.get_task(task_id)
+                assert row.status != "waiting", "deferred create must not dispatch the first step"
+
+                # Upload the attachment now that the task exists.
+                up = await client.post(
+                    f"/api/tasks/{task_id}/attachments?filename=shot.png",
+                    content=b"PNGDATA",
+                    headers={"content-type": "image/png"},
+                )
+                assert up.status_code == 200
+
+                # Release the first dispatch — the first step runs and parks at
+                # the gate, and the attachment was materialized into its worktree.
+                disp = await client.post(f"/api/tasks/{task_id}/dispatch")
+                assert disp.status_code == 200
+                await wait_for_status(service, task_id, "waiting")
+
+            # The durable attachment survived and is recorded exactly once.
+            fresh = await service.db.get_task(task_id)
+            assert [a["filename"] for a in fresh.metadata["attachments"]] == ["shot.png"]
+
+        run(_test())
+
+    def test_dispatch_unknown_task_is_404(self, app_with_service, run):
+        app, _ = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post("/api/tasks/deadbeef/dispatch")
+                assert resp.status_code == 404
 
         run(_test())

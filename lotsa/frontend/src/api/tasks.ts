@@ -38,11 +38,20 @@ export const createTask = (data: {
   body?: string
   process?: string
   project?: string
+  // Hold the first dispatch so attachments can be uploaded first, then call
+  // dispatchTask() to start it (see empty-state.tsx). Omit for the no-attachment
+  // path — the task dispatches immediately as before.
+  defer_dispatch?: boolean
 }) =>
   apiFetch<TaskDetailFull>('/api/tasks', {
     method: 'POST',
     body: JSON.stringify(data),
   })
+
+// Start a task created with defer_dispatch — runs its first step now that any
+// attachments have been uploaded.
+export const dispatchTask = (taskId: string) =>
+  apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/dispatch`, { method: 'POST' })
 
 export const fetchAttachments = (taskId: string) =>
   apiFetch<Attachment[]>(`/api/tasks/${taskId}/attachments`)

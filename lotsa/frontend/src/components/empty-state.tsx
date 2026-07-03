@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Send } from 'lucide-react'
-import { createTask, uploadAttachment } from '@/api/tasks'
+import { createTask, dispatchTask, uploadAttachment } from '@/api/tasks'
 import { AutoGrowTextarea } from '@/components/ui/auto-grow-textarea'
 import { Button } from '@/components/ui/button'
 import { AttachmentPicker } from '@/components/attachment-picker'
@@ -49,12 +49,17 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
     try {
       // The task must exist before attachments can be posted to it, so create
       // first, then upload each file sequentially (the count cap is per task).
-      const result = await createTask({ message: trimmed, process, project })
+      // When there are files, DEFER the first dispatch: the agent's first step
+      // materializes attachments from tasks.metadata, so it must not run until
+      // the uploads have landed. We start it explicitly via dispatchTask() once
+      // the files are in. With no files, the task dispatches immediately.
+      const hasFiles = files.length > 0
+      const result = await createTask({ message: trimmed, process, project, defer_dispatch: hasFiles })
       // The task now exists server-side. A subsequent attachment failure must
       // NOT strand it on this form — returning early here would leave an
       // orphaned task the operator can't see and a resubmit would create a
-      // duplicate. So on an upload error we record it but still navigate to the
-      // created task, where the operator can re-attach via the chat input.
+      // duplicate. So on an upload error we record it but still start + navigate
+      // to the created task, where the operator can re-attach via the chat input.
       let attachError: string | null = null
       for (const f of files) {
         try {
@@ -64,6 +69,10 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
           break
         }
       }
+      // Release the deferred first dispatch now that uploads have run (even on a
+      // partial failure — a stranded, never-dispatched task is worse than one
+      // that starts with whatever attached). Only needed when we deferred.
+      if (hasFiles) await dispatchTask(result.task.id)
       if (project) localStorage.setItem(LAST_PROJECT_KEY, project)
       setMessage('')
       setFiles([])

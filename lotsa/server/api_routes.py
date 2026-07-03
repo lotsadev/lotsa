@@ -68,6 +68,11 @@ class CreateTaskRequest(BaseModel):
     # when omitted the orchestrator picks the ``default`` project (or the sole
     # registered one). An unknown/non-git project yields ``PROJECT_NOT_FOUND``.
     project: str | None = None
+    # When True, create the task but hold the first dispatch — the caller then
+    # uploads any prompt attachments and calls ``POST /tasks/{id}/dispatch`` to
+    # start it. Without this, the first agent step is dispatched before the
+    # create-then-upload frontend can post its files, silently missing them.
+    defer_dispatch: bool = False
 
 
 class ProjectSummary(BaseModel):
@@ -293,9 +298,8 @@ async def upload_attachment(request: Request, task_id: str, filename: str) -> At
         raise _not_found()
 
     # Reject oversized uploads by their declared Content-Length *before* reading
-    # the body, so a 25 MB+ payload isn't buffered fully into memory first. This
-    # is the cheap guard; the post-read len(data) check below is the authority
-    # (a client may lie about or omit Content-Length).
+    # any bytes — the cheap fast-path for an honest client. A non-integer header
+    # is a clean 400.
     declared = request.headers.get("content-length")
     if declared is not None:
         try:
@@ -307,14 +311,23 @@ async def upload_attachment(request: Request, task_id: str, filename: str) -> At
         except ValueError:
             raise _bad_request(ValueError("Invalid Content-Length header"), "ATTACHMENT_BAD_LENGTH") from None
 
-    data = await request.body()
+    # Stream the body with a hard cap, aborting the moment the accumulated size
+    # exceeds the limit — so a client that omits or understates Content-Length
+    # still can't force us to buffer an unbounded payload into memory. This
+    # streaming bound (not the header pre-check) is the authority on size.
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={"error": "File exceeds the 25 MB limit", "code": "ATTACHMENT_TOO_LARGE"},
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
     if not data:
         raise _bad_request(ValueError("Empty file"), "ATTACHMENT_EMPTY")
-    if len(data) > MAX_FILE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail={"error": "File exceeds the 25 MB limit", "code": "ATTACHMENT_TOO_LARGE"},
-        )
 
     existing = row.metadata.get("attachments") or []
     # Pre-check for a clean 4xx in the common case; the append's WHERE clause is
@@ -460,6 +473,7 @@ async def create_task(request: Request, body: CreateTaskRequest) -> TaskDetailFu
             message=body.message,
             process_name=body.process,
             project_id=body.project,
+            defer_dispatch=body.defer_dispatch,
         )
     except ProcessNotFound as exc:
         # Unknown name (not in the catalog at all) — operator action is "add it
@@ -473,6 +487,22 @@ async def create_task(request: Request, body: CreateTaskRequest) -> TaskDetailFu
         # registered (ADR-029) — operator action is "pick a registered project".
         raise _bad_request(exc, "PROJECT_NOT_FOUND") from None
     return await _build_task_detail(service, task.id)
+
+
+@router.post("/tasks/{task_id}/dispatch")
+async def dispatch_task(request: Request, task_id: str) -> TaskDetailFullResponse:
+    """Start a task created with ``defer_dispatch=true`` (attachment flow).
+
+    The create-then-upload sequence creates the task deferred, POSTs its
+    attachments, then calls this to run the first step — so the first agent
+    prompt sees the uploaded files. A genuinely-unknown task is a 404.
+    """
+    service = _get_service(request)
+    row = await service.db.get_task(task_id)
+    if row is None:
+        raise _not_found()
+    await service.dispatch_created(task_id)
+    return await _build_task_detail(service, task_id)
 
 
 @router.post("/tasks/{task_id}/approve")

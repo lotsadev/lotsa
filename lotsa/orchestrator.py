@@ -1372,6 +1372,7 @@ class OrchestratorService:
         message: str | None = None,
         process_name: str | None = None,
         project_id: str | None = None,
+        defer_dispatch: bool = False,
     ) -> TaskRow:
         """Create a new task and dispatch its first step.
 
@@ -1395,6 +1396,15 @@ class OrchestratorService:
                           the name in metadata and every routing decision
                           resolves against it. An unknown name (not in the
                           catalog) raises ``ProcessNotFound``.
+            defer_dispatch: When True, create the task and store its first
+                          message but do **not** dispatch the first step —
+                          the caller must call :meth:`dispatch_created` once
+                          it is ready. This exists so the create-then-upload
+                          attachment flow (empty-state form) can upload the
+                          operator's files *before* the first agent dispatch:
+                          otherwise ``_run_agent``'s ``_materialize_attachments``
+                          reads ``tasks.metadata`` before any attachment record
+                          exists and the first step silently misses them.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
@@ -1475,7 +1485,8 @@ class OrchestratorService:
                 metadata=metadata,
             )
             await self.db.add_message(task.id, "user", first_step.job_type, chat_content, "chat")
-            await self._dispatch_step(item, first_step, feedback=chat_content)
+            if not defer_dispatch:
+                await self._dispatch_step(item, first_step, feedback=chat_content)
             return task
 
         # Normal flow: create in backlog, dispatch immediately
@@ -1492,8 +1503,44 @@ class OrchestratorService:
         if message is not None:
             step_name = first_step.job_type if first_step else ""
             await self.db.add_message(task.id, "user", step_name, message, "chat")
-        await self._dispatch_next_step(item)
+        if not defer_dispatch:
+            await self._dispatch_next_step(item)
         return task
+
+    async def dispatch_created(self, task_id: str) -> None:
+        """Dispatch the first step of a task created with ``defer_dispatch=True``.
+
+        Runs the same first-step dispatch :meth:`create_task` would have, now
+        that the operator's attachments have been uploaded and recorded in
+        ``tasks.metadata`` — so the first agent prompt materializes them (Path
+        A). The task's current row state already reflects its initial queued
+        state (``backlog`` for a normal first step, the step's ``queue_state``
+        for a conversational one), so ``_dispatch_next_step`` picks the right
+        step; a conversational first step also needs the operator's original
+        message replayed as ``feedback``.
+
+        No-op if the task has vanished. Race-safe against a double call:
+        ``_dispatch_step`` CASes from ``status='working'``, so a second
+        invocation loses and dispatches nothing.
+        """
+        row = await self.db.get_task(task_id)
+        if row is None:
+            return
+        flow = self.root_flow_for(row)
+        first_step = flow.steps[0] if flow and flow.steps else None
+        feedback: str | None = None
+        if first_step is not None and first_step.conversational:
+            chats = await self.db.get_messages(task_id, msg_type="chat")
+            feedback = chats[0].content if chats else None
+        item = Item(
+            id=row.id,
+            state=row.state,
+            priority=row.priority,
+            title=row.title,
+            body=row.body,
+            metadata=row.metadata,
+        )
+        await self._dispatch_next_step(item, feedback=feedback)
 
     async def _chat_transcript(self, task_id: str) -> str:
         """Render a task's chat conversation as a transcript for promotion handover.
