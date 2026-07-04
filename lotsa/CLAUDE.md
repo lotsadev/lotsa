@@ -245,7 +245,7 @@ markers in stdout. The orchestrator scans for the **last** matching marker.
 | Marker                          | Meaning                                                                       |
 |---------------------------------|-------------------------------------------------------------------------------|
 | `NEEDS_INPUT: <question>`       | Agent paused; orchestrator collects the answer and resumes the same session   |
-| `SPEC_COMPLETE: <title>`        | Conversational spec step done; persist artifact (orchestrator strips marker)  |
+| `SPEC_COMPLETE: <title>`        | Generic conversational-completion marker (strip + persist artifact); no bundled process emits it since ADR-043 dissolved the `spec` step — retained for custom/inline conversational steps |
 | `PR_FIX_DONE: <reasoning>`      | pr-fix made changes; advance to push                                          |
 | `PR_FIX_SKIPPED: <reasoning>`   | pr-fix declined feedback as non-actionable                                    |
 | `PR_FIX_BLOCKED: <reasoning>`   | pr-fix cannot proceed; mark task blocked                                      |
