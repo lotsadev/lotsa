@@ -706,20 +706,29 @@ async def test_reconcile_drops_empty_commit_on_identical_divergence(tmp_path, mo
     assert _g(["status", "--porcelain"], work) == ""
 
 
-async def test_reconcile_raises_conflict_on_incompatible_divergence(tmp_path, monkeypatch):
+async def test_reconcile_leaves_merge_markers_on_incompatible_divergence(tmp_path, monkeypatch):
     """When local and remote changed the same line differently, reconcile can't
-    auto-resolve — it raises ReconcileConflict (caller blocks → resolve_conflicts)
-    and aborts the rebase, leaving the worktree clean."""
+    rebase — it aborts the rebase, then MERGES the remote tip so the conflict is
+    left in the worktree as markers (identical shape to _sync_branch_to_main's
+    origin/main path), and raises ReconcileConflict carrying the unmerged paths.
+    The orchestrator then dispatches resolve_conflicts against those markers."""
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     work = _setup_diverged(tmp_path, local_content="local version\n", origin_content="operator version\n")
 
-    with pytest.raises(ReconcileConflict):
+    with pytest.raises(ReconcileConflict) as exc_info:
         await reconcile_branch_with_remote(work, "task-x")
 
-    # Rebase was aborted: worktree clean, not mid-rebase.
-    assert _g(["status", "--porcelain"], work) == ""
+    # The unmerged paths ride on the exception for the resolve_conflicts dispatch.
+    assert exc_info.value.conflicting_files == ("file.txt",)
+    # A merge (not a rebase) is left in progress with real conflict markers —
+    # the exact worktree shape the resolve_conflicts agent + commit posthook
+    # already handle for the origin/main conflict path.
+    assert (work / ".git" / "MERGE_HEAD").exists()
     assert not (work / ".git" / "rebase-merge").exists()
     assert not (work / ".git" / "rebase-apply").exists()
+    status = _g(["status", "--porcelain"], work)
+    assert "UU file.txt" in status, f"expected an unmerged file.txt, got: {status!r}"
+    assert "<<<<<<<" in (work / "file.txt").read_text()
 
 
 async def test_reconcile_returns_false_when_remote_branch_absent(tmp_path, monkeypatch):

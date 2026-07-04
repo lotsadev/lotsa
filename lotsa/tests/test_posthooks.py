@@ -331,8 +331,9 @@ async def test_commit_posthook_reconciles_and_retries_on_non_fast_forward(git_re
 
 
 async def test_commit_posthook_blocks_on_reconcile_conflict(git_repo: Path, monkeypatch):
-    """A real divergence-conflict during reconcile blocks the task
-    (``publish_conflict``) so ``resolve_conflicts`` can handle it — no retry."""
+    """A real divergence-conflict during reconcile surfaces ``publish_conflict``
+    with the unmerged paths so the orchestrator can dispatch ``resolve_conflicts``
+    against the markers reconcile left in the worktree — no push retry."""
     import lotsa.push_step as push_step
     from lotsa.posthooks import commit_posthook
 
@@ -343,7 +344,10 @@ async def test_commit_posthook_blocks_on_reconcile_conflict(git_repo: Path, monk
         raise push_step.PushError("NON_FAST_FORWARD: remote moved")
 
     async def fake_reconcile(work_dir, task_id):
-        raise push_step.ReconcileConflict("rebasing onto origin/lotsa/x conflicted")
+        raise push_step.ReconcileConflict(
+            "rebasing onto origin/lotsa/x conflicted",
+            conflicting_files=("telemetry_test.py", "session.py"),
+        )
 
     monkeypatch.setattr(push_step, "execute_push", fake_execute_push)
     monkeypatch.setattr(push_step, "reconcile_branch_with_remote", fake_reconcile)
@@ -355,6 +359,9 @@ async def test_commit_posthook_blocks_on_reconcile_conflict(git_repo: Path, monk
 
     assert result.success is False
     assert result.metadata.get("error_kind") == "publish_conflict"
+    # The unmerged paths ride along so the orchestrator can hand them to the
+    # resolve_conflicts agent (rather than dead-ending at a bare block).
+    assert result.metadata.get("conflicting_files") == ["telemetry_test.py", "session.py"]
     assert len(push_calls) == 1, "must not retry the push when reconcile conflicts"
 
 
