@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from lotsa.engines.pr_monitor import PrMonitorConfig
+    from lotsa.tools import ToolResult
 
 from lotsa.attachments import materialize_into_worktree
 from lotsa.config import LotsaConfig, resolve_project_specs
@@ -3577,13 +3578,19 @@ class OrchestratorService:
         item: Item,
         conflicting_files: tuple[str, ...],
         current_rounds: int,
+        *,
+        source: str = "origin/main",
+        from_step: str | None = None,
     ) -> bool:
         """Dispatch ``resolve_conflicts`` (or block) after a merge conflict.
 
-        Shared by ``_dispatch_pr_fix_locked`` and ``retry()`` — both sync
-        entry points call this on a ``SyncResult(status='conflicts')`` so
-        the conflict path is handled identically regardless of how the pr-fix
-        was triggered (monitor-driven or operator-initiated retry).
+        Shared by ``_dispatch_pr_fix_locked``, ``retry()`` (both on a
+        ``SyncResult(status='conflicts')`` from the origin/main sync) and the
+        commit posthook's publish-reconcile path (``source`` names the PR
+        branch's own remote) so the conflict is handled identically regardless
+        of how it arose. The conflict markers must already be sitting in the
+        worktree; this method only routes and dispatches. ``from_step`` labels
+        the stage-transition audit row (defaults to the monitor state).
 
         If the process declares a ``resolve_conflicts`` job: bumps the round
         counter, sets ``current_flow``, and dispatches the step. Returns
@@ -3601,7 +3608,7 @@ class OrchestratorService:
                 from_status="working",
                 from_state=item.state,
                 message=(
-                    f"Auto-merge of origin/main hit conflicts in: {files}. "
+                    f"Auto-merge of {source} hit conflicts in: {files}. "
                     "Process has no resolve_conflicts step — resolve the conflict "
                     "and click Retry."
                 ),
@@ -3622,7 +3629,7 @@ class OrchestratorService:
             "Merge conflicts detected — dispatching resolve_conflicts",
             "stage_transition",
             metadata={
-                "from_step": self._monitor_state_for(item) or "waiting_for_pr",
+                "from_step": from_step or self._monitor_state_for(item) or "waiting_for_pr",
                 "to_step": "resolve_conflicts",
             },
         )
@@ -3632,7 +3639,7 @@ class OrchestratorService:
             triggering_ids = list(engine.snapshot_triggering_ids(item.id))
         files_list = "\n".join(f"- {f}" for f in conflicting_files)
         conflict_feedback = (
-            "The orchestrator merged origin/main and hit conflicts. "
+            f"The orchestrator merged {source} and hit conflicts. "
             f"Resolve the conflict markers in these files only:\n{files_list}"
         )
         await self._dispatch_step(
@@ -4764,7 +4771,7 @@ class OrchestratorService:
             await self._dispatch_next_step(item)
             await self._cleanup_worktree_if_done(item)
 
-    async def _run_step_posthooks(self, item: Item, step: FlowStep, work_dir: Path) -> str | None:
+    async def _run_step_posthooks(self, item: Item, step: FlowStep, work_dir: Path) -> ToolResult | None:
         """Run *step*'s resolved posthooks in order (ADR-024).
 
         Called by the completion drainer after an **agent** step succeeds and
@@ -4773,12 +4780,15 @@ class OrchestratorService:
         Action/monitor steps never reach here, so they never run posthooks.
 
         Returns ``None`` on success (every posthook reported success), or the
-        first posthook's error message to use as the task's block reason. Each
-        posthook result is recorded as an audit message (commit SHA or no-op),
-        mirroring how ``push_pr`` surfaces ``pr_number``/``pr_url``.
+        first failing posthook's :class:`ToolResult` — the caller reads
+        ``.output`` for the block reason and ``.metadata['error_kind']`` to route
+        recovery (e.g. ``publish_conflict`` → ``resolve_conflicts`` instead of a
+        bare block). Each successful posthook result is recorded as an audit
+        message (commit SHA or no-op), mirroring how ``push_pr`` surfaces
+        ``pr_number``/``pr_url``.
         """
         from lotsa.registry import get_posthook
-        from lotsa.tools import TaskContext
+        from lotsa.tools import TaskContext, ToolResult
 
         for name in step.posthooks:
             try:
@@ -4802,10 +4812,14 @@ class OrchestratorService:
                 result = await hook(ctx, config)
             except Exception as exc:  # noqa: BLE001 — any posthook crash blocks the task
                 logger.exception("Posthook %r crashed for task %s step %s", name, item.id, step.name)
-                return f"Posthook {name!r} crashed: {type(exc).__name__}: {exc}"
+                return ToolResult(
+                    success=False,
+                    output=f"Posthook {name!r} crashed: {type(exc).__name__}: {exc}",
+                    metadata={"error_kind": "exception"},
+                )
 
             if not result.success:
-                return result.output or f"Posthook {name!r} failed"
+                return result
 
             # Merge any posthook metadata (e.g. commit_sha) into the task row,
             # then record an operator-visible audit line.
@@ -5137,8 +5151,50 @@ class OrchestratorService:
                     pending_question = _extract_needs_input(result.stdout)
                     if info.step.posthooks and pending_question is None:
                         posthook_work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
-                        posthook_err = await self._run_step_posthooks(item, info.step, posthook_work_dir)
-                        if posthook_err is not None:
+                        posthook_result = await self._run_step_posthooks(item, info.step, posthook_work_dir)
+                        if posthook_result is not None:
+                            block_reason = posthook_result.output or "Posthook failed"
+                            hook_meta = posthook_result.metadata or {}
+                            # The commit posthook's publish can hit a genuine
+                            # content conflict against the PR branch's OWN remote
+                            # (an operator/rebase advanced it). ``reconcile_branch_
+                            # with_remote`` has already left the conflict in the
+                            # worktree as merge markers, so route to the
+                            # ``resolve_conflicts`` agent — the same recovery the
+                            # origin/main sync uses — instead of dead-ending at
+                            # ``blocked`` (where Retry/Revise would just re-trigger
+                            # the same non-fast-forward and loop).
+                            if hook_meta.get("error_kind") == "publish_conflict" and any(
+                                s.name == "resolve_conflicts" for s in self._process_for(item).jobs
+                            ):
+                                conflicting_files = tuple(hook_meta.get("conflicting_files") or ())
+                                task_id = item.id
+                                # Re-anchor at the pr_fix sub-flow's entry state so
+                                # _handle_conflict_dispatch's _dispatch_step guard
+                                # sees the real (pr-fixing, resolving_conflicts)
+                                # edge (mirrors retry()'s conflict re-anchor). The
+                                # DB CAS is unguarded by the SM.
+                                reanchor = await self.db.atomic_transition(
+                                    task_id,
+                                    from_status="working",
+                                    from_state=item.state,
+                                    to_state="pr-fixing",
+                                    to_status="working",
+                                    to_current_step="pr-fix",
+                                    audit_on_win=None,
+                                )
+                                if reanchor.won:
+                                    item.state = "pr-fixing"
+                                    current_rounds = int(item.metadata.get("pr_fix_round_count", 0))
+                                    branch = f"lotsa/{task_id}"
+                                    await self._handle_conflict_dispatch(
+                                        item,
+                                        conflicting_files,
+                                        current_rounds,
+                                        source=f"origin/{branch}",
+                                        from_step=info.step.name,
+                                    )
+                                continue
                             active_flow_for_hook = self._resolve_flow(item)
                             if (item.state, "blocked") in active_flow_for_hook.state_machine.transitions:
                                 cas = await self.db.atomic_transition(
@@ -5151,7 +5207,7 @@ class OrchestratorService:
                                     audit_on_win=AuditRow(
                                         role="system",
                                         step_name=info.step.job_type,
-                                        content=f"Posthook failed: {posthook_err}",
+                                        content=f"Posthook failed: {block_reason}",
                                         msg_type="error",
                                     ),
                                 )
@@ -5165,7 +5221,7 @@ class OrchestratorService:
                                         await self._record_pr_decision(
                                             item.id,
                                             decision="blocked",
-                                            reasoning=posthook_err,
+                                            reasoning=block_reason,
                                             triggering_comment_ids=info.triggering_comment_ids,
                                             commit_sha=None,
                                             duration_ms=result.duration_ms,
