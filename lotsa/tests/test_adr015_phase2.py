@@ -48,7 +48,7 @@ from lotsa.engines.pr_monitor import PrMonitorConfig as PrConfig
 from lotsa.engines.pr_monitor import parse_config
 from lotsa.flows import build_process
 from lotsa.github_client import CheckStatus, PrInfo
-from lotsa.orchestrator import OrchestratorService
+from lotsa.orchestrator import InFlightStep, Item, OrchestratorService
 from lotsa.pr_monitor import PrSignal, classify_signals
 
 # ---------------------------------------------------------------------------
@@ -436,6 +436,119 @@ class TestConflictDispatchesResolveConflicts:
         row = run(svc.db.get_task(task.id))
         assert row.metadata.get("current_flow") == "pr_fix", (
             f"current_flow must be 'pr_fix' after conflict dispatch, got {row.metadata.get('current_flow')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5b. A commit-posthook publish conflict (branch's OWN remote diverged with
+#     content conflicts) dispatches resolve_conflicts, not a bare block.
+# ---------------------------------------------------------------------------
+
+
+class TestPublishConflictDispatchesResolveConflicts:
+    """A ``publish_conflict`` from the ``commit`` posthook's publish must route
+    to ``resolve_conflicts`` — the same recovery the origin/main sync uses —
+    rather than dead-ending at ``blocked`` (where Retry/Revise would re-trigger
+    the same non-fast-forward and loop). Regression for VPS task c79aaf7f.
+
+    ``reconcile_branch_with_remote`` has already left the conflict in the
+    worktree as merge markers by the time the posthook returns ``publish_conflict``
+    (covered by test_push_step); here we assert the drainer's routing given that
+    posthook result, so ``_run_step_posthooks`` is stubbed to return it.
+    """
+
+    def _stage_pr_fixing_task(self, svc, run, tmp_path, *, pr_number: int):
+        """A task mid ``pr-fix`` step (state=pr-fixing, status=working) with a
+        real worktree the dispatched resolve_conflicts agent can run in."""
+        task = run(
+            svc.db.create_task(
+                "publish conflict",
+                state="pr-fixing",
+                status="working",
+                current_step="pr-fix",
+                metadata={"pr_number": pr_number, "current_flow": "pr_fix", "pr_fix_round_count": 0},
+            )
+        )
+        run(svc.db.add_message(task.id, "agent", "spec", "spec", "artifact", metadata={"artifact_name": "spec"}))
+        run(svc.db.add_message(task.id, "agent", "plan", "plan", "artifact", metadata={"artifact_name": "plan"}))
+        wt = _setup_sync_worktree(tmp_path, task.id, "current")
+        svc._worktree_managers["default"].get_path = lambda _tid, _wt=wt: _wt
+        return task
+
+    def _drive_pr_fix_completion(self, svc, run, task):
+        """Feed a successful pr-fix agent completion into the drainer and wait
+        for it to settle (either a dispatch or a terminal state)."""
+        from lotsa.tools import ToolResult
+
+        # Stub the posthook to report the publish reconcile-conflict the real
+        # commit posthook would surface, with the unmerged paths attached.
+        async def _publish_conflict(_item, _step, _work_dir):
+            return ToolResult(
+                success=False,
+                output="Publish to PR #77 blocked — PR branch diverged with conflicts: ...",
+                metadata={"error_kind": "publish_conflict", "conflicting_files": ["telemetry_test.py"]},
+            )
+
+        svc._run_step_posthooks = _publish_conflict  # type: ignore[assignment]
+
+        item = Item(id=task.id, state="pr-fixing", title=task.title, body=task.body, metadata=dict(task.metadata))
+        pr_fix_step = next(s for s in svc._process_for(item).jobs if s.name == "pr-fix")
+        info = InFlightStep(
+            item=item,
+            step=pr_fix_step,
+            agent_result=AgentResult(
+                success=True,
+                stdout="PR_FIX_DONE: addressed feedback\n",
+                stderr="",
+                return_code=0,
+                duration_ms=100,
+                session_id="s1",
+            ),
+            step_work_dir=svc._worktree_managers["default"].get_path(task.id),
+            triggering_comment_ids=[],
+        )
+        run(svc._completions.put(info))
+        # Wait for the drainer to route AND the spawned agent coroutine to
+        # actually reach the runner (the resolving_conflicts CAS lands slightly
+        # before runner.run is called on the background task).
+        for _ in range(80):
+            row = run(svc.db.get_task(task.id))
+            if svc.runner.calls or row.status == "blocked":
+                break
+            run(asyncio.sleep(0.05))
+        run(asyncio.sleep(0.1))
+
+    def test_publish_conflict_dispatches_resolve_conflicts_not_blocked(self, full_service, tmp_path, run):
+        """The task lands at ``(state=resolving_conflicts, status=working)`` with
+        one agent dispatched — not at ``status=blocked``."""
+        svc = full_service
+        task = self._stage_pr_fixing_task(svc, run, tmp_path, pr_number=77)
+
+        self._drive_pr_fix_completion(svc, run, task)
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "working", (
+            f"a publish conflict must dispatch resolve_conflicts (status=working), got {row.status!r} — "
+            "the bare-block path is exactly the c79aaf7f dead-end this fix removes"
+        )
+        assert row.state == "resolving_conflicts", f"expected resolving_conflicts, got {row.state!r}"
+        assert len(svc.runner.calls) == 1, "resolve_conflicts agent must be dispatched"
+        assert row.metadata.get("current_flow") == "pr_fix"
+        assert int(row.metadata.get("pr_fix_round_count", 0)) == 1, "conflict dispatch consumes one round"
+
+    def test_publish_conflict_file_list_reaches_the_agent(self, full_service, tmp_path, run):
+        """The unmerged path must appear in the dispatched agent's prompt so it
+        knows which markers to resolve."""
+        svc = full_service
+        task = self._stage_pr_fixing_task(svc, run, tmp_path, pr_number=78)
+
+        self._drive_pr_fix_completion(svc, run, task)
+
+        assert svc.runner.calls, "resolve_conflicts agent must be dispatched"
+        call = svc.runner.calls[0]
+        combined = call.get("user_prompt", "") + call.get("system_prompt", "")
+        assert "telemetry_test.py" in combined, (
+            f"conflicting file must reach the agent prompt; excerpt: {combined[:400]!r}"
         )
 
 

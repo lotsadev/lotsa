@@ -144,8 +144,15 @@ publish** also reconciles against the task's *own* remote branch
 `NON_FAST_FORWARD`, so `reconcile_branch_with_remote` (`lotsa/push_step.py`)
 fetches and rebases the worktree onto the remote tip and retries once — local
 commits whose content the remote already has drop out as empty. A real
-divergence-conflict raises `ReconcileConflict` and the task blocks for
-`resolve_conflicts`. (Regression: task `<redacted>`.)
+content-divergence conflict can't rebase, so it falls back to `git merge` —
+leaving the conflict in the worktree as markers (the same shape
+`_sync_branch_to_main` leaves for the origin/main case) — and raises
+`ReconcileConflict` carrying the unmerged paths. The drainer's posthook-failure
+handler routes that `publish_conflict` to `_handle_conflict_dispatch`, so the
+`resolve_conflicts` agent edits the markers and the `commit` posthook completes
+the merge — instead of dead-ending at `blocked`, where Retry/Revise would just
+re-trigger the same non-fast-forward and loop. (Regressions: tasks `<redacted>`,
+`c79aaf7f`.)
 
 ### State transitions are atomic CAS (Constitution §3.1)
 
