@@ -262,6 +262,106 @@ class TestStop:
             run(_t())
 
 
+# ── Chat / stop torn-state (regression: VPS task c79aaf7f) ──────────────────
+
+
+class TestChatTornState:
+    """A chat message (send_message) to an error-blocked task must not strand it
+    at ``(status=working, state=blocked)`` with no agent, and stop() must be able
+    to clear such a row.
+
+    Pre-fix: send_message CASes ``to_state=row.state`` — for a task blocked via
+    the error/posthook path that state is the literal ``'blocked'``, from which
+    ``_dispatch_step`` can't advance (no ``(blocked, active_state)`` edge). The
+    status flip to ``working`` is never rolled back, and stop() then raises
+    instead of clearing it. This is exactly how VPS task c79aaf7f wedged.
+    """
+
+    def test_send_message_on_error_blocked_task_reanchors_not_torn(self, tmp_path, run):
+        """send_message on a ``(blocked, blocked)`` task re-anchors to the step's
+        queue_state (a dispatchable entry) and dispatches — never leaving the
+        torn ``(working, blocked)``."""
+        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+
+            async def _t():
+                task = await db.create_task(
+                    "error-blocked",
+                    state="blocked",
+                    status="blocked",
+                    current_step="resolve_conflicts",
+                    metadata={"current_flow": "pr_fix", "pr_number": 1},
+                )
+                calls: list[dict] = []
+
+                async def rec(item, step, feedback=None, triggering_comment_ids=None):
+                    calls.append({"state": item.state, "step": step.name})
+
+                svc._dispatch_step = rec  # type: ignore[method-assign]
+                await svc.send_message(task.id, "rebase or merge with remote branch")
+
+                row = await db.get_task(task.id)
+                assert (row.status, row.state) == ("working", "resolving_conflicts"), (
+                    f"must re-anchor to the dispatchable queue_state, got {(row.status, row.state)} "
+                    "— pre-fix this was the torn ('working', 'blocked')"
+                )
+                assert calls and calls[0]["state"] == "resolving_conflicts"
+                assert calls[0]["step"] == "resolve_conflicts"
+
+            run(_t())
+
+    def test_send_message_on_stop_parked_task_keeps_active_state(self, tmp_path, run):
+        """A stop()-parked task sits on its ACTIVE state (dispatchable via the
+        self-loop) — send_message must dispatch from there unchanged, not re-route."""
+        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+
+            async def _t():
+                task = await db.create_task(
+                    "stop-parked",
+                    state="resolving_conflicts",
+                    status="blocked",
+                    current_step="resolve_conflicts",
+                    metadata={"current_flow": "pr_fix", "pr_number": 1},
+                )
+                seen: list[str] = []
+
+                async def rec(item, step, feedback=None, triggering_comment_ids=None):
+                    seen.append(item.state)
+
+                svc._dispatch_step = rec  # type: ignore[method-assign]
+                await svc.send_message(task.id, "one more thing")
+
+                row = await db.get_task(task.id)
+                assert (row.status, row.state) == ("working", "resolving_conflicts")
+                assert seen == ["resolving_conflicts"], "dispatchable active state must be preserved"
+
+            run(_t())
+
+    def test_stop_clears_torn_working_blocked_row(self, tmp_path, run):
+        """stop() on a ``(working, blocked)`` row with no in-flight agent parks it
+        to a consistent ``(blocked, blocked)`` instead of raising StopNotAllowed."""
+        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+
+            async def _t():
+                task = await db.create_task(
+                    "torn",
+                    state="blocked",
+                    status="working",  # torn: working status, no agent
+                    current_step="resolve_conflicts",
+                    metadata={"current_flow": "pr_fix", "pr_number": 1},
+                )
+                assert task.id not in svc._in_flight
+
+                await svc.stop(task.id)  # must NOT raise
+
+                row = await db.get_task(task.id)
+                assert (row.status, row.state) == ("blocked", "blocked")
+                assert row.current_step == "resolve_conflicts"  # preserved for Retry
+                msgs = await db.get_messages(task.id)
+                assert _count_messages(msgs, "Cleared a stranded 'working' status (no agent was running).") == 1
+
+            run(_t())
+
+
 # ── Archive ────────────────────────────────────────────────────────────────
 
 

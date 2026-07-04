@@ -2431,21 +2431,37 @@ class OrchestratorService:
         if is_pr_fix:
             current_rounds = int(row.metadata.get("pr_fix_round_count", 0))
 
+        # A conversational resume normally CASes to the task's current (active)
+        # state, whose self-loop carries the revision edge. But a task blocked
+        # via the error/posthook path sits at ``state='blocked'`` (not its step's
+        # active state), and ``_dispatch_step`` only advances from a state with a
+        # ``(state, active_state)`` edge — dispatching from ``'blocked'`` would
+        # silently no-op *after* the CAS below flips ``status→working``, stranding
+        # the row at ``(working, blocked)`` with no agent (a torn state ``stop()``
+        # then couldn't clear). When the current state can't reach the step's
+        # active state, re-anchor to ``step.queue_state`` — the dispatch entry
+        # ``retry()`` uses, whose ``(queue_state, active_state)`` edge is always
+        # registered. A stop()-parked / waiting / needs_input task already sits on
+        # its active state, so it keeps the in-place self-loop resume unchanged.
+        item = Item(id=row.id, state=row.state, title=row.title, body=row.body, metadata=row.metadata)
+        active_flow = self._resolve_flow(item)
+        dispatch_state = (
+            row.state if (row.state, step.active_state) in active_flow.state_machine.transitions else step.queue_state
+        )
         # Atomic claim — same TOCTOU shape as approve()/retry()/answer(). Two
         # concurrent send_message() calls would both reach _dispatch_step.
         result = await self.db.atomic_transition(
             task_id,
             from_status=row.status,
             from_state=row.state,
-            to_state=row.state,
+            to_state=dispatch_state,
             to_status="working",
             to_current_step=step.name,
             audit_on_win=None,
         )
         if not result.won:
             return
-
-        item = Item(id=row.id, state=row.state, title=row.title, body=row.body, metadata=row.metadata)
+        item.state = dispatch_state
         # Phase 2 — for pr-fix: bump the round counter and snapshot the
         # comment IDs the monitor is tracking. Mirrors the post-CAS work
         # in ``answer()``/``revise()``/``_dispatch_pr_fix_locked`` so every
@@ -2814,6 +2830,30 @@ class OrchestratorService:
                             "Task was created but never started (attachment upload "
                             "abandoned) — parked. Click Retry to start it."
                         ),
+                        msg_type="status_change",
+                    ),
+                )
+                return
+            # Torn state: status='working' with no in-flight agent and state
+            # already at the terminal 'blocked' node. This cannot be a
+            # natural-completion race (a completing agent sits at its step's
+            # active state, not 'blocked') — it's a stranded status flip (e.g. a
+            # pre-fix send_message() whose state-advance was rejected). Reconcile
+            # it to a consistent blocked so the operator regains Retry, rather
+            # than raising — which is why the Stop button appeared dead on such
+            # rows. CAS-guarded so a concurrent recovery/restart is a clean no-op.
+            if row.state == "blocked":
+                await self.db.atomic_transition(
+                    task_id,
+                    from_status="working",
+                    from_state="blocked",
+                    to_state="blocked",
+                    to_status="blocked",
+                    to_current_step=row.current_step or row.state,
+                    audit_on_win=AuditRow(
+                        role="system",
+                        step_name=row.current_step or "",
+                        content="Cleared a stranded 'working' status (no agent was running).",
                         msg_type="status_change",
                     ),
                 )
