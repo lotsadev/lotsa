@@ -2,8 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "lotsa/**"
   pull_request:
+
+# Lotsa pushes/rebases a task branch repeatedly during a task; without this
+# block each push would stack a redundant run. Group on the ref and cancel any
+# in-progress run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -26,15 +35,30 @@ jobs:
         working-directory: lotsa/frontend
         run: npm ci && npm run build
 
+      - name: Lint (frontend)
+        working-directory: lotsa/frontend
+        run: npm run lint
+
+      - name: Type check (frontend)
+        working-directory: lotsa/frontend
+        run: npm run typecheck
+
+      - name: Test (frontend)
+        working-directory: lotsa/frontend
+        run: npm run test
+
       - name: Configure git identity (some tests create commits)
         run: |
           git config --global user.email "ci@lotsa.dev"
           git config --global user.name "Lotsa CI"
 
-      - name: Lint
+      - name: Lint (Python)
         run: |
           ruff check .
           ruff format --check .
 
-      - name: Test
+      - name: Type check (mypy)
+        run: mypy lotsa/ rigg/
+
+      - name: Test (Python)
         run: pytest lotsa/tests rigg/tests
