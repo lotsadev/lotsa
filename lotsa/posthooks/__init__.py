@@ -104,10 +104,16 @@ async def commit_posthook(ctx: TaskContext, config: dict[str, Any]) -> ToolResul
             try:
                 reconciled = await reconcile_branch_with_remote(ctx.worktree, ctx.task_id)
             except ReconcileConflict as rexc:
+                # The conflict is now sitting in the worktree as merge markers.
+                # Hand the unmerged paths up so the orchestrator can dispatch
+                # ``resolve_conflicts`` (rather than dead-ending at ``blocked``).
                 return ToolResult(
                     success=False,
                     output=f"Publish to PR #{pr_number} blocked — PR branch diverged with conflicts: {rexc}",
-                    metadata={"error_kind": "publish_conflict"},
+                    metadata={
+                        "error_kind": "publish_conflict",
+                        "conflicting_files": list(rexc.conflicting_files),
+                    },
                 )
             except PushError as rexc:
                 return ToolResult(

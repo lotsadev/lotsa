@@ -40,12 +40,18 @@ class PushError(Exception):
 
 
 class ReconcileConflict(Exception):
-    """Rebasing the worktree onto its advanced remote branch hit real conflicts.
+    """Integrating the advanced remote branch into the worktree hit real conflicts.
 
-    Signals that automatic reconciliation can't proceed; the caller should
-    block the task so ``resolve_conflicts`` can handle it. The message is
-    token-scrubbed and safe to surface.
+    Signals that automatic reconciliation can't proceed. ``conflicting_files``
+    lists the unmerged paths, and the conflict is left in the worktree as merge
+    markers (identical shape to ``_sync_branch_to_main``'s origin/main path) so
+    the caller can dispatch the ``resolve_conflicts`` agent to edit them. The
+    message is token-scrubbed and safe to surface.
     """
+
+    def __init__(self, message: str, conflicting_files: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.conflicting_files = conflicting_files
 
 
 # ---------------------------------------------------------------------------
@@ -518,10 +524,14 @@ async def reconcile_branch_with_remote(work_dir: Path, task_id: str) -> bool:
 
     Returns ``True`` when the worktree now incorporates the remote (retry the
     push). Returns ``False`` when there is nothing to reconcile (the remote ref
-    doesn't exist). Raises :class:`ReconcileConflict` on a real rebase conflict
-    (caller blocks → ``resolve_conflicts``) and :class:`PushError` on other git
-    failures. Authenticates the fetch with ``GITHUB_TOKEN`` via ``GIT_ASKPASS``
-    when set (production); a local/test ``origin`` needs no auth.
+    doesn't exist). On a real content conflict the rebase can't auto-resolve, it
+    falls back to ``git merge`` so the conflict is left in the worktree as merge
+    markers, then raises :class:`ReconcileConflict` carrying the unmerged paths —
+    the caller dispatches ``resolve_conflicts`` (whose agent edits the markers
+    and whose ``commit`` posthook completes the merge, identical to the
+    origin/main conflict path). :class:`PushError` on other git failures.
+    Authenticates the fetch with ``GITHUB_TOKEN`` via ``GIT_ASKPASS`` when set
+    (production); a local/test ``origin`` needs no auth.
     """
     branch = f"lotsa/{task_id}"
     token = os.environ.get("GITHUB_TOKEN")
@@ -543,7 +553,7 @@ async def reconcile_branch_with_remote(work_dir: Path, task_id: str) -> bool:
     def _scrub(s: str) -> str:
         return s.replace(token, "***") if token else s
 
-    async def _git(*args: str) -> tuple[int, str]:
+    async def _git(*args: str) -> tuple[int, str, str]:
         proc = await asyncio.create_subprocess_exec(
             "git",
             *args,
@@ -553,15 +563,15 @@ async def reconcile_branch_with_remote(work_dir: Path, task_id: str) -> bool:
             env=env,
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
         except TimeoutError:
             proc.kill()
             await proc.wait()
             raise PushError(f"git {args[0]} timed out after 120s") from None
-        return proc.returncode or 0, _scrub(stderr.decode().strip())
+        return proc.returncode or 0, _scrub(stdout.decode().strip()), _scrub(stderr.decode().strip())
 
     try:
-        code, err = await _git("fetch", "origin", branch)
+        code, _out, err = await _git("fetch", "origin", branch)
         if code != 0:
             low = err.lower()
             if "couldn't find remote ref" in low or "couldn't find remote" in low or "not found" in low:
@@ -572,10 +582,33 @@ async def reconcile_branch_with_remote(work_dir: Path, task_id: str) -> bool:
 
         # Rebase the worktree HEAD onto the freshly fetched remote tip, dropping
         # commits that become empty (the identical-content convergence case).
-        code, err = await _git("rebase", "--empty=drop", "FETCH_HEAD")
+        code, _out, err = await _git("rebase", "--empty=drop", "FETCH_HEAD")
         if code != 0:
+            # A rebase can't auto-merge overlapping edits. Abort it (restoring a
+            # clean worktree), then MERGE the remote tip instead: a clean merge
+            # means the rebase conflict was replay-order noise, so reconcile
+            # succeeded — retry the push. A conflicting merge leaves the markers
+            # in the worktree in the exact shape the ``resolve_conflicts`` agent
+            # and the ``commit`` posthook already handle for the origin/main path
+            # (``_sync_branch_to_main``), so the caller can dispatch that agent
+            # instead of dead-ending at ``blocked``.
             await _git("rebase", "--abort")
-            raise ReconcileConflict(f"rebasing onto origin/{branch} conflicted: {err}")
+            mcode, _mout, _merr = await _git("merge", "--no-edit", "FETCH_HEAD")
+            if mcode == 0:
+                return True
+            _fc, files_out, _fe = await _git("diff", "--name-only", "--diff-filter=U")
+            conflicting = tuple(f.strip() for f in files_out.splitlines() if f.strip())
+            if not conflicting:
+                # A non-zero merge with no unmerged paths is not a content
+                # conflict (dirty/locked worktree, index lock). Abort the
+                # half-done merge and surface the original rebase failure rather
+                # than routing to resolve_conflicts on a phantom (finding #10).
+                await _git("merge", "--abort")
+                raise ReconcileConflict(f"rebasing onto origin/{branch} conflicted: {err}")
+            raise ReconcileConflict(
+                f"rebasing onto origin/{branch} conflicted: {err}",
+                conflicting_files=conflicting,
+            )
         return True
     finally:
         if askpass_path:
