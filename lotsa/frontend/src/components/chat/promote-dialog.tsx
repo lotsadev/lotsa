@@ -83,7 +83,7 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
       {/* On mobile the centered dialog caps to the viewport width and scrolls
           vertically so the destination picker + per-input fields never
           overflow a narrow screen. */}
-      <DialogContent className="max-h-[85dvh] overflow-y-auto max-md:max-w-[calc(100vw-1rem)]">
+      <DialogContent className="max-h-[85dvh] overflow-y-auto md:max-w-2xl max-md:max-w-[calc(100vw-1rem)]">
         <DialogHeader>
           <DialogTitle>Hand off to Execute</DialogTitle>
           <DialogDescription>
