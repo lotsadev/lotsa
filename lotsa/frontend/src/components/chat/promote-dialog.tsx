@@ -26,11 +26,20 @@ interface PromoteDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-// ADR-027 — operator-driven process promotion. The operator picks a loaded
-// destination process; if that process declares promotion_inputs, render one
-// field per declared input, otherwise a single generic "promotion_context"
-// field. The collected values become the initial_artifacts dict the
-// destination's first step reads.
+// ADR-043 — the handoff (Think→Execute) gesture. Friendly labels for the
+// bundled Execute processes; inline/custom processes fall through to their raw
+// name. Internals (promote_task / initial_artifacts) are unchanged (ADR-043 §15
+// — UI language only).
+const HANDOFF_LABELS: Record<string, string> = {
+  build: 'Build it',
+  fix: 'Quick fix',
+}
+const handoffLabel = (name: string) => HANDOFF_LABELS[name] ?? name
+
+// ADR-027/043 — operator-driven handoff to a loaded destination process. If
+// that process declares promotion_inputs, render one field per declared input,
+// otherwise a single generic "promotion_context" field. The collected values
+// become the initial_artifacts dict the destination's first step reads.
 export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps) {
   const queryClient = useQueryClient()
   const { data: processes } = useProcesses()
@@ -76,11 +85,12 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
           overflow a narrow screen. */}
       <DialogContent className="max-h-[85dvh] overflow-y-auto max-md:max-w-[calc(100vw-1rem)]">
         <DialogHeader>
-          <DialogTitle>Promote task to another process</DialogTitle>
+          <DialogTitle>Hand off to Execute</DialogTitle>
           <DialogDescription>
-            The worktree and the full audit log stay. The active process, its
-            prompt set, and the state machine change — the current step ends and
-            the new process starts at its first step.
+            Choose how thorough: <strong>Build it</strong> for the full SDLC
+            pass, or <strong>Quick fix</strong> for a mechanical change. The
+            worktree and the full audit log stay; the handoff is one-way (no
+            return to chat) but the running task stays steerable.
           </DialogDescription>
         </DialogHeader>
 
@@ -94,13 +104,13 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
               setDestination(value)
             }}
           >
-            <SelectTrigger aria-label="Destination process">
-              <SelectValue placeholder="Choose a destination process…" />
+            <SelectTrigger aria-label="Handoff destination">
+              <SelectValue placeholder="Choose Build it or Quick fix…" />
             </SelectTrigger>
             <SelectContent>
               {options.map((p) => (
                 <SelectItem key={p.name} value={p.name}>
-                  {p.name}
+                  {handoffLabel(p.name)}
                   {p.description ? ` — ${p.description.split('\n')[0]}` : ''}
                 </SelectItem>
               ))}
@@ -155,7 +165,7 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
             Cancel
           </Button>
           <Button onClick={() => mutation.mutate()} disabled={!destination || mutation.isPending}>
-            Promote
+            Hand off
           </Button>
         </DialogFooter>
       </DialogContent>

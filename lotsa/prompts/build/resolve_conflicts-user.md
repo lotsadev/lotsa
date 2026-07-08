@@ -1,12 +1,8 @@
 # {title}
 
-## Spec
+## Spec (context only — the conflict markers below are ground truth)
 
-{artifact:spec}
-
-## Plan
-
-{artifact:plan}
+{artifact:draft_spec}
 
 ## Instructions
 

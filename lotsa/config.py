@@ -62,8 +62,8 @@ class LotsaConfig:
     max_output_tokens: int | None = None
     prompts_dir: Path | None = None
     # New-task default process (ADR-034 §2). ``chat`` opens a task as a
-    # conversation the operator grows from (promote into ``full``/``quickfix``/…
-    # when ready). ``--flow``/``--process`` (or this ``flow:`` field) only
+    # conversation the operator grows from (hand off into ``build``/``fix``
+    # when ready, ADR-043). ``--flow``/``--process`` (or this ``flow:`` field) only
     # selects which loaded process is the picker's pre-selected default — the
     # full bundled catalog always loads (ADR-034 §1/§4).
     flow: str = "chat"

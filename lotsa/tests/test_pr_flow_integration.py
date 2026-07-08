@@ -20,7 +20,7 @@ from lotsa.flows import build_process
 
 def test_full_process_has_push_pr_action_and_wait_for_pr_signal_monitor():
     """The full process exposes the new typed PR-phase jobs."""
-    process = build_process("full")
+    process = build_process("build")
     push_pr = next(j for j in process.jobs if j.name == "push_pr")
     wait = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     assert push_pr.type == "action"
@@ -31,7 +31,7 @@ def test_full_process_has_push_pr_action_and_wait_for_pr_signal_monitor():
 
 def test_full_process_main_flow_has_no_synthetic_pr_states():
     """The new state machine has no ``pushing``/``waiting_for_pr``/``rebasing``."""
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     for synthetic in ("pushing", "waiting_for_pr", "rebasing"):
         assert synthetic not in main.state_machine.states, (
@@ -41,7 +41,7 @@ def test_full_process_main_flow_has_no_synthetic_pr_states():
 
 def test_full_process_main_review_fail_targets_code():
     """Per-flow override puts the autonomous code↔review loop in ``main``."""
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     review_binding = next(b for b in main.bindings if b.name == "review")
     fail = next(r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern)
@@ -50,13 +50,13 @@ def test_full_process_main_review_fail_targets_code():
 
 def test_full_process_pr_fix_has_no_verify_step():
     """The pr_fix sub-flow skips verify (supersedes PR #62 stopgap)."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     assert not any(b.name == "verify" for b in pr_fix.bindings)
 
 
 def test_pr_fix_flow_skipped_targets_wait_for_pr_signal():
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
     skipped = next(r for r in (pr_fix_binding.rules or []) if "SKIPPED" in r.pattern)
@@ -87,18 +87,31 @@ def test_custom_process_with_monitor_job(tmp_path):
     assert "watch" in process.flows["main"].state_machine.states
 
 
-def test_flow_without_monitor_has_no_pr_phase_states():
-    """Simple/standard processes have no monitor — no PR-phase states."""
-    for name in ("simple", "standard"):
-        process = build_process(name)
-        main = process.flows["main"]
-        for synthetic in ("pushing", "waiting_for_pr", "rebasing", "wait_for_pr_signal"):
-            assert synthetic not in main.state_machine.states
+def test_flow_without_monitor_has_no_pr_phase_states(tmp_path):
+    """A process with no monitor job has no PR-phase states. ADR-043's bundled
+    catalog (chat/build/fix) is either conversational or PR-terminated, so this
+    is exercised with a minimal single-step inline process."""
+    import yaml as _yaml
+
+    process_file = tmp_path / "nomonitor.yaml"
+    process_file.write_text(
+        _yaml.dump(
+            {
+                "process": "nomonitor",
+                "jobs": [{"name": "coding", "type": "agent", "prompt": "coding"}],
+                "flows": {"main": {"steps": ["coding"]}},
+            }
+        )
+    )
+    process = build_process("nomonitor", process_file=process_file)
+    main = process.flows["main"]
+    for synthetic in ("pushing", "waiting_for_pr", "rebasing", "wait_for_pr_signal"):
+        assert synthetic not in main.state_machine.states
 
 
 def test_full_process_pr_fix_review_fail_targets_pr_fix():
     """Per-flow override: in pr_fix, review's REVIEW_FAIL loops back to pr-fix."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     review_binding = next(b for b in pr_fix.bindings if b.name == "review")
     fail = next(r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern)
@@ -107,7 +120,7 @@ def test_full_process_pr_fix_review_fail_targets_pr_fix():
 
 def test_pr_fix_flow_pr_fix_active_to_wait_for_pr_signal_transition_registered():
     """SKIPPED routes ``pr-fix`` back into the monitor — the SM transition must exist."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_step = next(rj for rj in pr_fix.jobs if rj.name == "pr-fix")
     assert (pr_fix_step.active_state, "wait_for_pr_signal") in pr_fix.state_machine.transitions
@@ -126,7 +139,7 @@ def test_main_flow_has_sub_flow_entry_edge_into_pr_fix():
     Without the (wait_for_pr_signal, pr-fixing) edge, ``_dispatch_step``'s
     pre-CAS guard rejects the dispatch and the task stalls in ``working``.
     """
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
     assert (
@@ -144,7 +157,7 @@ def test_main_flow_has_sub_flow_exit_edges_back_through_pr_fix_rules():
     Each rule target that names a main-flow job needs the corresponding edge
     registered in main's SM, even though the rules live in the pr_fix sub-flow.
     """
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
     # PR_FIX_SKIPPED → wait_for_pr_signal
@@ -171,7 +184,7 @@ def test_pr_fix_flow_has_sub_flow_entry_edge_from_monitor():
     until the next server restart flips it to blocked. The companion runtime
     test below exercises the full path.
     """
-    process = build_process("full")
+    process = build_process("build")
     pr_fix_first = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
     assert (
         "wait_for_pr_signal",
@@ -481,7 +494,7 @@ def test_resolve_flow_returns_subflow_when_metadata_set(tmp_path):
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -579,7 +592,7 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -705,7 +718,7 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
         # "not a git repository").
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, capture_output=True)
         subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=tmp_path, capture_output=True)
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -803,7 +816,7 @@ def test_retry_review_in_pr_fix_advances_to_push_pr(tmp_path):
     try:
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -887,7 +900,7 @@ def test_answer_review_in_pr_fix_advances_to_push_pr(tmp_path):
     try:
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -962,7 +975,7 @@ def test_resolve_step_for_row_prefers_active_flow(tmp_path):
     try:
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
-        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="full", model="sonnet", budget=5.0)
+        config = LotsaConfig(data_dir=tmp_path / "data", work_dir=tmp_path, flow="build", model="sonnet", budget=5.0)
         db = TaskDB(tmp_path / "data" / "lotsa.db")
         run(db.initialize())
         svc = OrchestratorService(config, db)
@@ -1026,7 +1039,7 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -1089,6 +1102,209 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
         loop.close()
 
 
+def test_push_pr_no_github_parks_task_in_awaiting_operator(tmp_path):
+    """A ``push_pr`` action that fails only because no GitHub is configured
+    (``error_kind='no_github'``) parks the task in ``awaiting_operator`` — the
+    ADR-043 escape hatch — NOT ``blocked``. This is the live producer for the
+    parked status the README/UI advertise; without it a GitHub-less operator
+    sees "blocked" with a token error instead of "Awaiting you".
+
+    Regression: pre-fix the action dispatcher routed every failed action to
+    ``blocked`` (via the ``rebasing``/``blocked`` branch), so this task landed
+    at ``status='blocked'`` and no code path ever produced ``awaiting_operator``.
+    The failure is driven from inside the code under test — the stub tool
+    returns the real ``no_github`` failure contract, not a pre-flipped row.
+    """
+    import asyncio
+
+    from lotsa.config import LotsaConfig
+    from lotsa.db import TaskDB
+    from lotsa.orchestrator import OrchestratorService
+    from lotsa.registry import register_tool
+    from lotsa.tools import ToolResult
+    from rigg.models import Item
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        (tmp_path / "data").mkdir()
+        config = LotsaConfig(
+            data_dir=tmp_path / "data",
+            work_dir=tmp_path,
+            flow="build",
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(tmp_path / "data" / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+
+        from lotsa import registry as reg
+
+        reg._TOOLS.pop("push_pr", None)
+
+        async def stub_push_pr(ctx, config):
+            # Mirror the real push_pr tool's NO_GITHUB failure contract.
+            return ToolResult(
+                success=False,
+                output="NO_GITHUB: GITHUB_TOKEN environment variable is not set.",
+                metadata={"error_kind": "no_github"},
+            )
+
+        register_tool("push_pr", stub_push_pr)
+
+        try:
+            run(svc.start())
+            try:
+                task = run(svc.db.create_task("No GitHub", state="push_pr", metadata={"process_name": "build"}))
+                run(
+                    svc.db.claim_task_transition(
+                        task.id,
+                        from_status=task.status,
+                        from_state=task.state,
+                        to_state="push_pr",
+                        to_status="working",
+                        to_current_step="push_pr",
+                    )
+                )
+                item = Item(id=task.id, state="push_pr", title="No GitHub", metadata={"process_name": "build"})
+                push_pr_step = next(j for j in svc.process.flows["main"].jobs if j.name == "push_pr")
+                run(svc._dispatch_step(item, push_pr_step))
+                for _ in range(5):
+                    run(asyncio.sleep(0.01))
+
+                row = run(svc.db.get_task(task.id))
+                assert row.status == "awaiting_operator", (
+                    f"Expected GitHub-less push to park in awaiting_operator, got "
+                    f"status={row.status!r} state={row.state!r}"
+                )
+                assert row.state == "awaiting_operator"
+                assert "pr_number" not in row.metadata
+                # Parked with a status_change (an invitation to act), not an error.
+                msgs = run(svc.db.get_messages(task.id))
+                assert any(m.type == "status_change" and "Mark complete" in m.content for m in msgs), (
+                    "expected an 'awaiting you' status_change audit row inviting Mark complete"
+                )
+                assert not any(m.type == "error" for m in msgs), (
+                    "a GitHub-less park must not surface as an error message"
+                )
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+    finally:
+        loop.close()
+
+
+def test_execute_push_no_github_parks_task_in_awaiting_operator(tmp_path):
+    """The *legacy* ``_execute_push`` path (``state='pushing'``, reachable via
+    ``retry()`` on a pre-ADR-014 push-state row) parks a GitHub-less push in
+    ``awaiting_operator`` — the ADR-043 escape hatch — NOT ``blocked``.
+
+    This is the sibling of ``test_push_pr_no_github_parks_task_in_awaiting_operator``:
+    the same ``NO_GITHUB:`` → ``awaiting_operator`` handling exists at two
+    push sites (the ``push_pr`` action tool and this legacy ``_execute_push``
+    branch), and only the former was covered. Without the ``_execute_push``
+    branch a GitHub-less operator who lands on the legacy retry path would see
+    ``blocked`` with a token error instead of "Awaiting you".
+
+    The failure is driven from inside the code under test: ``execute_push`` is
+    stubbed to raise the real ``PushError('NO_GITHUB: …')`` contract, and the
+    row enters at the genuine ``(status='working', state='pushing')`` push
+    precondition that ``PUSH_START`` claims — not pre-flipped into the parked
+    state.
+    """
+    import asyncio
+
+    from lotsa.config import LotsaConfig
+    from lotsa.db import TaskDB
+    from lotsa.orchestrator import OrchestratorService
+    from lotsa.push_step import PushError
+    from rigg.models import Item
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        (tmp_path / "data").mkdir()
+        config = LotsaConfig(
+            data_dir=tmp_path / "data",
+            work_dir=tmp_path,
+            flow="build",
+            model="sonnet",
+            budget=5.0,
+        )
+        db = TaskDB(tmp_path / "data" / "lotsa.db")
+        run(db.initialize())
+        svc = OrchestratorService(config, db)
+
+        import lotsa.push_step as push_step
+
+        orig_execute_push = push_step.execute_push
+        orig_build_pr_text = push_step.build_pr_text
+
+        async def stub_execute_push(**kwargs):
+            # Mirror push_step's machine-detectable GitHub-less contract.
+            raise PushError("NO_GITHUB: GITHUB_TOKEN environment variable is not set.")
+
+        async def stub_build_pr_text(**kwargs):
+            # Avoid needing a real git worktree for title/body synthesis;
+            # the push raises before the value is ever used anyway.
+            return ("t", "b")
+
+        push_step.execute_push = stub_execute_push
+        push_step.build_pr_text = stub_build_pr_text
+
+        try:
+            run(svc.start())
+            try:
+                task = run(
+                    svc.db.create_task("No GitHub (legacy push)", state="pushing", metadata={"process_name": "build"})
+                )
+                # Enter at the genuine push precondition PUSH_START claims.
+                run(
+                    svc.db.claim_task_transition(
+                        task.id,
+                        from_status=task.status,
+                        from_state=task.state,
+                        to_state="pushing",
+                        to_status="working",
+                        to_current_step="push",
+                    )
+                )
+                item = Item(
+                    id=task.id, state="pushing", title="No GitHub (legacy push)", metadata={"process_name": "build"}
+                )
+                run(svc._execute_push(item))
+
+                row = run(svc.db.get_task(task.id))
+                assert row.status == "awaiting_operator", (
+                    f"Expected GitHub-less legacy push to park in awaiting_operator, got "
+                    f"status={row.status!r} state={row.state!r}"
+                )
+                assert row.state == "awaiting_operator"
+                # Parked with a status_change (an invitation to act), not an error.
+                msgs = run(svc.db.get_messages(task.id))
+                assert any(m.type == "status_change" and "Mark complete" in m.content for m in msgs), (
+                    "expected an 'awaiting you' status_change audit row inviting Mark complete"
+                )
+                assert not any(m.type == "error" for m in msgs), (
+                    "a GitHub-less park must not surface as an error message"
+                )
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+        finally:
+            push_step.execute_push = orig_execute_push
+            push_step.build_pr_text = orig_build_pr_text
+    finally:
+        loop.close()
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests for the cross-flow step-lookup fallback. ``retry()`` and
 # ``jump_to_step()`` historically scanned only ``self.flow`` (main); under
@@ -1123,7 +1339,7 @@ def _stub_full_process_service(tmp_path, run):
     config = LotsaConfig(
         data_dir=tmp_path / "data",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1719,7 +1935,7 @@ def test_start_recovery_sweep_treats_legacy_pushing_state_as_action_state(tmp_pa
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )

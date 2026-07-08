@@ -52,10 +52,11 @@ def init(data_dir: Path | None) -> None:
                 {
                     "model": "sonnet",
                     "budget": 5.0,
-                    # ADR-034 §2 — new tasks default to ``chat`` (start as a
-                    # conversation, promote into a structured process when
-                    # ready). The full catalog still loads; ``flow:`` only picks
-                    # which process the new-task picker pre-selects.
+                    # ADR-034 §2 / ADR-043 — new tasks default to ``chat`` (start
+                    # as a conversation, hand off into an Execute process
+                    # (``build``/``fix``) when ready). The full catalog still
+                    # loads; ``flow:`` only picks which process the new-task
+                    # picker pre-selects.
                     "flow": "chat",
                 },
                 default_flow_style=False,
@@ -204,7 +205,7 @@ def promote(task_id: str, process: str, context: str | None, host: str, port: in
     Issues ``POST /api/tasks/<task_id>/promote`` against a running
     ``lotsa serve`` — the orchestrator owns the task's in-memory state, so this
     must talk to the live server rather than spinning up its own. For
-    destination-specific handover (e.g. ``full``'s ``draft_spec``), use the
+    destination-specific handover (e.g. ``build``'s ``draft_spec``), use the
     dashboard's Promote modal; ``--context`` seeds the generic
     ``promotion_context`` artifact.
     """
@@ -264,10 +265,11 @@ def promote(task_id: str, process: str, context: str | None, host: str, port: in
     "--flow",
     default=None,
     help=(
-        "Process to load. Bundled: chat/simple/standard/full/quickfix. Custom: any name "
-        "defined in lotsa.yaml's `processes:` block. Default: the inline "
-        "entry with default:true, or 'chat' if none. Free-form string — "
-        "validation happens at startup against the loaded catalog."
+        "Process the new-task picker pre-selects. Bundled (ADR-043): chat (Think) / "
+        "build (Execute, full depth) / fix (Execute, shallow). Custom: any name "
+        "defined in lotsa.yaml's `processes:` block. The full catalog always loads; "
+        "this only sets the default selection. Default: the inline entry with "
+        "default:true, or 'chat' if none."
     ),
 )
 @click.option(

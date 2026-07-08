@@ -278,7 +278,7 @@ def test_build_process_accepts_registered_runner_name(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("preset", ["simple", "standard", "full"])
+@pytest.mark.parametrize("preset", ["chat", "build", "fix"])
 def test_bundled_preset_jobs_have_no_runner_field(preset):
     """Bundled presets must ship no ``runner:`` field — all jobs have
     ``runner=None``.
@@ -299,7 +299,7 @@ def test_bundled_preset_jobs_have_no_runner_field(preset):
 # ---------------------------------------------------------------------------
 
 
-def _make_minimal_service(tmp_path: Path, flow: str = "simple") -> OrchestratorService:
+def _make_minimal_service(tmp_path: Path, flow: str = "build") -> OrchestratorService:
     """Create an OrchestratorService without calling start()."""
     db = TaskDB(tmp_path / "lotsa.db")
     config = LotsaConfig(
@@ -539,7 +539,7 @@ async def test_start_registers_claude_agent_sdk_built_in(tmp_path):
         model="sonnet",
         budget=5.0,
         data_dir=tmp_path,
-        flow="simple",
+        flow="build",
     )
     svc = OrchestratorService(config, db)
     svc.runner = _FakeRunner("fake")
@@ -574,7 +574,7 @@ async def test_start_claude_agent_sdk_builtin_not_default(tmp_path):
         model="sonnet",
         budget=5.0,
         data_dir=tmp_path,
-        flow="simple",
+        flow="build",
     )
     svc = OrchestratorService(config, db)
     svc.runner = _FakeRunner("fake")

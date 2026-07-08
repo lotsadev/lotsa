@@ -21,15 +21,27 @@ interface ProcessPickerProps {
 // in/out of the controlled value.
 const DEFAULT_VALUE = '__default__'
 
+// ADR-043 — friendly labels for the two-phase Think→Execute catalog. The
+// picker is a *mode switcher*: Chat (Think) is the default entry mode; the
+// operator can flip to Build / Quick fix (Execute) on the first turn. Inline
+// or custom processes fall through to their raw name.
+const MODE_LABELS: Record<string, string> = {
+  chat: 'Chat',
+  build: 'Build',
+  fix: 'Quick fix',
+}
+
+const modeLabel = (name: string) => MODE_LABELS[name] ?? name
+
 /**
- * Real process picker for the new-task surface (ADR-021).
+ * Mode switcher for the new-task surface (ADR-021 / ADR-043).
  *
  * ``GET /api/processes`` returns every loaded process; ``POST /api/tasks``
- * accepts any of them. The list is sorted active-first by the API. A
- * "Default" option maps to ``undefined`` so the caller can always fall back to
- * the server's configured default — picking an explicit process never strands
- * the parent on a stale name if the active process changes between sessions.
- * Renders nothing when only one process is loaded — there's no choice to make.
+ * accepts any of them. Chat is the default entry mode (``undefined`` → the
+ * server's configured default, which is ``chat``); the operator can pick Build
+ * or Quick fix — or any inline process — before the first turn. Picking the
+ * Default option never strands the parent on a stale name if the active process
+ * changes between sessions. Renders nothing when only one process is loaded.
  */
 export function ProcessPicker({ value, onChange, className, disabled }: ProcessPickerProps) {
   const { data: processes } = useProcesses()
@@ -38,7 +50,7 @@ export function ProcessPicker({ value, onChange, className, disabled }: ProcessP
 
   const active = processes.find((p) => p.is_active)
   // ``undefined`` (dispatch against the server default) renders as the Default
-  // option; an explicit selection renders as that process's name.
+  // option; an explicit selection renders as that process's mode label.
   const selected = value ?? DEFAULT_VALUE
 
   return (
@@ -47,21 +59,21 @@ export function ProcessPicker({ value, onChange, className, disabled }: ProcessP
       onValueChange={(v) => onChange(v === DEFAULT_VALUE ? undefined : v)}
       disabled={disabled}
     >
-      <SelectTrigger className={cn('h-9', className)} aria-label="Process">
-        <SelectValue placeholder="Process" />
+      <SelectTrigger className={cn('h-9', className)} aria-label="Mode">
+        <SelectValue placeholder="Mode" />
       </SelectTrigger>
       <SelectContent>
         <SelectItem value={DEFAULT_VALUE}>
           Default
           {active && (
             <span className="ml-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-              {active.name}
+              {modeLabel(active.name)}
             </span>
           )}
         </SelectItem>
         {processes.map((p) => (
           <SelectItem key={p.name} value={p.name}>
-            {p.name}
+            {modeLabel(p.name)}
             {p.is_active && (
               <span className="ml-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
                 default

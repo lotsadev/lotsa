@@ -1,53 +1,31 @@
-process: software_process
+process: build
 description: |
-  New feature or substantive change. Full SDLC discipline: operator-approved
-  spec, plan, failing-tests-first, code, review, and post-implementation
-  verify. Use when the behavior to add is non-trivial and worth the ceremony.
+  Execute at full depth. Autonomous SDLC discipline: plan, failing-tests-first,
+  code, review, post-implementation verify, then open a PR and watch it to
+  terminal. The task body (or a spec carried from chat) is the brief — there is
+  no separate spec/plan gate. Reach it from chat via the "Build it" handoff, or
+  select it directly for a well-understood change.
 promotion_inputs:
   - name: draft_spec
-    description: A discussed-and-agreed spec the operator wants verified rather
-                 than re-elicited (e.g. distilled from a chat conversation).
+    description: A discussed-and-agreed spec the operator wants built rather than
+                 re-elicited (e.g. distilled from a chat conversation). Optional —
+                 the task body is used when absent.
 jobs:
   # ADR-022 — per-step model selection. Every step falls back to the global
   # `model:` in lotsa.yaml; add `model: <name>` on a step to override. The
   # bundled process deliberately ships NO per-step models — assigning them
   # is operator policy, and bundled defaults would silently override the
-  # operator's global model on upgrade (PR #124 shipped exactly that and an
-  # opus operator found spec running on haiku). A cost-tiered example:
-  #   spec:        model: haiku    # conversational elicitation is cheap
-  #   plan:        model: opus     # deepest reasoning step
-  #   test/code:   model: sonnet   # strong coding tier
-  #   review:      model: opus     # different model than the implementer —
-  #                                # model diversity catches more
-  #   pr-fix:      model: sonnet
-  #   verify:      model: opus
-  - name: spec
-    type: agent
-    prompt: spec
-    conversational: true
-    output: spec
-    queue_state: speccing
-    active_state: spec
-    rules:
-      - source: stdout
-        pattern: "^SPEC_COMPLETE:"
-        target: next
-
+  # operator's global model on upgrade.
   - name: plan
     type: agent
     prompt: planning
-    evaluate: true
-    inputs: [spec]
-    output: plan
     queue_state: backlog
     active_state: planning
-    gate_state: planned
 
   - name: test
     type: agent
     prompt: testing
     resume: true
-    inputs: [spec, plan]
     queue_state: testing
     active_state: testing
     posthooks: [commit]
@@ -56,7 +34,6 @@ jobs:
     type: agent
     prompt: coding
     resume: true
-    inputs: [spec, plan]
     queue_state: coding
     active_state: coding
     posthooks: [commit]
@@ -64,7 +41,6 @@ jobs:
   - name: review
     type: agent
     prompt: review
-    inputs: [spec, plan]
     queue_state: reviewing
     active_state: reviewing
     rules:
@@ -79,7 +55,6 @@ jobs:
     type: agent
     prompt: pr-fix
     resume: true
-    inputs: [spec, plan]
     queue_state: pr-fixing
     active_state: pr-fixing
     posthooks: [commit]
@@ -101,7 +76,6 @@ jobs:
     type: agent
     prompt: verify
     conversational: true
-    inputs: [spec]
     posthooks: [commit]
     rules:
       - source: stdout
@@ -150,7 +124,6 @@ jobs:
 flows:
   main:
     steps:
-      - spec
       - plan
       - test
       - code

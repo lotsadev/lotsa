@@ -1,0 +1,533 @@
+"""Failing tests for the Execute-side of the two-phase model (ADR-043).
+
+Covers the operator ``mark_complete`` terminal action + ``awaiting_operator``
+parked status (plan §5, acceptance #8), the chat→build spec carry (plan §4/§6,
+acceptance #9), and legacy-row routing on restart (plan §9, acceptance #10).
+
+Written RED — before the implementation:
+
+* ``OrchestratorService.mark_complete`` does not exist → ``AttributeError``.
+* ``MarkCompleteNotAllowed`` is not importable → ``ImportError`` (imported
+  lazily inside the one test that needs it, so it fails independently).
+* ``awaiting_operator`` is not in the status enum.
+* ``POST /tasks/{id}/mark-complete`` is unrouted → 404.
+* A task persisted under ``full`` is not re-routed to ``blocked`` on restart
+  today (``full`` still loads), so it stays ``waiting``.
+* The ``build``/``chat`` spec-carry prompt surfaces don't exist yet.
+"""
+
+from __future__ import annotations
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from lotsa.config import LotsaConfig
+from lotsa.db import TaskDB
+from lotsa.flows import BUNDLED_PROMPTS, build_process
+from lotsa.orchestrator import OrchestratorService
+from lotsa.status import ALL_STATUSES, TaskStatus
+from lotsa.tests.conftest import FakeRunner, wait_for_completion
+
+
+def _catalog_service(tmp_path, run):
+    """An OrchestratorService on the bundled catalog (no inline processes, no
+    flow-file) with a FakeRunner. Mirrors the ADR-034 catalog-path helper."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    config = LotsaConfig(
+        data_dir=data_dir,
+        work_dir=tmp_path,
+        model="sonnet",
+        budget=5.0,
+        config_path=tmp_path / "lotsa.yaml",
+    )
+    db = TaskDB(data_dir / "lotsa.db")
+    run(db.initialize())
+    svc = OrchestratorService(config, db)
+    svc.runner = FakeRunner()
+    return svc
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# awaiting_operator parked status (plan §5, acceptance #8)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_awaiting_operator_is_a_known_status():
+    """The parked 'awaiting you' status must be a recognized enum member.
+
+    Fails pre-impl: the status model is eight-valued; ``awaiting_operator``
+    is absent.
+    """
+    assert "awaiting_operator" in ALL_STATUSES
+
+
+def test_taskstatus_exposes_awaiting_operator_constant():
+    """Fails pre-impl: ``TaskStatus.AWAITING_OPERATOR`` raises AttributeError."""
+    assert TaskStatus.AWAITING_OPERATOR == "awaiting_operator"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# mark_complete terminal action (plan §5, acceptance #8)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_mark_complete_drives_non_terminal_task_to_complete(tmp_path, run):
+    """The operator escape hatch: mark_complete moves a parked, non-terminal
+    task to the terminal ``complete`` status via atomic_transition.
+
+    Fails pre-impl: ``mark_complete`` does not exist → AttributeError.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        # Arrange a task parked at a non-terminal Execute state (the precondition,
+        # not the post-bug outcome — the outcome under test is 'complete').
+        task = run(
+            svc.db.create_task(
+                "Escape hatch",
+                state="reviewing",
+                status="waiting",
+                current_step="review",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert row.current_step is None
+        # A terminal audit row naming the operator action is written on the win.
+        msgs = run(svc.db.get_messages(task.id))
+        assert any(
+            m.type == "status_change" and ("complete" in m.content.lower() or "operator" in m.content.lower())
+            for m in msgs
+        ), "mark_complete must write a status_change audit row"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_rejects_already_terminal_task(tmp_path, run):
+    """mark_complete on an already-terminal task raises MarkCompleteNotAllowed.
+
+    Fails pre-impl: the exception type does not exist (ImportError), and the
+    method does not exist.
+    """
+    from lotsa.orchestrator import MarkCompleteNotAllowed  # lazy: not yet defined
+
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Already done",
+                state="complete",
+                status="complete",
+                metadata={"process_name": "build"},
+            )
+        )
+        with pytest.raises(MarkCompleteNotAllowed):
+            run(svc.mark_complete(task.id))
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_retries_past_concurrent_non_terminal_shift(tmp_path, run):
+    """mark_complete must converge when a concurrent path advances the task to
+    a DIFFERENT non-terminal ``(status, state)`` between its fresh read and its
+    CAS — the asymmetric-guard bug class ``lotsa/CLAUDE.md`` calls out.
+
+    The failure is exercised from INSIDE the code under test: a stub wraps
+    ``atomic_transition`` and, on the first terminal CAS attempt, advances the
+    row out from under the expected ``from_*`` (so that CAS loses), then lets
+    the retry succeed. This is not a pre-flipped post-bug row — the row starts
+    at a legitimately non-terminal state and moves mid-execution.
+
+    Regression: pre-fix ``mark_complete`` issued a SINGLE CAS attempt and, on
+    loss against a non-terminal shift, returned silently. The task would stay
+    ``working``/``verifying`` and this assertion (``status == 'complete'``)
+    would fail; only a terminal concurrent outcome was meant to no-op.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Racy complete",
+                state="reviewing",
+                status="waiting",
+                current_step="review",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        real_at = svc.db.atomic_transition
+        counters = {"terminal_attempts": 0, "interfered": False}
+
+        async def racy_atomic_transition(task_id, **kwargs):
+            # Only perturb the terminal CAS mark_complete issues, and only once.
+            if kwargs.get("to_status") == "complete" and not counters["interfered"]:
+                counters["interfered"] = True
+                # A competing coroutine advances the row to a non-terminal
+                # (status, state) after mark_complete's re-read but before its
+                # CAS lands — the exact window the single-attempt version lost.
+                await real_at(
+                    task_id,
+                    from_status=kwargs["from_status"],
+                    from_state=kwargs["from_state"],
+                    to_state="verifying",
+                    to_status="working",
+                    to_current_step="verify",
+                    audit_on_win=None,
+                )
+            if kwargs.get("to_status") == "complete":
+                counters["terminal_attempts"] += 1
+            return await real_at(task_id, **kwargs)
+
+        svc.db.atomic_transition = racy_atomic_transition
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert counters["terminal_attempts"] >= 2, (
+            "mark_complete must re-read and retry the terminal CAS after losing to a concurrent non-terminal shift"
+        )
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_api_route_completes_task(app_with_service, run):
+    """POST /api/tasks/{id}/mark-complete drives the task terminal and returns
+    the full task detail.
+
+    Fails pre-impl: the route is unrouted → 404.
+    """
+    app, service = app_with_service
+
+    async def _test():
+        task = await service.create_task("API mark complete")
+        await wait_for_completion(service, task.id)
+        # Precondition: not already terminal.
+        row = await service.db.get_task(task.id)
+        assert row.status not in ("complete", "abandoned", "archived")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/tasks/{task.id}/mark-complete")
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["task"]["status"] == "complete"
+
+    run(_test())
+
+
+def test_mark_complete_raises_failed_when_cas_never_converges(tmp_path, run):
+    """If every terminal CAS loses to a moving non-terminal state, mark_complete()
+    must raise ``MarkCompleteFailed`` (retryable), NOT ``MarkCompleteNotAllowed``
+    (a 400 "already terminal" precondition) and NOT return silently.
+
+    Pre-fix red: the loop-exhausted branch raised ``MarkCompleteNotAllowed``, so
+    a genuine non-convergence was reported as a non-retryable 400. The failure is
+    driven from inside the code under test — a stubbed ``atomic_transition`` makes
+    every ``to_status='complete'`` CAS lose by presenting a bogus ``from_status``.
+    """
+    from lotsa.orchestrator import MarkCompleteFailed, MarkCompleteNotAllowed
+
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Never converges",
+                state="reviewing",
+                status="waiting",
+                current_step="review",
+                metadata={"process_name": "build"},
+            )
+        )
+        real_at = svc.db.atomic_transition
+
+        async def always_lose(task_id, **kwargs):
+            # Force the terminal CAS to lose every iteration: present a bogus
+            # ``from_status`` so ``to_status='complete'`` never lands, simulating
+            # a perpetually-racing non-terminal writer.
+            if kwargs.get("to_status") == "complete":
+                return await real_at(
+                    task_id,
+                    from_status="__never__",
+                    from_state=kwargs["from_state"],
+                    to_state=kwargs["to_state"],
+                    to_status="complete",
+                    to_current_step=kwargs.get("to_current_step"),
+                    audit_on_win=None,
+                )
+            return await real_at(task_id, **kwargs)
+
+        svc.db.atomic_transition = always_lose
+        try:
+            with pytest.raises(MarkCompleteFailed):
+                run(svc.mark_complete(task.id))
+        finally:
+            svc.db.atomic_transition = real_at
+
+        # MarkCompleteFailed must be distinct from the 400 precondition type.
+        assert not issubclass(MarkCompleteFailed, MarkCompleteNotAllowed)
+        # Task is NOT complete on a non-converging run.
+        row = run(svc.db.get_task(task.id))
+        assert row.status != "complete"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_endpoint_returns_503_when_mark_complete_fails(app_with_service, run):
+    """When mark_complete() raises ``MarkCompleteFailed`` (CAS never converged),
+    the route surfaces a 503 with code ``MARK_COMPLETE_FAILED`` rather than a
+    false 200 — mirrors ``archive``'s ``ArchiveFailed`` → 503 contract. A 400
+    (MarkCompleteNotAllowed) here would wrongly tell the client not to retry.
+    """
+    app, service = app_with_service
+
+    async def _test():
+        from lotsa.orchestrator import MarkCompleteFailed
+
+        task = await service.create_task("Mark complete fails")
+        await wait_for_completion(service, task.id)
+
+        async def boom(task_id: str) -> None:
+            raise MarkCompleteFailed("did not converge")
+
+        service.mark_complete = boom  # type: ignore[method-assign]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/tasks/{task.id}/mark-complete")
+            assert resp.status_code == 503
+            assert resp.json()["detail"]["code"] == "MARK_COMPLETE_FAILED"
+
+    run(_test())
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# mark_complete from ANY non-terminal state (ADR-043 headline: "from ANY
+# non-terminal state"). The happy-path tests above all start from
+# ``(waiting, reviewing)``; these assert the breadth the CAS actually claims —
+# the escape-hatch state itself, a SM sink, and the PR-monitor-untrack branch.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_mark_complete_from_awaiting_operator(tmp_path, run):
+    """The escape hatch's raison d'être: a task parked at ``awaiting_operator``
+    (the GitHub-less push park) is driven to ``complete`` by the operator.
+
+    This is the state the whole action exists to close, yet none of the
+    happy-path tests start from it — assert it directly.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Parked awaiting operator",
+                state="awaiting_operator",
+                status="awaiting_operator",
+                current_step="push",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert row.current_step is None
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_from_blocked(tmp_path, run):
+    """mark_complete works from ``blocked`` — a SM sink. An Execute run that
+    couldn't reach a PR terminal on its own (e.g. a push failure) is parked at
+    ``blocked``; completion is global truth, not a flow edge, so the
+    non-edge-gated CAS (ADR-030 pattern) still lands from this sink.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        task = run(
+            svc.db.create_task(
+                "Blocked then completed",
+                state="pushing",
+                status="blocked",
+                current_step="push",
+                metadata={"process_name": "build"},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_mark_complete_from_waiting_for_pr_untracks_monitor(tmp_path, run):
+    """mark_complete on a task parked at the PR monitor stops it being polled:
+    the monitor engine's ``untrack`` is invoked before the terminal CAS, mirroring
+    archive()/block() teardown. Without it, a completed task would keep being
+    polled by pr_monitor. Asserted via a spy wrapping the REAL engine's untrack
+    (resolved against the task's own process), not a hand-rolled fake, so the
+    ``_monitor_engine_for`` resolution is exercised too.
+    """
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        engine = svc._pr_monitors_by_process["build"]
+        untracked: list[str] = []
+        real_untrack = engine.untrack
+
+        def spy_untrack(task_id: str) -> None:
+            untracked.append(task_id)
+            real_untrack(task_id)
+
+        engine.untrack = spy_untrack  # type: ignore[method-assign]
+
+        # ``wait_for_pr_signal`` is build's monitor state; ``waiting_for_pr`` the
+        # paired status. This is the exact shape a parked, PR-watching task holds.
+        task = run(
+            svc.db.create_task(
+                "Watching a PR",
+                state="wait_for_pr_signal",
+                status="waiting_for_pr",
+                current_step="wait_for_pr_signal",
+                metadata={"process_name": "build", "pr_number": 7},
+            )
+        )
+
+        run(svc.mark_complete(task.id))
+
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete"
+        assert row.state == "complete"
+        assert task.id in untracked, "mark_complete must untrack a PR-monitored task before completing it"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Legacy-row routing on restart (plan §9, acceptance #10)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_legacy_process_row_routes_to_blocked_on_restart(tmp_path, run):
+    """A task persisted under a removed process name lands in ``blocked`` with a
+    recovery message after restart (clean break — no aliasing).
+
+    Fails pre-impl: ``full`` still loads, so the row is recognized and left at
+    ``waiting`` rather than routed to ``blocked``.
+    """
+    # Seed the row BEFORE the service starts, so start()'s recovery sweep sees it.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db = TaskDB(data_dir / "lotsa.db")
+    run(db.initialize())
+    legacy = run(
+        db.create_task(
+            "Persisted under full",
+            state="planned",
+            status="waiting",
+            current_step="plan",
+            metadata={"process_name": "full"},
+        )
+    )
+    run(db.close())
+
+    svc = _catalog_service(tmp_path, run)  # reuses the same data_dir/DB
+    run(svc.start())
+    try:
+        row = run(svc.db.get_task(legacy.id))
+        assert row.status == "blocked", (
+            f"a row under the removed 'full' process must be routed to blocked; got {row.status!r}"
+        )
+        msgs = run(svc.db.get_messages(legacy.id))
+        assert any("full" in m.content.lower() for m in msgs), "the recovery message must name the removed process"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_non_legacy_row_is_untouched_by_restart_routing(tmp_path, run):
+    """A row under a current process (``build``) parked at a gate is NOT flipped
+    to blocked by the legacy-routing sweep."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db = TaskDB(data_dir / "lotsa.db")
+    run(db.initialize())
+    current = run(
+        db.create_task(
+            "Under build",
+            state="reviewing",
+            status="waiting",
+            current_step="review",
+            metadata={"process_name": "build"},
+        )
+    )
+    run(db.close())
+
+    svc = _catalog_service(tmp_path, run)
+    run(svc.start())
+    try:
+        row = run(svc.db.get_task(current.id))
+        assert row.status == "waiting", f"a current-process gate row must survive restart; got {row.status!r}"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Chat→Build spec carry, prompt-level (plan §4/§6, acceptance #9)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_chat_prompt_offers_spec_distillation():
+    """chat can, on request, distill a spec before handoff (acceptance #9).
+
+    Fails pre-impl: chat-system.md carries no spec-distillation guidance today.
+    """
+    text = (BUNDLED_PROMPTS / "chat" / "chat-system.md").read_text().lower()
+    assert "spec" in text, "chat prompt must describe distilling a spec on request"
+
+
+def test_build_declares_draft_spec_promotion_input():
+    """build declares the ``draft_spec`` promotion input so a carried spec is
+    delivered via ADR-027's initial_artifacts on handoff.
+
+    Fails pre-impl: build doesn't exist.
+    """
+    process = build_process("build")
+    names = {pi.name for pi in process.promotion_inputs}
+    assert "draft_spec" in names
+
+
+def test_build_planning_prompt_injects_carried_spec():
+    """build's planning user prompt reads the carried spec via the
+    ``{artifact:draft_spec}`` injection, so it reaches the agent even though
+    ``inputs`` gating was dropped.
+
+    Fails pre-impl: the build planning prompt doesn't exist.
+    """
+    path = BUNDLED_PROMPTS / "build" / "planning-user.md"
+    assert path.is_file(), "build/planning-user.md must exist"
+    assert "{artifact:draft_spec}" in path.read_text()

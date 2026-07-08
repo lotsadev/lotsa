@@ -30,7 +30,7 @@ The plan and tests are already in your conversation history. Review them to unde
 
 Write the code. Match the style and patterns of the existing codebase.
 
-- **Follow the plan.** It was approved. Don't deviate without good reason.
+- **Follow the plan** from the preceding planning step. Don't deviate without good reason.
 - **Make the tests pass.** The tests define the contract. Your code must satisfy them.
 - **Build what's specified, nothing else.** No unasked-for features.
 - **Prefer the simple solution.** Fewer moving parts.

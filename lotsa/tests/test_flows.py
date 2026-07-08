@@ -31,24 +31,18 @@ from lotsa.flows import (
 # ---------------------------------------------------------------------------
 
 
-def test_simple_process_loads():
-    """The simple preset loads and exposes a single-step main flow."""
-    process = build_process("simple")
-    assert process.name == "simple"
+def test_fix_process_loads():
+    """The ``fix`` preset (ADR-043 Execute-at-shallow-depth) loads with a
+    ``code``-first main flow and a pr_fix sub-flow."""
+    process = build_process("fix")
+    assert process.name == "fix"
     main = process.flows["main"]
-    assert len(main.bindings) == 1
-    assert main.bindings[0].name == "coding"
+    assert main.bindings[0].name == "code"
+    assert "pr_fix" in process.flows
 
 
-def test_standard_process_loads():
-    process = build_process("standard")
-    assert process.name == "standard"
-    main = process.flows["main"]
-    assert len(main.bindings) == 1
-
-
-def test_full_process_loads_with_two_flows():
-    process = build_process("full")
+def test_build_process_loads_with_two_flows():
+    process = build_process("build")
     assert "main" in process.flows
     assert "pr_fix" in process.flows
 
@@ -60,7 +54,7 @@ def test_unknown_process_raises():
 
 def test_build_flow_returns_main_flow_for_backward_compat():
     """``build_flow`` (legacy entry point) returns the root flow as a FlowConfig."""
-    flow = build_flow("full")
+    flow = build_flow("build")
     assert flow.name == "main"
 
 
@@ -69,40 +63,39 @@ def test_build_flow_returns_main_flow_for_backward_compat():
 # ---------------------------------------------------------------------------
 
 
-def test_state_derivation_simple():
-    """Simple flow derives: backlog → coding → complete."""
-    process = build_process("simple")
+def test_state_derivation_fix_code_first():
+    """fix's first step (``code``) derives: coding → complete via review."""
+    process = build_process("fix")
     main = process.flows["main"]
     step = main.jobs[0]
-    assert step.queue_state == "backlog"
+    assert step.name == "code"
     assert step.active_state == "coding"
-    assert step.success_state == "complete"
 
 
-def test_state_derivation_full_main():
-    process = build_process("full")
+def test_state_derivation_build_main():
+    process = build_process("build")
     main = process.flows["main"]
     by_name = {rj.name: rj for rj in main.jobs}
 
-    # spec is conversational with a distinct queue_state
-    assert by_name["spec"].queue_state == "speccing"
-    assert by_name["spec"].active_state == "spec"
-    # plan has an evaluate gate
-    assert by_name["plan"].success_state == "planned"
+    # plan is the ungated first step (no spec step, no planned gate)
+    assert main.bindings[0].name == "plan"
+    assert by_name["plan"].queue_state == "backlog"
+    assert by_name["plan"].active_state == "planning"
     # The last step in main is wait_for_pr_signal (monitor)
     assert main.bindings[-1].name == "wait_for_pr_signal"
     assert by_name["wait_for_pr_signal"].type == "monitor"
 
 
-def test_gate_states():
-    process = build_process("full")
+def test_build_main_has_no_gate_states():
+    """ADR-043 dropped the plan gate — build's main flow is fully ungated."""
+    process = build_process("build")
     main = process.flows["main"]
-    assert "planned" in main.gate_states
+    assert main.gate_states == set()
 
 
 def test_revision_self_loop_on_active_states():
     """Active states have self-loops for revision dispatch."""
-    process = build_process("simple")
+    process = build_process("build")
     main = process.flows["main"]
     assert ("coding", "coding") in main.state_machine.transitions
 
@@ -112,14 +105,14 @@ def test_revision_self_loop_on_active_states():
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_loading_standard():
-    process = build_process("standard")
+def test_prompt_loading_fix():
+    process = build_process("fix")
     system = process.registry.load("coding-system")
     assert "Coding Agent" in system or len(system) > 50
 
 
-def test_prompt_loading_full():
-    process = build_process("full")
+def test_prompt_loading_build():
+    process = build_process("build")
     for name in ["planning-system", "testing-system", "coding-system", "review-system", "verify-system"]:
         content = process.registry.load(name)
         assert len(content) > 50
@@ -132,7 +125,7 @@ def test_user_override_prompts(tmp_path):
     (custom / "coding-system.md").write_text("Custom system prompt.")
     (custom / "coding-user.md").write_text("Custom: {title}\n{body}")
 
-    process = build_process("standard", prompts_dir=custom)
+    process = build_process("build", prompts_dir=custom)
     assert process.registry.load("coding-system") == "Custom system prompt."
 
 
@@ -294,11 +287,11 @@ def test_build_process_rejects_subflow_binding_override_target_outside_process(t
     assert "sub" in message, f"Override-target error must name the owning flow; got {message!r}"
 
 
-@pytest.mark.parametrize("preset", ["simple", "standard", "full"])
+@pytest.mark.parametrize("preset", ["chat", "build", "fix"])
 def test_bundled_presets_pass_cross_process_validator(preset):
     """Every bundled preset's rule targets resolve within their own process —
     the new validator must not reject them (guards against false positives,
-    e.g. the ``full`` process's pr_fix sub-flow routing)."""
+    e.g. the ``build``/``fix`` pr_fix sub-flow routing)."""
     process = build_process(preset)
     assert "main" in process.flows
 
@@ -407,19 +400,19 @@ def test_chat_process_has_description():
     assert process.description.strip() != ""
 
 
-def test_quickfix_process_is_code_then_review():
-    """The bundled ``quickfix`` process starts ``code → review`` (ADR-027 §3 /
-    R9). Fails pre-fix: ``quickfix`` is not a bundled preset (ValueError)."""
-    process = build_process("quickfix")
+def test_fix_process_is_code_then_review():
+    """The bundled ``fix`` process (ADR-043) starts ``code → review`` (ADR-027 §3 /
+    R9)."""
+    process = build_process("fix")
     main = process.flows["main"]
     step_names = [s.name for s in main.steps]
     assert step_names[:2] == ["code", "review"]
 
 
-def test_quickfix_process_has_description_and_promotion_inputs():
-    """Quickfix carries a description (for triage) and declares its
+def test_fix_process_has_description_and_promotion_inputs():
+    """``fix`` carries a description (for triage) and declares its
     promotion input (the operator's instruction)."""
-    process = build_process("quickfix")
+    process = build_process("fix")
     assert process.description is not None
     assert [pi.name for pi in process.promotion_inputs] == ["instruction"]
 
@@ -434,7 +427,7 @@ def test_backward_compat_flow_step_alias():
 
 
 def test_flow_config_steps_alias_returns_resolved_jobs_in_binding_order():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     assert [s.name for s in main.steps] == [b.name for b in main.bindings]
 
@@ -590,7 +583,7 @@ def test_every_bundled_marker_survives_markdown_wrapping():
 
     from rigg.models import AgentResult
 
-    bundled = ("simple", "standard", "full", "chat", "quickfix")
+    bundled = ("chat", "build", "fix")
     swept = 0
     for process_name in bundled:
         process = build_process(process_name)
@@ -626,7 +619,7 @@ def test_every_bundled_marker_survives_markdown_wrapping():
                         )
                     swept += 1
     # Guard against the sweep silently going hollow (e.g. a refactor that
-    # empties job.rules) — full+quickfix carry 14 stdout rules today.
+    # empties job.rules) — build+fix carry a dozen-plus stdout rules today.
     assert swept >= 10, f"wrapping sweep only covered {swept} rules — sweep broken?"
 
 
@@ -667,33 +660,61 @@ def test_evaluate_output_rules_missing_file(tmp_path):
 
 
 def test_find_step():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     assert find_step(main, "planning").name == "plan"
     assert find_step(main, "nonexistent") is None
 
 
-def test_find_step_for_gate():
-    process = build_process("full")
-    main = process.flows["main"]
-    assert find_step_for_gate(main, "planned").name == "plan"
+def _gated_process(tmp_path):
+    """A minimal two-step process with an evaluate gate — ``build``/``fix`` no
+    longer carry a gate (ADR-043 dropped the plan gate), so gate-mechanics tests
+    build one inline. ``analyze`` (evaluate) → gate ``analyzed`` → ``implement``."""
+    process_file = tmp_path / "gated.yaml"
+    process_file.write_text(
+        yaml.dump(
+            {
+                "process": "gated",
+                "jobs": [
+                    {"name": "analyze", "type": "agent", "prompt": "analyze", "evaluate": True},
+                    {"name": "implement", "type": "agent", "prompt": "implement"},
+                ],
+                "flows": {"main": {"steps": ["analyze", "implement"]}},
+            }
+        )
+    )
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    for name in ["analyze-system", "analyze-user", "implement-system", "implement-user"]:
+        (prompts / f"{name}.md").write_text(f"Prompt: {name}\n{{title}}\n{{body}}")
+    return build_process("gated", prompts_dir=prompts, process_file=process_file)
+
+
+def test_find_step_for_gate(tmp_path):
+    main = _gated_process(tmp_path).flows["main"]
+    assert find_step_for_gate(main, "analyzed").name == "analyze"
     assert find_step_for_gate(main, "nonexistent") is None
 
 
-def test_next_dispatchable_state_gated():
-    process = build_process("full")
-    main = process.flows["main"]
-    assert next_dispatchable_state(main, "planned") == "testing"
+def test_build_main_has_no_gate_feeding_step():
+    """ADR-043 — build's ungated main flow has no gate to feed."""
+    main = build_process("build").flows["main"]
+    assert find_step_for_gate(main, "planned") is None
+
+
+def test_next_dispatchable_state_gated(tmp_path):
+    main = _gated_process(tmp_path).flows["main"]
+    assert next_dispatchable_state(main, "analyzed") == "implement"
 
 
 def test_next_dispatchable_state_already_dispatchable():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     assert next_dispatchable_state(main, "backlog") == "backlog"
 
 
 def test_next_dispatchable_state_complete():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     assert next_dispatchable_state(main, "complete") is None
 
@@ -706,7 +727,7 @@ def test_next_dispatchable_state_complete():
 def test_build_dispatch_rules_skips_non_agent_jobs(tmp_path):
     """Only agent jobs produce DispatchRules — action/monitor jobs are
     driven through other paths."""
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     rules = build_dispatch_rules(main, work_dir=tmp_path)
     # The full main flow has 7 agent jobs + 1 action + 1 monitor; only agents
@@ -716,12 +737,15 @@ def test_build_dispatch_rules_skips_non_agent_jobs(tmp_path):
     assert "wait_for_pr_signal" not in rule_names
 
 
-def test_build_dispatch_rules_standard(tmp_path):
-    process = build_process("standard")
+def test_build_dispatch_rules_fix(tmp_path):
+    """fix's agent jobs (code/review/pr-fix/resolve_conflicts) produce dispatch
+    rules; the push_pr action and monitor do not."""
+    process = build_process("fix")
     main = process.flows["main"]
     rules = build_dispatch_rules(main, work_dir=tmp_path)
-    assert len(rules) == 1
-    assert rules[0].job_type == "coding"
+    job_types = {r.job_type for r in rules}
+    assert "code" in job_types
+    assert "push_pr" not in job_types
 
 
 # ---------------------------------------------------------------------------
@@ -730,22 +754,22 @@ def test_build_dispatch_rules_standard(tmp_path):
 
 
 def test_resolve_output_target_next_returns_success_state():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     plan = next(rj for rj in main.jobs if rj.name == "plan")
-    # plan's success_state is "planned" (gate)
-    assert resolve_output_target("next", plan, main) == "planned"
+    # plan is ungated (ADR-043) — "next" is the following step's queue, ``testing``
+    assert resolve_output_target("next", plan, main) == "testing"
 
 
 def test_resolve_output_target_blocked():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     plan = next(rj for rj in main.jobs if rj.name == "plan")
     assert resolve_output_target("blocked", plan, main) == "blocked"
 
 
 def test_resolve_output_target_named_job():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     review = next(rj for rj in main.jobs if rj.name == "review")
     code = next(rj for rj in main.jobs if rj.name == "code")
@@ -754,7 +778,7 @@ def test_resolve_output_target_named_job():
 
 
 def test_resolve_output_target_unknown_routes_to_blocked():
-    process = build_process("full")
+    process = build_process("build")
     main = process.flows["main"]
     plan = next(rj for rj in main.jobs if rj.name == "plan")
     assert resolve_output_target("nonexistent_job", plan, main) == "blocked"
@@ -766,7 +790,7 @@ def test_resolve_output_target_unknown_routes_to_blocked():
 
 
 def test_full_pr_fix_needs_decision_routes_to_needs_input():
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
     needs = next(r for r in (pr_fix_binding.rules or []) if "NEEDS_DECISION" in r.pattern)
@@ -774,7 +798,7 @@ def test_full_pr_fix_needs_decision_routes_to_needs_input():
 
 
 def test_full_pr_fix_needs_decision_precedes_blocked():
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
     patterns = [r.pattern for r in (pr_fix_binding.rules or [])]
@@ -816,14 +840,16 @@ def test_output_and_inputs_parsed(tmp_path):
     assert main.jobs[2].inputs == ["spec", "plan"]
 
 
-def test_full_process_artifact_config():
-    process = build_process("full")
+def test_build_process_artifact_config():
+    """ADR-043 — build dropped the spec step and all spec/plan inputs; only
+    pr_summary still declares an output artifact (``pr_description``)."""
+    process = build_process("build")
     main = process.flows["main"]
     by_name = {s.name: s for s in main.jobs}
-    assert by_name["spec"].output == "spec"
-    assert by_name["plan"].output == "plan"
-    assert by_name["plan"].inputs == ["spec"]
-    assert by_name["code"].inputs == ["spec", "plan"]
+    assert "spec" not in by_name
+    assert by_name["plan"].output is None
+    assert by_name["pr_summary"].output == "pr_description"
+    assert all(not j.inputs for j in main.jobs)
 
 
 # ---------------------------------------------------------------------------

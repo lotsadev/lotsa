@@ -10,6 +10,7 @@ import {
   retryTask,
   stopAgent,
   acknowledgeOverride,
+  markCompleteTask,
   uploadAttachment,
 } from '@/api/tasks'
 import type { TaskDetailFull } from '@/api/types'
@@ -70,6 +71,13 @@ export function ChatInput({ data }: ChatInputProps) {
     !['complete', 'abandoned', 'archived'].includes(task.status) &&
     !['complete', 'abandoned'].includes(task.state)
 
+  // ADR-043 — the operator "Mark complete" escape hatch. Available on any
+  // non-terminal task, surfaced where it matters: a task parked awaiting the
+  // operator (``awaiting_operator``), watching a PR, or blocked — e.g. a
+  // GitHub-less run that can't reach a PR terminal on its own.
+  const canMarkComplete =
+    ['awaiting_operator', 'waiting_for_pr', 'blocked'].includes(task.status)
+
   const onSuccess = () => {
     queryClient.invalidateQueries({ queryKey: ['task', task.id] })
     setInputValue('')
@@ -120,6 +128,7 @@ export function ChatInput({ data }: ChatInputProps) {
   // runaway agent). Any pending files stay selected in the picker and go out
   // with the operator's next Send.
   const stopMutation = useMutation({ mutationFn: () => stopAgent(task.id), onSuccess })
+  const markCompleteMutation = useMutation({ mutationFn: () => markCompleteTask(task.id), onSuccess })
   // Acknowledge a fired guard: reset the guard and resume the step in one bare
   // action (no reason field — ADR-019 revised 2026-07-02). On success the task
   // query is invalidated: the new audit row appears and detect() now returns
@@ -141,6 +150,7 @@ export function ChatInput({ data }: ChatInputProps) {
     approveMutation.isPending ||
     retryMutation.isPending ||
     stopMutation.isPending ||
+    markCompleteMutation.isPending ||
     overrideMutation.isPending
 
   // After a NON_FAST_FORWARD push the orchestrator parks the task at
@@ -154,6 +164,7 @@ export function ChatInput({ data }: ChatInputProps) {
     waiting: task.is_conversational ? 'Send a message…' : 'Type to revise…',
     waiting_for_pr: 'Send PR feedback to dispatch a fix cycle…',
     needs_input: "Answer the agent's question…",
+    awaiting_operator: 'Awaiting you — Mark complete when the work is done.',
     blocked: isRebasing
       ? 'Describe how to recover the branch — e.g. rebase on main…'
       : 'Send a corrected message to resume, or Retry to re-run as-is…',
@@ -306,6 +317,14 @@ export function ChatInput({ data }: ChatInputProps) {
         </div>
       )}
 
+      {task.status === 'awaiting_operator' && (
+        <div className="mb-2 text-xs text-muted-foreground">
+          Awaiting you — the work is committed on{' '}
+          <span className="font-mono">lotsa/{task.id}</span>. Review it and click{' '}
+          <strong>Mark complete</strong> to close the task (the GitHub-less escape hatch).
+        </div>
+      )}
+
       {/* ``flex-wrap`` lets the action button group drop below the textarea on
           narrow screens instead of overflowing a single line; ``min-w-0`` on
           the textarea lets it shrink. On desktop there's room, so it stays on
@@ -331,7 +350,18 @@ export function ChatInput({ data }: ChatInputProps) {
           onChange={(e) => setInputValue(e.target.value)}
           onSubmit={submitForStatus}
           placeholder={placeholders[task.status] ?? ''}
-          disabled={isPending || task.status === 'complete' || task.status === 'abandoned'}
+          disabled={
+            isPending ||
+            task.status === 'complete' ||
+            task.status === 'abandoned' ||
+            // ``awaiting_operator`` is not a text-input state — the operator's
+            // action is the "Mark complete" button, not a typed message. The
+            // textarea stays disabled (matching ``complete``/``abandoned``) so
+            // typing + Enter/Send can't silently no-op (submitForStatus/
+            // submitDisabled have no ``awaiting_operator`` case). The static
+            // placeholder is a hint on the disabled field, like the terminal ones.
+            task.status === 'awaiting_operator'
+          }
           className="min-w-0 flex-1"
         />
         <div className="flex flex-wrap items-center gap-2">
@@ -388,6 +418,17 @@ export function ChatInput({ data }: ChatInputProps) {
               {ov.label}
             </Button>
           ))}
+          {canMarkComplete && (
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={() => markCompleteMutation.mutate()}
+              disabled={isPending}
+            >
+              Mark complete
+            </Button>
+          )}
           {canPromote && (
             <Button
               type="button"
@@ -396,7 +437,7 @@ export function ChatInput({ data }: ChatInputProps) {
               onClick={() => setPromoteOpen(true)}
               disabled={isPending}
             >
-              Promote
+              Hand off
             </Button>
           )}
         </div>

@@ -322,7 +322,7 @@ def test_retry_rejects_rebasing_with_revise_hint(tmp_path, _loop, run):
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -334,7 +334,7 @@ def test_retry_rejects_rebasing_with_revise_hint(tmp_path, _loop, run):
     try:
         task = run(
             db.create_task(
-                title="rebase-required", flow_name="full", status="blocked", current_step="push", state="rebasing"
+                title="rebase-required", flow_name="build", status="blocked", current_step="push", state="rebasing"
             )
         )
         with pytest.raises(RetryNotAllowed, match="non-fast-forward"):
@@ -930,7 +930,7 @@ def test_concurrent_push_retry_only_one_wins(tmp_path, _loop, run):
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -943,7 +943,7 @@ def test_concurrent_push_retry_only_one_wins(tmp_path, _loop, run):
         task = run(
             db.create_task(
                 title="push retry race",
-                flow_name="full",
+                flow_name="build",
                 status="blocked",
                 current_step="push",
                 # state='pushing' — task crashed mid-push, retry is the right
@@ -989,7 +989,7 @@ def test_concurrent_revise_rebasing_only_one_wins(tmp_path, _loop, run):
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1002,7 +1002,7 @@ def test_concurrent_revise_rebasing_only_one_wins(tmp_path, _loop, run):
         task = run(
             db.create_task(
                 title="rebasing race",
-                flow_name="full",
+                flow_name="build",
                 status="blocked",
                 current_step="push",
                 state="rebasing",
@@ -1079,7 +1079,7 @@ def test_revise_rebasing_dispatches_pr_fix_agent(tmp_path, _loop, run):
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1093,7 +1093,7 @@ def test_revise_rebasing_dispatches_pr_fix_agent(tmp_path, _loop, run):
         task = run(
             db.create_task(
                 title="rebase recover",
-                flow_name="full",
+                flow_name="build",
                 status="blocked",
                 current_step="push_pr",
                 state="rebasing",
@@ -1136,7 +1136,7 @@ def test_concurrent_transition_task_only_one_writes_audit_message(tmp_path, _loo
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1149,7 +1149,7 @@ def test_concurrent_transition_task_only_one_writes_audit_message(tmp_path, _loo
         task = run(
             db.create_task(
                 title="transition race",
-                flow_name="full",
+                flow_name="build",
                 status="waiting_for_pr",
                 current_step="push",
                 # ADR-014 Layer A renamed the monitor's state from the
@@ -1203,7 +1203,7 @@ def test_concurrent_revise_waiting_for_pr_only_one_records_feedback(tmp_path, _l
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1216,7 +1216,7 @@ def test_concurrent_revise_waiting_for_pr_only_one_records_feedback(tmp_path, _l
         task = run(
             db.create_task(
                 title="waiting_for_pr race",
-                flow_name="full",
+                flow_name="build",
                 status="waiting_for_pr",
                 current_step="push",
                 state="waiting_for_pr",
@@ -1284,7 +1284,7 @@ def test_revise_loses_to_transition_task_no_orphan_feedback(tmp_path, _loop, run
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
-        flow="full",
+        flow="build",
         model="sonnet",
         budget=5.0,
     )
@@ -1297,7 +1297,7 @@ def test_revise_loses_to_transition_task_no_orphan_feedback(tmp_path, _loop, run
         task = run(
             db.create_task(
                 title="orphan race",
-                flow_name="full",
+                flow_name="build",
                 status="waiting_for_pr",
                 current_step="push",
                 # ADR-014 Layer A: monitor state renamed; status unchanged.

@@ -596,7 +596,7 @@ class TestConflictsResolvedMarkerRouting:
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -745,7 +745,7 @@ class TestResolveConflictsNeedsInputEscalation:
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -958,7 +958,7 @@ class TestAnswerRedispatchesResolveConflicts:
         config = LotsaConfig(
             data_dir=tmp_path / "data",
             work_dir=tmp_path,
-            flow="full",
+            flow="build",
             model="sonnet",
             budget=5.0,
         )
@@ -1236,7 +1236,7 @@ def test_resolve_conflicts_monitor_entry_edge_in_main_sm():
     Pre-fix failure: ``resolve_conflicts`` job doesn't exist in the process,
     so ``resolving_conflicts`` is not a known state; the edge is absent.
     """
-    process = build_process("full")
+    process = build_process("build")
     main_sm = process.flows["main"].state_machine
     resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None, (
@@ -1257,7 +1257,7 @@ def test_resolve_conflicts_monitor_entry_edge_in_pr_fix_sm():
     Pre-fix failure: even if main's SM carries the edge, pr_fix's SM won't,
     so the transition guard silently no-ops.
     """
-    process = build_process("full")
+    process = build_process("build")
     pr_fix_sm = process.flows["pr_fix"].state_machine
     resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None, "resolve_conflicts must be in pr_fix sub-flow"
@@ -1279,7 +1279,7 @@ def test_pr_fixing_to_resolving_conflicts_edge_in_pr_fix_sm():
     step between them would change pr-fix's success_state and drop this edge.
     This test protects that invariant.
     """
-    process = build_process("full")
+    process = build_process("build")
     pr_fix_sm = process.flows["pr_fix"].state_machine
     assert ("pr-fixing", "resolving_conflicts") in pr_fix_sm.transitions, (
         "pr_fix SM must have ('pr-fixing', 'resolving_conflicts'). "
@@ -1294,7 +1294,7 @@ def test_conflicts_resolved_rule_edge_in_sm():
 
     Pre-fix failure: no rule → no edge registered by _build_state_machine.
     """
-    process = build_process("full")
+    process = build_process("build")
     resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None, "resolve_conflicts must exist in pr_fix"
 
@@ -1318,13 +1318,13 @@ def test_full_process_has_resolve_conflicts_job():
 
     Pre-fix failure: it's not in full/process.yaml.
     """
-    process = build_process("full")
+    process = build_process("build")
     names = [j.name for j in process.jobs]
     assert "resolve_conflicts" in names, f"resolve_conflicts must be in full process jobs. Got: {names}"
 
 
 def test_full_process_resolve_conflicts_is_agent_type():
-    process = build_process("full")
+    process = build_process("build")
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert job.type == "agent", f"resolve_conflicts must be type=agent, got {job.type!r}"
 
@@ -1332,7 +1332,7 @@ def test_full_process_resolve_conflicts_is_agent_type():
 def test_full_process_resolve_conflicts_has_commit_posthook():
     """The ``commit`` posthook must be declared so the orchestrator
     completes the merge commit deterministically after the agent edits."""
-    process = build_process("full")
+    process = build_process("build")
     # The job-level posthooks are on the raw Job; resolve through process.jobs.
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert "commit" in (job.posthooks or []), (
@@ -1341,7 +1341,7 @@ def test_full_process_resolve_conflicts_has_commit_posthook():
 
 
 def test_full_process_resolve_conflicts_has_no_model():
-    process = build_process("full")
+    process = build_process("build")
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert job.model is None, (
         f"resolve_conflicts must not pin a model (bundled process ships no per-step models — "
@@ -1350,7 +1350,7 @@ def test_full_process_resolve_conflicts_has_no_model():
 
 
 def test_full_process_resolve_conflicts_has_resume():
-    process = build_process("full")
+    process = build_process("build")
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert job.resume_session is True, (
         "resolve_conflicts must have resume=true so the agent can continue a session "
@@ -1360,7 +1360,7 @@ def test_full_process_resolve_conflicts_has_resume():
 
 def test_full_process_pr_fix_flow_contains_resolve_conflicts():
     """``resolve_conflicts`` must appear in the ``pr_fix`` sub-flow's bindings."""
-    process = build_process("full")
+    process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     names = [b.name for b in pr_fix.bindings]
     assert "resolve_conflicts" in names, (
@@ -1371,7 +1371,7 @@ def test_full_process_pr_fix_flow_contains_resolve_conflicts():
 def test_full_process_resolve_conflicts_has_conflicts_resolved_rule():
     """``resolve_conflicts`` must declare a ``CONFLICTS_RESOLVED:`` output rule
     routing to ``pr-fix``."""
-    process = build_process("full")
+    process = build_process("build")
     # The per-flow rule override in the pr_fix binding takes precedence, but the
     # job-level default is also acceptable. Check the resolved FlowStep via the
     # pr_fix flow's job list.
@@ -1395,7 +1395,7 @@ def test_full_process_pr_fix_binding_is_still_first():
 
     Adding resolve_conflicts must NOT reorder pr-fix away from position 0.
     """
-    process = build_process("full")
+    process = build_process("build")
     first_binding = process.flows["pr_fix"].bindings[0]
     assert first_binding.name == "pr-fix", (
         f"pr-fix must remain bindings[0] of pr_fix. Got bindings[0].name={first_binding.name!r}. "
@@ -1415,7 +1415,7 @@ def test_full_process_wait_for_pr_signal_has_merge_conflict_trigger():
 
     Pre-fix failure: the trigger isn't in full/process.yaml's monitor config.
     """
-    process = build_process("full")
+    process = build_process("build")
     monitor_job = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     triggers = monitor_job.config.get("triggers", []) if hasattr(monitor_job, "config") else []
     assert "merge_conflict" in triggers, (
@@ -1430,7 +1430,7 @@ def test_full_process_monitor_config_parses_merge_conflict_trigger():
 
     Pre-fix failure: parse_config raises ValueError on the unknown trigger.
     """
-    process = build_process("full")
+    process = build_process("build")
     monitor_job = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     raw_config = dict(monitor_job.config) if hasattr(monitor_job, "config") else {}
     # Should not raise.

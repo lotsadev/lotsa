@@ -46,62 +46,49 @@ States depend on the active process (see [Processes](#processes) below).
 
 ## Processes
 
-A **process** is the full job catalog — every step a task can take, plus the flows that string them together. Lotsa ships five bundled processes; you can also define your own inline in `lotsa.yaml` or as standalone `process.yaml` files.
+A **process** is the full job catalog — every step a task can take, plus the flows that string them together. Lotsa ships three bundled processes on a two-phase **Think→Execute** axis (ADR-043); you can also define your own inline in `lotsa.yaml` or as standalone `process.yaml` files.
 
-New tasks default to `chat` (ADR-034): a fresh `lotsa serve` opens a task as a conversation you grow from, then **promote** into a structured process (`full`, `quickfix`, …) when you know what you're building. The whole bundled catalog plus every inline process is always loaded, so each one is pickable per-task in the new-task picker and a valid promotion target — `--process <name>` / `--flow <name>` (or `lotsa.yaml`'s `flow:` field, or an inline entry's `default: true`) only chooses **which process the picker pre-selects** as the default. Pass `--flow full` to make full the default for an operator who always builds; drop the flag for chat-first.
+New tasks default to `chat` (ADR-034): a fresh `lotsa serve` opens a task as a conversation you grow from, then **hand off** into an Execute process (`build` / `fix`) when you know what you're building. The whole bundled catalog plus every inline process is always loaded, so each one is pickable per-task in the new-task mode switcher and a valid handoff target — `--process <name>` / `--flow <name>` (or `lotsa.yaml`'s `flow:` field, or an inline entry's `default: true`) only chooses **which process the picker pre-selects** as the default. Pass `--flow build` to make Build the default for an operator who always builds; drop the flag for chat-first.
+
+The handoff from Think (`chat`) to Execute (`build`/`fix`) is one-way — the worktree and history carry over, but there's no return to chat — while a running Execute task stays steerable via revision feedback and `NEEDS_INPUT`.
 
 ### Bundled processes
 
-#### `chat` (default) — explore and triage
+#### `chat` (default) — Think: explore and triage
 
 ```
-backlog → chatting (conversational) → promote into another process
+backlog → chatting (conversational) → hand off into an Execute process
 ```
 
-A single conversational step, no completion marker and no commit pressure. New tasks start here out of the box: discuss the work with the agent, and when you're ready, **promote** the task into a structured process (`full`, `quickfix`, `standard`, `simple`) — the worktree and history carry over. This is the zero-config default.
+A single conversational step: no completion marker, no commit pressure, and it never writes implementation code. New tasks start here out of the box: discuss the work with the agent — and, on request, have it distill a concise spec into the conversation — then, when you're ready, **hand off** the task into `build` or `fix`. The worktree and history carry over. This is the zero-config default.
 
-#### `simple` — implement only
-
-```
-backlog → coding → complete | blocked
-```
-
-Agent implements the task directly in the working directory. No branching, no committing. Good for quick scripts or learning.
-
-#### `standard` — branch, implement, commit
+#### `build` — Execute (full depth): plan, test, code, review, verify, PR loop
 
 ```
-backlog → coding → complete | blocked
+backlog → planning → testing → coding → reviewing → verifying → summarizing → push_pr → wait_for_pr_signal → complete | blocked
 ```
 
-Agent creates a feature branch, implements the task, runs validation (lint/test), commits, and reports a summary. A good middle ground for real development work; pick it with `--flow standard`.
+Full SDLC discipline, run autonomously — the task body (or a spec carried from chat) is the brief; there is no separate spec/plan gate (ADR-043 dropped it):
 
-#### `full` — spec, plan, test, code, review, verify, PR loop
+1. **Plan** — agent reads the codebase and writes an implementation plan. Ungated — it auto-advances to the next step (no human approval gate)
+2. **Test** — agent writes failing tests (resumes same session)
+3. **Code** — agent implements to make tests pass (resumes same session)
+4. **Review** — agent reviews the diff independently (fresh session, no implementation bias)
+5. **Verify** — conversational; agent walks through what was built before the PR
+6. **PR summary** — agent writes the PR title/body from the branch diff
+7. **Push & monitor** — the `push_pr` action job opens the PR, then the `wait_for_pr_signal` monitor polls GitHub. Reviewer comments and failing checks dispatch a `pr_fix` sub-flow that re-runs review and pushes again until merged
 
-```
-backlog → speccing → planning → planned (human gate) → testing → coding → reviewing → verifying → push_pr → wait_for_pr_signal → complete | blocked
-```
-
-Six agent-dispatched steps plus a human gate and an automated PR-monitoring phase:
-
-1. **Spec** — conversational; agent and operator iterate on the task description until the agent emits `SPEC_COMPLETE: <title>`. The resulting spec is persisted as a `spec` artifact for downstream steps to consume
-2. **Plan** — agent reads codebase, creates feature branch, writes implementation plan
-3. **Approve** — human reviews the plan in the dashboard and approves it
-4. **Test** — agent writes failing tests (resumes same session)
-5. **Code** — agent implements to make tests pass (resumes same session)
-6. **Review** — agent reviews the diff independently (fresh session, no implementation bias)
-7. **Verify** — conversational; agent walks through what was built and confirms it matches the spec before opening the PR
-8. **Push & monitor** — the `push_pr` action job opens the PR, then the `wait_for_pr_signal` monitor polls GitHub. Reviewer comments and failing checks dispatch a `pr_fix` sub-flow that re-runs review and pushes again until merged
-
-The `planned` state is a **human gate** — no dispatch rule targets it. The task waits in the dashboard until you approve or reject it.
-
-#### `quickfix` — execute a precise instruction
+#### `fix` — Execute (shallow depth): execute a precise instruction
 
 ```
-backlog → coding → reviewing → complete | blocked
+backlog → coding → reviewing → push_pr → wait_for_pr_signal → complete | blocked
 ```
 
-For a mechanical change you've already decided on (status bumps, typo fixes, renames, config/dependency tweaks): the coder executes the instruction directly — no spec, no plan, no test-writing — and review checks the diff against that instruction. A common promotion target from `chat` when the conversation lands on a small, well-defined edit.
+For a mechanical change you've already decided on (status bumps, typo fixes, renames, config/dependency tweaks): the coder executes the instruction directly — no spec, no plan, no test-writing — and review checks the diff against that instruction. It then opens a PR and watches it to terminal, the same as `build`. A common handoff target from `chat` when the conversation lands on a small, well-defined edit.
+
+#### No GitHub? The mark-complete escape hatch
+
+Both Execute processes push to a remote and open a PR by default. When no GitHub token is configured, the push parks the task at **`awaiting_operator`** ("Awaiting you") with the code committed on `lotsa/<task_id>` — review the worktree and click **Mark complete** to close it out.
 
 ### Custom processes
 
@@ -273,7 +260,7 @@ Lives at `~/.lotsa/lotsa.yaml` by default (alongside `lotsa.db` and the per-task
 model: sonnet                 # claude model
 budget: 5.0                   # max USD per agent run
 # max_output_tokens: 128000   # cap per response — uncomment to raise the 32000 default
-flow: chat                    # default-selected process: bundled name (chat/simple/standard/full/quickfix) or an inline process name. The full catalog always loads; this only sets the picker's pre-selected default
+flow: chat                    # default-selected process: bundled name (chat/build/fix) or an inline process name. The full catalog always loads; this only sets the picker's pre-selected default
 prompts_dir: prompts/         # custom prompt templates (optional)
 # resume_cap: 2               # ADR-040 — max auto-resume attempts per task on restart before falling back to `blocked`
 # shutdown_grace_seconds: 30  # ADR-040 — bounded window shutdown() waits for in-flight agents to drain before cancelling
@@ -373,7 +360,7 @@ Start the dashboard. Reads `lotsa.yaml` from `--data-dir` (default `~/.lotsa`). 
 
 ```bash
 lotsa serve                                # dashboard on 127.0.0.1:8420
-lotsa serve --flow full                    # use the bundled full process
+lotsa serve --flow build                   # use the bundled Build (Execute) process
 lotsa serve --process marketing            # use an inline process from lotsa.yaml
 lotsa serve --flow-file my.yaml            # use a standalone process.yaml
 lotsa serve --model opus                   # use a specific model
@@ -389,7 +376,7 @@ lotsa serve --config /path/lotsa.yaml      # explicit config file
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--flow` | `standard` | Active process — a bundled name (`simple`/`standard`/`full`) or any inline name from `lotsa.yaml`'s `processes:` block |
+| `--flow` | `chat` | Process the new-task picker pre-selects — a bundled name (`chat`/`build`/`fix`) or any inline name from `lotsa.yaml`'s `processes:` block. The full catalog always loads; this only sets the default, it doesn't restrict what's available |
 | `--process` | — | Alias for `--flow`; either works |
 | `--flow-file` | — | Standalone `process.yaml` file (highest priority — overrides `--flow`/`--process` and inline `default: true`) |
 | `--model` | `sonnet` | Claude model name |

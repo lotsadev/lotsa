@@ -2,6 +2,7 @@ export type TaskStatus =
   | 'working'
   | 'waiting'
   | 'waiting_for_pr'
+  | 'awaiting_operator'
   | 'needs_input'
   | 'blocked'
   | 'complete'

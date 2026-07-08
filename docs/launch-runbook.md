@@ -62,11 +62,11 @@ lotsa serve --data-dir ~/tmp/lotsa-data
 
 ### 4. Chat-first task (no git needed)
 - [ ] New task → defaults to **chat**; send a message, get a reply, watch the **Activity tab** stream live tool calls.
-- [ ] **Promote** the chat task to `quickfix` or `standard` → it picks up the structured flow.
+- [ ] **Hand off** the chat task to `build` or `fix` → it picks up the structured Execute flow.
 
 ### 5. Structured flow → PR (needs `GITHUB_TOKEN` + repo)
-- [ ] Create a `standard`/`full` task like *“add a CONTRIBUTORS.md with one line”* against the throwaway repo.
-- [ ] Watch it branch → implement → **commit** (orchestrator-owned) → approve any gate → **push** → **PR opens**.
+- [ ] Create a `build`/`fix` task like *“add a CONTRIBUTORS.md with one line”* against the throwaway repo.
+- [ ] Watch it implement → **commit** (orchestrator-owned) → **push** → **PR opens** (the orchestrator owns the branch; the agent never branches, and `build`'s plan is ungated — no approval gate).
 - [ ] Leave a review comment on the PR → the **PR monitor** picks it up and dispatches a fix round.
 
 ### 6. Docker runner

@@ -1,0 +1,122 @@
+process: fix
+description: |
+  Execute at shallow depth. A mechanical, pre-decided change (status bumps, typo
+  fixes, renames, config tweaks, dependency bumps): no design conversation, no
+  test writing. The coder executes a precise instruction; review checks the diff
+  against that instruction, not the broad architectural checklist. Then it opens
+  a PR and watches it to terminal. Reach it from chat via the "Quick fix"
+  handoff, or select it directly.
+promotion_inputs:
+  - name: instruction
+    description: The mechanical change the operator wants applied.
+jobs:
+  - name: code
+    type: agent
+    prompt: coding
+    queue_state: coding
+    active_state: coding
+    posthooks: [commit]
+
+  # ``review``/``pr-fix``/``resolve_conflicts`` reuse the generic prompts via
+  # the fix → build fallback in ``_resolve_prompts_search_paths`` — fix ships
+  # only its distinctive ``coding`` prompt (the "execute this instruction"
+  # framing). Routing lives at the flow-step level below (per-flow overrides
+  # take precedence over job defaults — see lotsa/CLAUDE.md).
+  - name: review
+    type: agent
+    prompt: review
+    queue_state: reviewing
+    active_state: reviewing
+
+  - name: pr-fix
+    type: agent
+    prompt: pr-fix
+    resume: true
+    queue_state: pr-fixing
+    active_state: pr-fixing
+    posthooks: [commit]
+    rules:
+      - source: stdout
+        pattern: "^PR_FIX_DONE:"
+        target: review
+      - source: stdout
+        pattern: "^PR_FIX_NEEDS_DECISION:"
+        target: needs_input
+      - source: stdout
+        pattern: "^PR_FIX_BLOCKED:"
+        target: blocked
+      - source: stdout
+        pattern: "^PR_FIX_SKIPPED:"
+        target: wait_for_pr_signal
+
+  - name: push_pr
+    type: action
+    tool: push_pr
+
+  - name: resolve_conflicts
+    type: agent
+    prompt: resolve_conflicts
+    resume: true
+    queue_state: resolving_conflicts
+    active_state: resolving_conflicts
+    posthooks: [commit]
+    rules:
+      - source: stdout
+        pattern: "^CONFLICTS_RESOLVED:"
+        target: pr-fix
+
+  - name: wait_for_pr_signal
+    type: monitor
+    engine: pr_monitor
+    config:
+      poll_interval_seconds: 30
+      debounce_seconds: 120
+      triggers: [human_comment, bot_comment, review_decision, failing_check, merge_conflict]
+      max_pr_fix_rounds: 10
+      max_consecutive_skipped: 3
+
+flows:
+  main:
+    steps:
+      - code
+      - name: review
+        rules:
+          - source: stdout
+            pattern: "^REVIEW_PASS"
+            target: next
+          - source: stdout
+            pattern: "^REVIEW_FAIL"
+            target: code
+      - push_pr
+      - wait_for_pr_signal
+
+  pr_fix:
+    steps:
+      - name: pr-fix
+        rules:
+          - source: stdout
+            pattern: "^PR_FIX_DONE:"
+            target: review
+          - source: stdout
+            pattern: "^PR_FIX_NEEDS_DECISION:"
+            target: needs_input
+          - source: stdout
+            pattern: "^PR_FIX_BLOCKED:"
+            target: blocked
+          - source: stdout
+            pattern: "^PR_FIX_SKIPPED:"
+            target: wait_for_pr_signal
+      - name: resolve_conflicts
+        rules:
+          - source: stdout
+            pattern: "^CONFLICTS_RESOLVED:"
+            target: pr-fix
+      - name: review
+        rules:
+          - source: stdout
+            pattern: "^REVIEW_PASS"
+            target: next
+          - source: stdout
+            pattern: "^REVIEW_FAIL"
+            target: pr-fix
+      - push_pr

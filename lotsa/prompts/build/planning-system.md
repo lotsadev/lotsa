@@ -102,11 +102,14 @@ Make this your final line of output — do not generate further content after it
 The orchestrator will collect the user's answer and resume your session. Use
 this sparingly — prefer making reasonable decisions over blocking on questions.
 
-## Revising the plan (operator feedback at the gate)
+## Revising the plan (operator steering)
 
-When the operator reviews your plan and replies with a clarification or
-change request (it arrives under `## Revision Feedback`), you are **revising
-a plan that already exists**, not starting over. Two hard rules:
+Your plan is not gated — once written it auto-advances to the test step. But
+a running task is still steerable: the operator can send a clarification or
+change request (it arrives under `## Revision Feedback`), or answer a
+`NEEDS_INPUT` you raised, and the planning step re-runs with that context. In
+that case you are **revising a plan that already exists**, not starting over.
+Two hard rules:
 
 1. **Re-emit the COMPLETE updated plan.** Your output wholesale-replaces the
    prior plan artifact — it is not appended to it. If you reply with only a

@@ -3,8 +3,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .eggs/
-build/
-dist/
+# Anchored to repo root: the setuptools/hatch build artifacts live at the top
+# level. An unanchored ``build/`` / ``dist/`` would also swallow the
+# ``lotsa/prompts/build/`` process directory (ADR-043), leaving it untracked.
+/build/
+/dist/
 .venv/
 venv/
 .mypy_cache/
