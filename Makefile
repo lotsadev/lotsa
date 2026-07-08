@@ -26,7 +26,11 @@ build:
 # Contributor convenience: build the dashboard-bundled wheel and deploy it via
 # the CLI's --wheel override (so the box runs your local build, not PyPI).
 # Reads ./deploy.yaml for the host + config, same as a pip user.
-deploy: build
+# Rebuild the dashboard bundle first (frontend), then the wheel (build); the
+# recursive $(MAKE) calls keep the order deterministic even under `make -j`.
+deploy:
+	$(MAKE) frontend
+	$(MAKE) build
 	lotsa deploy --wheel $$(ls dist/lotsa-*.whl)
 
 # ---------------------------------------------------------------------------
