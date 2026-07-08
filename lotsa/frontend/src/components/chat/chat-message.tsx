@@ -51,16 +51,10 @@ const LARGE_CONTENT_THRESHOLD = 10_000 // chars
 // `[&_a]:break-words` wraps long link text. Wide tables are wrapped in a scroll
 // container by MARKDOWN_COMPONENTS below.
 //
-// R5 — the `@tailwindcss/typography` plugin (enabled for headings/lists/tables)
-// also restyles `code`/`pre`, which broke chat code blocks: it wraps inline
-// `code` in literal backtick `::before`/`::after` quotes, colours `pre code`
-// with the near-white `--tw-prose-pre-code` (unreadable on the light `bg-muted`
-// we set), sizes `pre code` from prose's own `pre` rule instead of the compact
-// code size, and adds large vertical `pre` margins. The overrides below
-// re-assert the pre-plugin look for code (higher-specificity `[&_pre_code]` /
-// `[&_pre]` selectors win over the plugin's zero-specificity `:where()` rules):
-// strip the backticks, force the readable `text-foreground` colour, pin the
-// compact `text-xs` size, and drop the extra margins.
+// R5 — the `@tailwindcss/typography` plugin restyles `code`/`pre` (backtick
+// quotes on inline code; light `--tw-prose-pre-code` grey, unreadable on our
+// light `bg-muted`); the higher-specificity `[&_code]`/`[&_pre]` overrides below
+// re-assert the readable pre-plugin look.
 const PROSE_CLASSES = "prose prose-sm dark:prose-invert max-w-none break-words [overflow-wrap:anywhere] [&_h1]:text-lg [&_h1]:font-bold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_h4]:text-sm [&_h4]:font-medium [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-xs [&_code]:font-normal [&_code]:before:content-none [&_code]:after:content-none [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_pre]:my-2 [&_pre]:text-foreground [&_pre]:overflow-x-auto [&_pre]:max-w-full [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-xs [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_a]:text-primary [&_a]:underline [&_a]:break-words"
 
 // R1 — wide tables scroll horizontally inside their own container rather than
