@@ -37,7 +37,7 @@ function makeTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
     timeout_status: 'ok',
     metadata: {},
     body: '',
-    flow_name: 'full',
+    flow_name: 'build',
     work_dir: '/tmp/worktrees/abc123',
     project_name: 'lotsa',
     project_path: '/repos/lotsa',
@@ -46,7 +46,7 @@ function makeTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
 }
 
 const flow: Flow = {
-  name: 'full',
+  name: 'build',
   steps: [
     {
       name: 'code',
@@ -105,6 +105,21 @@ describe('ChatInput action row reflow', () => {
   it('still renders the Send control', () => {
     const { getByRole } = renderChatInput()
     expect(getByRole('button', { name: 'Send' })).toBeInTheDocument()
+  })
+})
+
+describe('ChatInput hand-off gating (ADR-043)', () => {
+  // The Hand off button is the one-way Think→Execute gesture: it shows only
+  // while the task is in the chat (Think) process and disappears once handed
+  // off to build/fix (no build↔fix re-routing surfaced from the UI).
+  it('shows Hand off while the task is still in the chat (Think) process', () => {
+    const { getByRole } = renderChatInput(makeData({ flow_name: 'chat' }))
+    expect(getByRole('button', { name: 'Hand off' })).toBeInTheDocument()
+  })
+
+  it('hides Hand off once the task has been handed off to an Execute process', () => {
+    const { queryByRole } = renderChatInput(makeData({ flow_name: 'build' }))
+    expect(queryByRole('button', { name: 'Hand off' })).toBeNull()
   })
 })
 
