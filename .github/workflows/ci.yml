@@ -2,12 +2,36 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "lotsa/**"
   pull_request:
+
+# Lotsa pushes/rebases a task branch repeatedly during a task; without this
+# block each push would stack a redundant run. Group on the ref and cancel any
+# in-progress run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A `lotsa/**` task-branch push already runs CI on the exact commit (see
+    # the `push` filter above). Its `pull_request` event would then run a
+    # second, redundant time — and because the two events land in *different*
+    # concurrency groups (`refs/heads/...` vs `refs/pull/N/merge`),
+    # cancel-in-progress can't dedupe them, doubling CI minutes. So skip the
+    # pull_request run only when it's redundant: a same-repo head whose branch
+    # the `push` trigger already covers (`lotsa/**`). Every other case still
+    # runs the pull_request job — fork PRs (whose head push never reaches the
+    # base repo) and same-repo PRs from branches *outside* the push filter
+    # (e.g. a human `fix-ci` branch), which `push` would otherwise not cover at
+    # all, leaving them with no CI.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !startsWith(github.head_ref, 'lotsa/')
     steps:
       - uses: actions/checkout@v4
 
@@ -26,15 +50,44 @@ jobs:
         working-directory: lotsa/frontend
         run: npm ci && npm run build
 
+      # Frontend lint/typecheck currently have a pre-existing backlog (e.g.
+      # react-hooks/set-state-in-effect in use-mobile, a TaskDetail optional
+      # mismatch in stage-bar.test.tsx). Run them for visibility but don't fail
+      # the build until the baseline is cleaned up in a dedicated PR — otherwise
+      # every task branch goes red on errors it didn't introduce. `npm run test`
+      # (vitest) is clean, so it stays a hard gate.
+      - name: Lint (frontend)
+        working-directory: lotsa/frontend
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Type check (frontend)
+        working-directory: lotsa/frontend
+        run: npm run typecheck
+        continue-on-error: true
+
+      - name: Test (frontend)
+        working-directory: lotsa/frontend
+        run: npm run test
+
       - name: Configure git identity (some tests create commits)
         run: |
           git config --global user.email "ci@lotsa.dev"
           git config --global user.name "Lotsa CI"
 
-      - name: Lint
+      - name: Lint (Python)
         run: |
           ruff check .
           ruff format --check .
 
-      - name: Test
+      # mypy has a large pre-existing error baseline (~83 errors across the
+      # tree, the bulk in modules untouched here). Run it for visibility but
+      # don't fail the build until the baseline is driven to zero in a dedicated
+      # cleanup PR — a required gate that's red on day one blocks every task
+      # branch and trains everyone to ignore it. Flip to a hard gate once clean.
+      - name: Type check (mypy)
+        run: mypy lotsa/ rigg/
+        continue-on-error: true
+
+      - name: Test (Python)
         run: pytest lotsa/tests rigg/tests
