@@ -143,20 +143,36 @@ def test_concurrency_cancels_in_progress(ci_config):
 
 
 def test_same_repo_pull_request_run_is_deduped(ci_config):
-    """A same-repo PR must not run CI twice (once via push, once via PR).
+    """A same-repo `lotsa/**` PR must not run CI twice (once via push, once via PR).
 
-    For a `lotsa/**` task branch (or any human PR opened from a branch in this
-    repo) the `push` event already runs CI on the exact commit. The two events
-    land in different `concurrency` groups (`refs/heads/...` vs
-    `refs/pull/N/merge`), so `cancel-in-progress` can't dedupe them — the job
-    itself must be guarded to skip the redundant `pull_request` run for
-    same-repo heads while still running for forks (whose branch push never
-    reaches the base repo).
+    For a `lotsa/**` task branch the `push` event already runs CI on the exact
+    commit. The two events land in different `concurrency` groups
+    (`refs/heads/...` vs `refs/pull/N/merge`), so `cancel-in-progress` can't
+    dedupe them — the job itself must be guarded to skip the redundant
+    `pull_request` run for same-repo heads while still running for forks (whose
+    branch push never reaches the base repo).
     """
     guard = str(ci_config["jobs"]["test"].get("if", ""))
     assert "pull_request" in guard, f"test job has no pull_request dedup guard: {guard!r}"
     assert "head.repo.full_name" in guard and "github.repository" in guard, (
         f"test job guard doesn't compare PR head repo against the base repo: {guard!r}"
+    )
+
+
+def test_same_repo_pull_request_dedup_is_scoped_to_push_covered_branches(ci_config):
+    """The dedup skip must be scoped to branches the `push` trigger covers.
+
+    The `push` trigger only fires on `main` and `lotsa/**`. If the guard skips
+    the `pull_request` run for *every* same-repo head, a same-repo PR from a
+    branch outside that filter (e.g. a human `fix-ci` branch) gets neither a
+    `push` run nor a `pull_request` run — no CI at all. The guard must therefore
+    reference the `lotsa/`-branch scope (via `github.head_ref`) so only
+    push-covered same-repo heads are skipped.
+    """
+    guard = str(ci_config["jobs"]["test"].get("if", ""))
+    assert "head_ref" in guard and "lotsa/" in guard, (
+        f"test job guard skips ALL same-repo PRs; it must scope the skip to push-covered "
+        f"`lotsa/` branches so other same-repo PRs still run CI: {guard!r}"
     )
 
 
