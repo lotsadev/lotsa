@@ -62,7 +62,7 @@ def service_ctx(run, tmp_path: Path, *, runner=None, flow: str = "custom"):
 
     ``flow="custom"`` uses the single agent step ``coding`` (evaluate gate) so
     ``create_task`` dispatches a normal agent step. Any other value is treated
-    as a bundled preset name (e.g. ``"full"``) whose richer state machine the
+    as a bundled preset name (e.g. ``"build"``) whose richer state machine the
     invariant tests introspect for ``blocked`` / ``complete`` edges.
     """
     if flow == "custom":
@@ -281,7 +281,7 @@ class TestChatTornState:
         """send_message on a ``(blocked, blocked)`` task re-anchors to the step's
         queue_state (a dispatchable entry) and dispatches — never leaving the
         torn ``(working, blocked)``."""
-        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+        with service_ctx(run, tmp_path, flow="build") as (svc, db):
 
             async def _t():
                 task = await db.create_task(
@@ -312,7 +312,7 @@ class TestChatTornState:
     def test_send_message_on_stop_parked_task_keeps_active_state(self, tmp_path, run):
         """A stop()-parked task sits on its ACTIVE state (dispatchable via the
         self-loop) — send_message must dispatch from there unchanged, not re-route."""
-        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+        with service_ctx(run, tmp_path, flow="build") as (svc, db):
 
             async def _t():
                 task = await db.create_task(
@@ -339,7 +339,7 @@ class TestChatTornState:
     def test_stop_clears_torn_working_blocked_row(self, tmp_path, run):
         """stop() on a ``(working, blocked)`` row with no in-flight agent parks it
         to a consistent ``(blocked, blocked)`` instead of raising StopNotAllowed."""
-        with service_ctx(run, tmp_path, flow="full") as (svc, db):
+        with service_ctx(run, tmp_path, flow="build") as (svc, db):
 
             async def _t():
                 task = await db.create_task(
@@ -587,7 +587,7 @@ class TestArchivedInvariant:
             async def _t():
                 transitions = svc.flow.state_machine.transitions
                 complete_srcs = [src for (src, dst) in transitions if dst == "complete" and src != "complete"]
-                assert complete_srcs, "test setup: full flow should have an edge into 'complete'"
+                assert complete_srcs, "test setup: build flow should have an edge into 'complete'"
                 state = complete_srcs[0]
 
                 task = await db.create_task("Archived w/ edge", flow_name="build", state=state, status="archived")
@@ -607,7 +607,7 @@ class TestArchivedInvariant:
             async def _t():
                 transitions = svc.flow.state_machine.transitions
                 blocked_srcs = [src for (src, dst) in transitions if dst == "blocked" and src != "blocked"]
-                assert blocked_srcs, "test setup: full flow should have an edge into 'blocked'"
+                assert blocked_srcs, "test setup: build flow should have an edge into 'blocked'"
                 state = blocked_srcs[0]
 
                 task = await db.create_task("Archived blockable", flow_name="build", state=state, status="archived")
@@ -627,7 +627,7 @@ class TestArchivedInvariant:
 
             async def _t():
                 jobs = svc.flow.jobs
-                assert len(jobs) >= 2, "test setup: full flow should have multiple jobs"
+                assert len(jobs) >= 2, "test setup: build flow should have multiple jobs"
                 start_state = jobs[0].queue_state
                 target_name = jobs[1].name
 
