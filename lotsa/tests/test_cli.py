@@ -72,11 +72,19 @@ def test_init_does_not_write_data_dir_in_yaml(tmp_path):
 
 
 def test_version():
-    """--version flag works."""
+    """--version reports the installed package version.
+
+    Assert against the same source the CLI reads — ``@click.version_option(
+    package_name="lotsa")`` resolves via ``importlib.metadata`` — so a version
+    bump never silently breaks this test (hardcoding the number just re-arms the
+    same trap on the next release).
+    """
+    from importlib.metadata import version
+
     runner = CliRunner()
     result = runner.invoke(cli, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert version("lotsa") in result.output
 
 
 # --- lotsa build ---
