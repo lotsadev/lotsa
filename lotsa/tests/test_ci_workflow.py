@@ -142,6 +142,24 @@ def test_concurrency_cancels_in_progress(ci_config):
     assert ci_config["concurrency"].get("cancel-in-progress") is True, "concurrency.cancel-in-progress must be true"
 
 
+def test_same_repo_pull_request_run_is_deduped(ci_config):
+    """A same-repo PR must not run CI twice (once via push, once via PR).
+
+    For a `lotsa/**` task branch (or any human PR opened from a branch in this
+    repo) the `push` event already runs CI on the exact commit. The two events
+    land in different `concurrency` groups (`refs/heads/...` vs
+    `refs/pull/N/merge`), so `cancel-in-progress` can't dedupe them — the job
+    itself must be guarded to skip the redundant `pull_request` run for
+    same-repo heads while still running for forks (whose branch push never
+    reaches the base repo).
+    """
+    guard = str(ci_config["jobs"]["test"].get("if", ""))
+    assert "pull_request" in guard, f"test job has no pull_request dedup guard: {guard!r}"
+    assert "head.repo.full_name" in guard and "github.repository" in guard, (
+        f"test job guard doesn't compare PR head repo against the base repo: {guard!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Criterion 3 — the new checks run (frontend lint/typecheck/vitest + mypy)
 # ---------------------------------------------------------------------------

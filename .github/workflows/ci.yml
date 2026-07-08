@@ -17,6 +17,17 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # For a same-repo branch (every `lotsa/**` task branch, and any human PR
+    # opened from a branch in this repo), the `push` event already runs CI on
+    # the exact commit. The `pull_request` event would then run a second,
+    # redundant time — and because the two events land in *different*
+    # concurrency groups (`refs/heads/...` vs `refs/pull/N/merge`),
+    # cancel-in-progress can't dedupe them, doubling CI minutes. Skip the
+    # pull_request run when its head is in this repo; keep it only for forks,
+    # whose branch push never reaches the base repo so `push` can't cover them.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v4
 
