@@ -1,4 +1,4 @@
-.PHONY: setup dev build deploy frontend test lint format typecheck frontend-install frontend-dev frontend-build
+.PHONY: setup dev prebuild build deploy frontend test lint format typecheck frontend-install frontend-dev frontend-build
 
 # ---------------------------------------------------------------------------
 # Setup — run once after cloning
@@ -12,7 +12,16 @@ setup:
 # Package — build a wheel/sdist with the dashboard bundled (needs Node)
 # ---------------------------------------------------------------------------
 
-build:
+# Prebuild actions that must run before packaging — a fresh dashboard bundle
+# today, plus a home for any future codegen. `build` depends on this so BOTH
+# `make build` and `make deploy` package a freshly-built frontend, closing the
+# stale-static/dist/ gap: hatch_build.py skips the frontend build when
+# static/dist/index.html already exists, and `build`'s `rm -rf dist build`
+# cleans only the top-level Python dirs, never that bundle. The dependency edge
+# (not a recipe-line sequence) keeps ordering correct even under `make -j`.
+prebuild: frontend
+
+build: prebuild
 	rm -rf dist build
 	python -m build
 
@@ -26,11 +35,9 @@ build:
 # Contributor convenience: build the dashboard-bundled wheel and deploy it via
 # the CLI's --wheel override (so the box runs your local build, not PyPI).
 # Reads ./deploy.yaml for the host + config, same as a pip user.
-# Rebuild the dashboard bundle first (frontend), then the wheel (build); the
-# recursive $(MAKE) calls keep the order deterministic even under `make -j`.
-deploy:
-	$(MAKE) frontend
-	$(MAKE) build
+# A fresh dashboard is guaranteed transitively (deploy -> build -> prebuild);
+# no frontend step is needed here.
+deploy: build
 	lotsa deploy --wheel $$(ls dist/lotsa-*.whl)
 
 # ---------------------------------------------------------------------------
