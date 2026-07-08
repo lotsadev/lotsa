@@ -68,7 +68,13 @@ export function RightPanel({ taskId }: RightPanelProps) {
         />
       </TabsContent>
       <TabsContent value="changes" className="flex-1 overflow-hidden mt-0">
-        <ChangesTab taskId={taskId} active={activeTab === 'changes'} />
+        <ChangesTab
+          taskId={taskId}
+          active={activeTab === 'changes'}
+          status={data.task.status}
+          prNumber={data.task.metadata?.pr_number as number | string | undefined}
+          prUrl={data.task.metadata?.pr_url as string | undefined}
+        />
       </TabsContent>
       <TabsContent value="activity" className="flex-1 overflow-hidden mt-0">
         <ActivityTab key={taskId} taskId={taskId} active={activeTab === 'activity'} />

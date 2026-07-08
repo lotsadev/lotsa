@@ -1,7 +1,9 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { PatchDiff } from '@pierre/diffs/react'
+import { GitPullRequest } from 'lucide-react'
 import { fetchDiff } from '@/api/tasks'
+import type { TaskStatus } from '@/api/types'
 import { useTheme } from '@/hooks/use-theme'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
@@ -9,7 +11,19 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 interface ChangesTabProps {
   taskId: string
   active: boolean
+  status: TaskStatus
+  prNumber?: number | string
+  prUrl?: string
 }
+
+// Statuses under which the orchestrator deletes the worktree, so the diff
+// endpoint returns an empty patch (200 { diff: "" }). `complete`/`abandoned`
+// clean up via `_cleanup_worktree_if_done`; `archived` via the archive path.
+const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  'complete',
+  'abandoned',
+  'archived',
+])
 
 type Layout = 'unified' | 'split'
 
@@ -30,7 +44,7 @@ function chunkKey(chunk: string, index: number): string {
   return firstLine || `file-${index}`
 }
 
-export function ChangesTab({ taskId, active }: ChangesTabProps) {
+export function ChangesTab({ taskId, active, status, prNumber, prUrl }: ChangesTabProps) {
   const { theme } = useTheme()
   const [layout, setLayout] = useState<Layout>('unified')
 
@@ -56,6 +70,34 @@ export function ChangesTab({ taskId, active }: ChangesTabProps) {
   }, [data?.diff])
 
   if (files.length === 0) {
+    // A terminal task's worktree is gone, so the diff endpoint returns an empty
+    // patch. Distinguish that from a brand-new active task (which also has no
+    // diff yet) — otherwise both render the misleading "No changes yet".
+    if (TERMINAL_STATUSES.has(status)) {
+      const hasPr = typeof prNumber === 'number' || typeof prNumber === 'string'
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-muted-foreground">
+          <p>We can't display changes for completed or archived tasks.</p>
+          {hasPr &&
+            (typeof prUrl === 'string' ? (
+              <a
+                href={prUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 font-mono hover:text-foreground transition-colors"
+              >
+                <GitPullRequest className="size-3 shrink-0" />
+                <span>Check the PR #{prNumber}</span>
+              </a>
+            ) : (
+              <span className="inline-flex items-center gap-1 font-mono">
+                <GitPullRequest className="size-3 shrink-0" />
+                <span>Check the PR #{prNumber}</span>
+              </span>
+            ))}
+        </div>
+      )
+    }
     return (
       <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
         No changes yet
