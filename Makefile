@@ -12,10 +12,8 @@ setup:
 # Package — build a wheel/sdist with the dashboard bundled (needs Node)
 # ---------------------------------------------------------------------------
 
-# Runs before packaging (fresh dashboard now; a home for future codegen).
-# `build` depends on it via a dependency edge — not a recipe-line call — so the
-# bundle is rebuilt even under `make -j`, closing the stale static/dist/ gap
-# that hatch_build.py's skip-if-exists would otherwise leave.
+# Prebuild steps run before packaging. A dependency edge (not a recipe call) so
+# the bundle rebuilds even under `make -j`, closing hatch_build.py's stale-dist skip.
 prebuild: frontend
 
 build: prebuild
