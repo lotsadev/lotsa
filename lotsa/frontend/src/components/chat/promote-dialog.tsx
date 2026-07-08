@@ -37,9 +37,9 @@ const handoffLabel = (name: string) => HANDOFF_LABELS[name] ?? name
 
 // ADR-027/043 — operator-driven handoff to a loaded destination process. The
 // dialog only picks the destination: promotion carries the full chat transcript
-// forward automatically (promote_task seeds it as draft_spec/promotion_context
-// when called with no explicit artifacts), so there are no per-input fields to
-// fill in.
+// forward automatically (promote_task seeds it under promotion_context and each
+// of the destination's declared promotion_inputs when called with no explicit
+// artifacts), so there are no per-input fields to fill in.
 export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps) {
   const queryClient = useQueryClient()
   const { data: processes } = useProcesses()
@@ -54,8 +54,10 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
 
   const mutation = useMutation({
     // No artifacts: the destination's first step (build's plan, fix's coding)
-    // reads the full chat transcript, which promote_task seeds as
-    // draft_spec/promotion_context when called with no explicit fields.
+    // reads the full chat transcript, which promote_task seeds under
+    // promotion_context and each of the destination's declared promotion_inputs
+    // (draft_spec for build, instruction for fix) when called with no explicit
+    // fields.
     mutationFn: () => promoteTask(taskId, destination, undefined),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', taskId] })

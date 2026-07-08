@@ -136,9 +136,10 @@ export const markCompleteTask = (taskId: string) =>
 
 // ADR-027/043 — switch a task to a different loaded process mid-life. The Hand
 // off dialog sends no explicit artifacts (undefined), so promote_task seeds the
-// full chat transcript as draft_spec/promotion_context, which the destination's
-// first step reads. Explicit initialArtifacts, when passed, override that
-// seeding and are keyed by the destination's promotion_inputs.
+// full chat transcript under promotion_context and each of the destination's
+// declared promotion_inputs (draft_spec for build, instruction for fix), which
+// the destination's first step reads. Explicit initialArtifacts, when passed,
+// override that seeding and are keyed by the destination's promotion_inputs.
 export const promoteTask = (
   taskId: string,
   toProcess: string,
