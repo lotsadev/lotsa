@@ -3,13 +3,21 @@ import { attachmentRawUrl } from '@/api/tasks'
 import { formatBytes } from '@/lib/utils'
 import type { Attachment } from '@/api/types'
 
-// One attachment rendered inline. Images become a clickable thumbnail that
-// opens the full-size file in a new tab; other types become a paperclip chip
-// with name + size. Both anchor to the raw-bytes endpoint. Shared by the chat
-// bubble strip (message-scoped) and the right-panel list (task-scoped).
+// Raster image MIME types the backend actually serves `inline` — mirror of
+// `_INLINE_SAFE_MIMES` in `lotsa/attachments.py`. A thumbnail is only rendered
+// for these: any other type (notably `image/svg+xml`, which the backend forces
+// to an `application/octet-stream` download to close the stored-XSS path) would
+// render as a broken `<img>`, so it falls through to the paperclip chip below.
+const INLINE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+
+// One attachment rendered inline. Server-inlineable images become a clickable
+// thumbnail that opens the full-size file in a new tab; other types (including
+// non-raster images the server won't serve inline) become a paperclip chip with
+// name + size. Both anchor to the raw-bytes endpoint. Shared by the chat bubble
+// strip (message-scoped) and the right-panel list (task-scoped).
 export function AttachmentItem({ taskId, att }: { taskId: string; att: Attachment }) {
   const url = attachmentRawUrl(taskId, att.filename)
-  const isImage = att.mime.startsWith('image/')
+  const isImage = INLINE_IMAGE_MIMES.has(att.mime)
 
   if (isImage) {
     return (

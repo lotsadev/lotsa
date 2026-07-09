@@ -196,6 +196,10 @@ export function ChatMessage({ message, awaitingInput = false }: ChatMessageProps
             {Array.isArray(message.metadata?.attachments) && (
               <AttachmentStrip
                 taskId={message.task_id}
+                // Safe assertion: the backend is the sole writer of
+                // `metadata.attachments` (stamped at message INSERT from the
+                // task's own attachment records), so elements always match
+                // `Attachment`'s shape; the `isArray` guard covers the type.
                 attachments={message.metadata.attachments as Attachment[]}
               />
             )}

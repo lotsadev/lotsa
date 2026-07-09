@@ -39,6 +39,17 @@ describe('AttachmentItem', () => {
     expect(link!.getAttribute('target')).toBe('_blank')
   })
 
+  it('renders a non-inlineable image (SVG) as a chip, not a broken <img>', () => {
+    // The backend forces `image/svg+xml` to an octet-stream download (XSS
+    // guard), so an <img> pointing at it would render broken. The client must
+    // fall through to the chip for any image type outside the raster allowlist.
+    render(<AttachmentItem taskId="task-1" att={att({ filename: 'diagram.svg', mime: 'image/svg+xml' })} />)
+    expect(screen.queryByRole('img')).toBeNull()
+    const link = screen.getByRole('link')
+    expect(link.getAttribute('href')).toBe('/api/tasks/task-1/attachments/diagram.svg/raw')
+    expect(link.textContent).toContain('diagram.svg')
+  })
+
   it('renders a non-image as a chip with name + size linking to raw', () => {
     render(<AttachmentItem taskId="task-1" att={att({ filename: 'notes.pdf', mime: 'application/pdf' })} />)
     const link = screen.getByRole('link')
