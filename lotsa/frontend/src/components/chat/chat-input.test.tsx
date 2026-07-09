@@ -175,6 +175,21 @@ describe('ChatInput PR-monitoring CI-check status', () => {
     })
     expect(getByText(/CI checks passed/)).toBeInTheDocument()
   })
+
+  it('prioritises the failing summary over checks still in flight', () => {
+    // failing must win over pending — a red ✗ summary shows even while other
+    // checks are still running (pending = 3 - 1 - 1 = 1), so a real failure is
+    // never masked by a "running…" message. Guards the branch ordering in
+    // chat-input.tsx (failing check precedes the pending check).
+    const { getByText, queryByText } = monitoring({
+      pr_checks_total: 3,
+      pr_checks_passing: 1,
+      pr_checks_failing: 1,
+    })
+    const el = getByText(/1 CI check failing/)
+    expect(el.className).toMatch(/text-destructive/)
+    expect(queryByText(/CI checks running/)).toBeNull()
+  })
 })
 
 describe('ChatInput partial-upload retry', () => {
