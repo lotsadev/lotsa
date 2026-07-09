@@ -316,12 +316,26 @@ export function ChatInput({ data }: ChatInputProps) {
             <span>PR #{prNumber ?? '?'}</span>
           )}
           {prDecision && <span> · {prDecision}</span>}
-          {checksTotal !== undefined && checksTotal > 0 && (
-            <span>
-              {' '}· checks {checksPassing ?? 0}/{checksTotal}
-              {(checksFailing ?? 0) > 0 && <span> ({checksFailing} failing)</span>}
-            </span>
-          )}
+          {checksTotal !== undefined && checksTotal > 0 && (() => {
+            const passing = checksPassing ?? 0
+            const failing = checksFailing ?? 0
+            const pending = checksTotal - passing - failing
+            if (failing > 0) {
+              return (
+                <span className="text-destructive">
+                  {' '}· ✗ {failing} CI check{failing === 1 ? '' : 's'} failing
+                </span>
+              )
+            }
+            if (pending > 0) {
+              return (
+                <span>
+                  {' '}· CI checks running… ({passing}/{checksTotal})
+                </span>
+              )
+            }
+            return <span>{' '}· ✓ CI checks passed</span>
+          })()}
           {(feedbackCount ?? 0) > 0 && (
             <span> · {feedbackCount} comment{feedbackCount === 1 ? '' : 's'}</span>
           )}
