@@ -2073,3 +2073,147 @@ def test_revise_on_needs_input_pr_fix_task_finds_subflow_step_via_process_catalo
             raise
     finally:
         loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression: a pr-fix SKIPPED round must not duplicate the agent's reasoning
+# across two messages, and its stage_transition divider must stay short.
+#
+# Live bug (operator report): when a pr-fix round declined feedback as
+# non-actionable (PR_FIX_SKIPPED), the drainer wrote the agent's one-line
+# reasoning into BOTH a ``stage_transition`` divider (as
+# ``f"pr-fix skipped: {last_line}"``) AND the append-only ``pr_decision`` audit
+# row. The same sentence therefore rendered twice — once as a monospaced
+# divider label that could not wrap (forcing the window to scroll horizontally)
+# and once as a chat bubble. The divider must carry a bare marker with no
+# reasoning; the ``pr_decision`` row stays the single carrier of the reasoning.
+# ---------------------------------------------------------------------------
+
+
+def _drain_in_flight(run, svc, task_id):
+    """Pump the completion drainer until the dispatched agent is retired."""
+    import asyncio
+
+    for _ in range(40):
+        if task_id not in svc._in_flight:
+            break
+        run(asyncio.sleep(0.05))
+    # One more tick so the drainer lands the SKIPPED transition + audit writes.
+    run(asyncio.sleep(0.1))
+
+
+def test_pr_fix_skipped_writes_short_divider_and_single_reasoning(tmp_path):
+    """A SKIPPED round emits a bare ``pr-fix skipped`` divider and carries the
+    reasoning in exactly one message — the ``pr_decision`` row.
+
+    The reasoning here is deliberately long so a divider that still embedded it
+    would be the overflowing monospaced block the operator reported.
+    """
+    import asyncio
+
+    from lotsa import registry as reg
+    from lotsa.registry import register_posthook
+    from lotsa.tests.test_orchestrator import FakeRunner
+    from lotsa.tools import ToolResult
+    from rigg.models import AgentResult
+
+    long_reason = "reviewer comment is non-actionable " * 20
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        svc, db, _hang = _stub_full_process_service(tmp_path, run)
+
+        # The pr-fix step's ``commit`` posthook runs on agent success BEFORE the
+        # SKIPPED routing (ADR-024); its publish step needs a real git remote +
+        # GITHUB_TOKEN, which the tmpdir lacks. Stub it to succeed so routing
+        # reaches the SKIPPED branch under test rather than blocking at pr-fix.
+        # The autouse ``_isolated_registry`` fixture restores the built-in.
+        reg._POSTHOOKS.pop("commit", None)
+
+        async def stub_commit(ctx, config):
+            return ToolResult(success=True, output="no changes to commit", metadata={})
+
+        register_posthook("commit", stub_commit)
+
+        # The pr-fix agent declines the feedback with a long reasoning line.
+        svc.runner = FakeRunner(
+            AgentResult(
+                success=True,
+                stdout=f"Read the feedback.\nPR_FIX_SKIPPED: {long_reason}\n",
+                stderr="",
+                return_code=0,
+                duration_ms=88,
+                cost_usd=0.003,
+                session_id="sk",
+            )
+        )
+        try:
+            run(svc.start())
+            try:
+                # Stage a task as if the pr_monitor engine had just landed it in
+                # waiting_for_pr at the monitor's queue_state, with the pr-fix
+                # input artifacts seeded so the dispatch is not short-circuited.
+                task = run(
+                    svc.db.create_task(
+                        "PR fix skipped divider test",
+                        state="wait_for_pr_signal",
+                        status="waiting_for_pr",
+                        metadata={"pr_number": 1, "github_owner": "o", "github_repo": "r"},
+                    )
+                )
+                for art in ("spec", "plan"):
+                    run(
+                        svc.db.add_message(
+                            task.id,
+                            "agent",
+                            art,
+                            f"{art} content",
+                            "artifact",
+                            metadata={"artifact_name": art},
+                        )
+                    )
+
+                dispatched = run(svc.dispatch_pr_fix(task.id, "bot left an approval comment"))
+                assert dispatched, "dispatch_pr_fix returned False — the locked body declined"
+                _drain_in_flight(run, svc, task.id)
+
+                # The pr-fix SKIPPED divider must be a short, constant marker.
+                transitions = run(svc.db.get_messages(task.id, msg_type="stage_transition"))
+                pr_fix_dividers = [
+                    m for m in transitions if (m.metadata or {}).get("from_step") == "pr-fix"
+                ]
+                assert pr_fix_dividers, "SKIPPED path must still emit a stage_transition divider"
+                divider = pr_fix_dividers[-1]
+                assert divider.content == "pr-fix skipped", (
+                    f"divider must be a bare marker with no reasoning, got {divider.content!r}"
+                )
+
+                # No stage_transition may embed the reasoning — that duplication
+                # (and its horizontal overflow) is exactly what this fix removes.
+                for m in transitions:
+                    assert long_reason.strip() not in (m.content or ""), (
+                        "a stage_transition divider must not duplicate the agent's "
+                        f"reasoning (found it in {m.content!r})"
+                    )
+
+                # Exactly one message carries the reasoning: the pr_decision row.
+                decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
+                skipped_rows = [
+                    m for m in decisions if (m.metadata or {}).get("decision") == "skipped"
+                ]
+                assert len(skipped_rows) == 1, (
+                    f"SKIPPED must write exactly one skipped pr_decision row, got {len(skipped_rows)}"
+                )
+                assert long_reason.strip() in (skipped_rows[0].content or ""), (
+                    "the pr_decision row is the single carrier of the reasoning text"
+                )
+                assert skipped_rows[0].metadata.get("commit_sha") is None
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+    finally:
+        loop.close()

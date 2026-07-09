@@ -26,6 +26,17 @@ function makeMessage(overrides: Partial<Message> = {}): Message {
   }
 }
 
+// A pr_decision message (the pr-fix audit row). `pr_decision` is a distinct
+// message type the frontend must render as a first-class chat bubble via its
+// own branch — not by an incidental fallthrough to the role==='agent' case.
+// Built via a cast because the type is only added to the Message union as part
+// of this change; this helper carries the runtime value the backend sends.
+function prDecisionMessage(overrides: Partial<Message> = {}): Message {
+  const msg = makeMessage({ role: 'agent', step_name: 'pr-fix', ...overrides })
+  ;(msg as { type: string }).type = 'pr_decision'
+  return msg
+}
+
 // Scan every rendered element's class attribute (SVG icons expose className as
 // an object, so read the attribute string rather than el.className).
 function anyClass(container: HTMLElement, re: RegExp): boolean {
@@ -78,6 +89,7 @@ describe('ChatMessage — bubble max width 90% (R3)', () => {
     { label: 'question', msg: makeMessage({ role: 'agent', type: 'question', content: 'x' }) },
     { label: 'error', msg: makeMessage({ role: 'agent', type: 'error', content: 'x' }) },
     { label: 'fallback', msg: makeMessage({ role: 'system', type: 'output', content: 'x' }) },
+    { label: 'pr_decision', msg: prDecisionMessage({ content: 'reviewer approved' }) },
   ]
 
   it.each(bubbleVariants)('caps the $label bubble at 90pct width, not 80pct', ({ msg }) => {
@@ -202,5 +214,48 @@ describe('ChatMessage — overflow containment (R1)', () => {
     const { container } = render(<ChatMessage message={msg} />)
 
     expect(anyClass(container, /min-w-0/)).toBe(true)
+  })
+})
+
+describe('ChatMessage — stage_transition divider cannot overflow', () => {
+  // A long stage_transition label (e.g. an unshortened "pr-fix skipped: <long
+  // reasoning>") rendered as a `shrink-0 font-mono` span forces the flex row —
+  // and the whole window — wider than the viewport, in monospace. The divider
+  // must shrink and wrap instead.
+  it('wraps a long transition label instead of forcing horizontal scroll', () => {
+    const msg = makeMessage({ role: 'system', type: 'stage_transition', content: 'x'.repeat(300) })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    // `shrink-0` pins the label to its content width — the overflow source.
+    expect(anyClass(container, /shrink-0/)).toBe(false)
+    // `min-w-0` lets the flex child shrink below its content size so the label
+    // can wrap; `break-words` performs the wrap on a long unbroken string.
+    expect(anyClass(container, /min-w-0/)).toBe(true)
+    expect(anyClass(container, /break-words/)).toBe(true)
+  })
+})
+
+describe('ChatMessage — pr_decision is a first-class chat bubble', () => {
+  it('renders a pr_decision message as the "pr-fix Agent" chat bubble', () => {
+    const msg = prDecisionMessage({ content: 'reviewer approved — nothing actionable' })
+    const { container, getByText } = render(<ChatMessage message={msg} />)
+
+    expect(getByText('pr-fix Agent')).toBeInTheDocument()
+    // Left-aligned bubble, not the centered stage_transition divider treatment.
+    expect(anyClass(container, /justify-start/)).toBe(true)
+    expect(anyClass(container, /bg-card/)).toBe(true)
+    expect(anyClass(container, /text-center/)).toBe(false)
+  })
+
+  it('renders via its own type branch, not an incidental role==="agent" fallthrough', () => {
+    // A pr_decision row keyed on type must render as the labelled chat bubble
+    // regardless of role. With only the role==='agent' fallthrough, a
+    // non-agent role drops to the unlabelled generic fallback (no "pr-fix
+    // Agent" label), so this asserts the explicit `type === 'pr_decision'`
+    // branch exists.
+    const msg = prDecisionMessage({ role: 'system', content: 'reviewer approved' })
+    const { getByText } = render(<ChatMessage message={msg} />)
+
+    expect(getByText('pr-fix Agent')).toBeInTheDocument()
   })
 })
