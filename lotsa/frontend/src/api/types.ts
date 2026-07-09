@@ -39,7 +39,7 @@ export interface Message {
   role: 'user' | 'agent' | 'system'
   step_name: string
   content: string
-  type: 'chat' | 'output' | 'stage_transition' | 'feedback' | 'question' | 'answer' | 'error' | 'status_change' | 'stderr' | 'artifact' | 'artifact_seeded' | 'process_promotion'
+  type: 'chat' | 'output' | 'stage_transition' | 'feedback' | 'question' | 'answer' | 'error' | 'status_change' | 'stderr' | 'artifact' | 'artifact_seeded' | 'process_promotion' | 'pr_decision'
   metadata: Record<string, unknown>
   created_at: string
 }

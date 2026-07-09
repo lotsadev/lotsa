@@ -161,7 +161,12 @@ export function ChatMessage({ message, awaitingInput = false }: ChatMessageProps
     )
   }
 
-  // Stage transition — horizontal divider with label
+  // Stage transition — horizontal divider with label. The label uses `min-w-0`
+  // + `break-words` (and `text-center` for the wrapped case) instead of
+  // `shrink-0`: a `shrink-0` label pins itself to its content width, so a long
+  // transition label pushed the flex row — and the whole window — wider than
+  // the viewport. `min-w-0` lets the flex child shrink below its content size
+  // so `break-words` can wrap it, keeping status updates inside the column.
   if (message.type === 'stage_transition') {
     const isBackward = message.metadata?.direction === 'backward'
     return (
@@ -169,13 +174,36 @@ export function ChatMessage({ message, awaitingInput = false }: ChatMessageProps
         <Separator className="flex-1" />
         <span
           className={cn(
-            'shrink-0 font-mono text-xs font-medium',
+            'min-w-0 break-words text-center font-mono text-xs font-medium',
             isBackward ? 'text-amber-500' : 'text-green-500'
           )}
         >
           {message.content}
         </span>
         <Separator className="flex-1" />
+      </div>
+    )
+  }
+
+  // pr-fix decision (SKIPPED / DONE / BLOCKED / NEEDS_DECISION) — the audit row
+  // that carries the pr-fix agent's one-line reasoning. Render it intentionally
+  // as the left-aligned agent chat bubble (it previously reached this shape by
+  // an accidental fallthrough to the role==='agent' branch, and only when the
+  // row happened to be authored as `agent`). Keyed on `type` so the reasoning
+  // always lands in the chat bubble — the channel the operator wants — instead
+  // of the overflowing stage_transition divider.
+  if (message.type === 'pr_decision') {
+    return (
+      <div className="flex justify-start py-1.5">
+        <div className="max-w-[90%] min-w-0">
+          <div className="mb-1 font-mono text-xs text-primary">
+            {message.step_name} Agent
+          </div>
+          <div className="rounded-xl border border-border bg-card px-4 py-2.5">
+            <MarkdownContent content={message.content} />
+            <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
+          </div>
+        </div>
       </div>
     )
   }
