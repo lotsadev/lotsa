@@ -123,6 +123,60 @@ describe('ChatInput hand-off gating (ADR-043)', () => {
   })
 })
 
+describe('ChatInput PR-monitoring CI-check status', () => {
+  // The monitoring row renders only while the task is parked on the PR
+  // (status === 'waiting_for_pr'). The CI summary replaces the old bare
+  // `checks 0/1` (which read like "0 of 1 passing" and alarmed operators —
+  // see the attached screenshot) with a failing / running / passed summary.
+  function monitoring(checks: Record<string, unknown>) {
+    return renderChatInput(
+      makeData({
+        status: 'waiting_for_pr',
+        metadata: { pr_number: 27, ...checks },
+      }),
+    )
+  }
+
+  it('shows a red failing summary when any CI check is failing', () => {
+    const { getByText } = monitoring({
+      pr_checks_total: 3,
+      pr_checks_passing: 1,
+      pr_checks_failing: 2,
+    })
+    const el = getByText(/2 CI checks failing/)
+    expect(el).toBeInTheDocument()
+    expect(el.className).toMatch(/text-destructive/)
+  })
+
+  it('singularises the failing summary for exactly one failing check', () => {
+    const { getByText } = monitoring({
+      pr_checks_total: 1,
+      pr_checks_passing: 0,
+      pr_checks_failing: 1,
+    })
+    expect(getByText(/1 CI check failing/)).toBeInTheDocument()
+  })
+
+  it('shows a running summary with passing/total while checks are pending (the 0/1 case)', () => {
+    const { getByText } = monitoring({
+      pr_checks_total: 1,
+      pr_checks_passing: 0,
+      pr_checks_failing: 0,
+    })
+    const el = getByText(/CI checks running/)
+    expect(el.textContent).toContain('(0/1)')
+  })
+
+  it('shows an all-passed summary once every check has passed', () => {
+    const { getByText } = monitoring({
+      pr_checks_total: 2,
+      pr_checks_passing: 2,
+      pr_checks_failing: 0,
+    })
+    expect(getByText(/CI checks passed/)).toBeInTheDocument()
+  })
+})
+
 describe('ChatInput partial-upload retry', () => {
   beforeEach(() => {
     uploadAttachment.mockReset()
