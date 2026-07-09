@@ -2180,9 +2180,7 @@ def test_pr_fix_skipped_writes_short_divider_and_single_reasoning(tmp_path):
 
                 # The pr-fix SKIPPED divider must be a short, constant marker.
                 transitions = run(svc.db.get_messages(task.id, msg_type="stage_transition"))
-                pr_fix_dividers = [
-                    m for m in transitions if (m.metadata or {}).get("from_step") == "pr-fix"
-                ]
+                pr_fix_dividers = [m for m in transitions if (m.metadata or {}).get("from_step") == "pr-fix"]
                 assert pr_fix_dividers, "SKIPPED path must still emit a stage_transition divider"
                 divider = pr_fix_dividers[-1]
                 assert divider.content == "pr-fix skipped", (
@@ -2199,9 +2197,7 @@ def test_pr_fix_skipped_writes_short_divider_and_single_reasoning(tmp_path):
 
                 # Exactly one message carries the reasoning: the pr_decision row.
                 decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
-                skipped_rows = [
-                    m for m in decisions if (m.metadata or {}).get("decision") == "skipped"
-                ]
+                skipped_rows = [m for m in decisions if (m.metadata or {}).get("decision") == "skipped"]
                 assert len(skipped_rows) == 1, (
                     f"SKIPPED must write exactly one skipped pr_decision row, got {len(skipped_rows)}"
                 )
