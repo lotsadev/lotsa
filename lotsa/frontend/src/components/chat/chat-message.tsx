@@ -6,9 +6,10 @@ import remarkBreaks from 'remark-breaks'
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { FileText, ChevronDown, ExternalLink } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatBytes } from '@/lib/utils'
 import { formatRelativeTime, formatFullDateTime } from '@/lib/time'
-import type { Message } from '@/api/types'
+import { AttachmentStrip } from '@/components/attachment-view'
+import type { Message, Attachment } from '@/api/types'
 
 interface ChatMessageProps {
   message: Message
@@ -16,12 +17,6 @@ interface ChatMessageProps {
   // the single "awaiting your answer" bubble a duplicate question folded into
   // (R2). Renders the amber needs-input accent.
   awaitingInput?: boolean
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
 function TruncatedFooter({ message }: { message: Message }) {
@@ -50,7 +45,12 @@ const LARGE_CONTENT_THRESHOLD = 10_000 // chars
 // horizontal scrollbar to code blocks inside the bubble instead of widening it;
 // `[&_a]:break-words` wraps long link text. Wide tables are wrapped in a scroll
 // container by MARKDOWN_COMPONENTS below.
-const PROSE_CLASSES = "prose prose-sm dark:prose-invert max-w-none break-words [overflow-wrap:anywhere] [&_h1]:text-lg [&_h1]:font-bold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_h4]:text-sm [&_h4]:font-medium [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-xs [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_pre]:overflow-x-auto [&_pre]:max-w-full [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_a]:text-primary [&_a]:underline [&_a]:break-words"
+//
+// R5 — the `@tailwindcss/typography` plugin restyles `code`/`pre` (backtick
+// quotes on inline code; light `--tw-prose-pre-code` grey, unreadable on our
+// light `bg-muted`); the higher-specificity `[&_code]`/`[&_pre]` overrides below
+// re-assert the readable pre-plugin look.
+const PROSE_CLASSES = "prose prose-sm dark:prose-invert max-w-none break-words [overflow-wrap:anywhere] [&_h1]:text-lg [&_h1]:font-bold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold [&_h4]:text-sm [&_h4]:font-medium [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-xs [&_code]:font-normal [&_code]:before:content-none [&_code]:after:content-none [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_pre]:my-2 [&_pre]:text-foreground [&_pre]:overflow-x-auto [&_pre]:max-w-full [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-xs [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_a]:text-primary [&_a]:underline [&_a]:break-words"
 
 // R1 — wide tables scroll horizontally inside their own container rather than
 // widening the bubble. The prose [&_table]/[&_th]/[&_td] selectors still apply:
@@ -221,6 +221,16 @@ export function ChatMessage({ message, awaitingInput = false }: ChatMessageProps
           </div>
           <div className="rounded-xl border border-primary/30 bg-primary/10 px-4 py-2.5">
             <MarkdownContent content={message.content} />
+            {Array.isArray(message.metadata?.attachments) && (
+              <AttachmentStrip
+                taskId={message.task_id}
+                // Safe assertion: the backend is the sole writer of
+                // `metadata.attachments` (stamped at message INSERT from the
+                // task's own attachment records), so elements always match
+                // `Attachment`'s shape; the `isArray` guard covers the type.
+                attachments={message.metadata.attachments as Attachment[]}
+              />
+            )}
             <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
           </div>
         </div>

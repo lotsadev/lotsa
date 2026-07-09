@@ -1,7 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
   Dialog,
   DialogContent,
@@ -36,15 +35,15 @@ const HANDOFF_LABELS: Record<string, string> = {
 }
 const handoffLabel = (name: string) => HANDOFF_LABELS[name] ?? name
 
-// ADR-027/043 — operator-driven handoff to a loaded destination process. If
-// that process declares promotion_inputs, render one field per declared input,
-// otherwise a single generic "promotion_context" field. The collected values
-// become the initial_artifacts dict the destination's first step reads.
+// ADR-027/043 — operator-driven handoff to a loaded destination process. The
+// dialog only picks the destination: promotion carries the full chat transcript
+// forward automatically (promote_task seeds it under promotion_context and each
+// of the destination's declared promotion_inputs when called with no explicit
+// artifacts), so there are no per-input fields to fill in.
 export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps) {
   const queryClient = useQueryClient()
   const { data: processes } = useProcesses()
   const [destination, setDestination] = useState<string>('')
-  const [fields, setFields] = useState<Record<string, string>>({})
 
   // Don't offer the chat process as a destination — promotion never targets
   // chat (no demotion; ADR-027 §7).
@@ -52,38 +51,27 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
     () => (processes ?? []).filter((p) => p.name !== 'chat'),
     [processes]
   )
-  const selected = options.find((p) => p.name === destination)
-  const declaredInputs = selected?.promotion_inputs ?? []
 
   const mutation = useMutation({
-    mutationFn: () => {
-      const artifacts: Record<string, string> = {}
-      if (declaredInputs.length > 0) {
-        for (const input of declaredInputs) {
-          if (fields[input.name]?.trim()) artifacts[input.name] = fields[input.name]
-        }
-      } else if (fields.promotion_context?.trim()) {
-        artifacts.promotion_context = fields.promotion_context
-      }
-      return promoteTask(taskId, destination, Object.keys(artifacts).length ? artifacts : undefined)
-    },
+    // No artifacts: the destination's first step (build's plan, fix's coding)
+    // reads the full chat transcript, which promote_task seeds under
+    // promotion_context and each of the destination's declared promotion_inputs
+    // (draft_spec for build, instruction for fix) when called with no explicit
+    // fields.
+    mutationFn: () => promoteTask(taskId, destination, undefined),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', taskId] })
       onOpenChange(false)
       setDestination('')
-      setFields({})
     },
   })
-
-  const setField = (name: string, value: string) =>
-    setFields((prev) => ({ ...prev, [name]: value }))
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/* On mobile the centered dialog caps to the viewport width and scrolls
-          vertically so the destination picker + per-input fields never
-          overflow a narrow screen. */}
-      <DialogContent className="max-h-[85dvh] overflow-y-auto max-md:max-w-[calc(100vw-1rem)]">
+          vertically so the destination picker never overflows a narrow
+          screen. */}
+      <DialogContent className="max-h-[85dvh] overflow-y-auto md:max-w-2xl max-md:max-w-[calc(100vw-1rem)]">
         <DialogHeader>
           <DialogTitle>Hand off to Execute</DialogTitle>
           <DialogDescription>
@@ -116,37 +104,6 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
               ))}
             </SelectContent>
           </Select>
-
-          {destination &&
-            (declaredInputs.length > 0 ? (
-              declaredInputs.map((input) => (
-                <div key={input.name} className="flex flex-col gap-1">
-                  <label className="text-xs font-medium text-muted-foreground">
-                    {input.name}
-                  </label>
-                  <p className="text-xs text-muted-foreground">{input.description}</p>
-                  <Input
-                    value={fields[input.name] ?? ''}
-                    onChange={(e) => setField(input.name, e.target.value)}
-                    placeholder={`Content for ${input.name}…`}
-                  />
-                </div>
-              ))
-            ) : (
-              <div className="flex flex-col gap-1">
-                <label className="text-xs font-medium text-muted-foreground">
-                  promotion_context
-                </label>
-                <p className="text-xs text-muted-foreground">
-                  Optional context carried into the new process.
-                </p>
-                <Input
-                  value={fields.promotion_context ?? ''}
-                  onChange={(e) => setField('promotion_context', e.target.value)}
-                  placeholder="Context for the new process…"
-                />
-              </div>
-            ))}
 
           {/* Surface a refused promotion (HTTP 400 PROMOTE_NOT_ALLOWED —
               unknown/unloaded destination, terminal task, demotion attempt).

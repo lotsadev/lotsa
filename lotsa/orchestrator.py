@@ -1616,6 +1616,18 @@ class OrchestratorService:
 
         # Conversational first step: store message as chat, dispatch spec step
         if first_step and first_step.conversational:
+            # Deferred create (the empty-state attachment flow): hold the first
+            # chat-message INSERT until dispatch, so it can be stamped with the
+            # attachments the operator uploads in the deferred window. The
+            # ``messages`` table is append-only (no UPDATE), so stamping is only
+            # possible at INSERT — hence the deferral rather than a later patch.
+            # The content is stashed in ``metadata`` (persisted, restart-safe) and
+            # ``_release_first_step`` inserts it once the uploads have landed.
+            if defer_dispatch:
+                metadata["deferred_first_message"] = {
+                    "content": chat_content,
+                    "step_name": first_step.job_type,
+                }
             task = await self.db.create_task(
                 title=title,
                 body="",
@@ -1633,12 +1645,19 @@ class OrchestratorService:
                 body="",
                 metadata=metadata,
             )
-            await self.db.add_message(task.id, "user", first_step.job_type, chat_content, "chat")
             if not defer_dispatch:
+                await self.db.add_message(task.id, "user", first_step.job_type, chat_content, "chat")
                 await self._dispatch_step(item, first_step, feedback=chat_content)
             return task
 
         # Normal flow: create in backlog, dispatch immediately
+        # Deferred create defers the first chat-message INSERT too (see the
+        # conversational branch above) so it can carry the operator's uploads.
+        if defer_dispatch and message is not None:
+            metadata["deferred_first_message"] = {
+                "content": message,
+                "step_name": first_step.job_type if first_step else "",
+            }
         task = await self.db.create_task(
             title=title,
             body=body,
@@ -1648,8 +1667,9 @@ class OrchestratorService:
             metadata=metadata,
         )
         item = Item(id=task.id, state="backlog", priority=priority, title=title, body=body, metadata=metadata)
-        # Store the original message as a chat message if provided
-        if message is not None:
+        # Store the original message as a chat message if provided. Deferred
+        # creates route it through ``_release_first_step`` instead (stamped).
+        if message is not None and not defer_dispatch:
             step_name = first_step.job_type if first_step else ""
             await self.db.add_message(task.id, "user", step_name, message, "chat")
         if not defer_dispatch:
@@ -1702,7 +1722,34 @@ class OrchestratorService:
         step's ``queue_state`` for a conversational one), so
         ``_dispatch_next_step`` picks the right step; a conversational first step
         also needs the operator's original message replayed as ``feedback``.
+
+        The first chat message is inserted **here**, not in ``create_task``, for
+        a deferred task — this is the point at which the operator's uploads have
+        landed, so the row can be stamped with them (``messages`` is append-only,
+        so the stamp can only be set at INSERT). The content was stashed in
+        ``metadata['deferred_first_message']`` at create; the insert is claimed
+        once via an atomic metadata-flag CAS (``claim_metadata_flag``), not a
+        read-then-write ``get_messages`` existence check. Two releases can race —
+        an operator ``/dispatch`` against the restart-recovery sweep's
+        ``_classify_and_resume`` (both call this for the same never-dispatched
+        row), or a double-clicked Dispatch — and an existence check lets both
+        observe no chat row and both insert before either's message is visible,
+        producing a duplicate first message. The CAS resolves a single winner
+        independently of whether any DB call happens to suspend.
         """
+        deferred = (row.metadata or {}).get("deferred_first_message")
+        if deferred is not None:
+            won = await self.db.claim_metadata_flag(row.id, "deferred_first_message_released")
+            if won:
+                records = row.metadata.get("attachments") or []
+                await self.db.add_message(
+                    row.id,
+                    "user",
+                    deferred.get("step_name", ""),
+                    deferred["content"],
+                    "chat",
+                    metadata={"attachments": records} if records else None,
+                )
         flow = self.root_flow_for(row)
         first_step = flow.steps[0] if flow and flow.steps else None
         feedback: str | None = None
@@ -1898,15 +1945,22 @@ class OrchestratorService:
         # carry the chat conversation forward so the destination's first step has
         # the FULL discussion — not just the (truncated) task title. Without this,
         # a task promoted from chat reaches e.g. ``planning`` with only ``{title}`` /
-        # empty ``{body}`` and reports the request "cut off". Seeded under both the
-        # generic ``promotion_context`` and ``draft_spec`` (what ``build``'s planning
-        # step reads); harmless extras for destinations that read neither.
+        # empty ``{body}`` and reports the request "cut off". Seeded under the
+        # generic ``promotion_context`` AND every artifact name the destination
+        # actually reads — i.e. each of its declared ``promotion_inputs``
+        # (``draft_spec`` for ``build``, ``instruction`` for ``fix``). Keying off
+        # the destination's own declared inputs rather than a hardcoded name is
+        # what keeps a chat→fix handoff from landing at ``{artifact:instruction}``
+        # → ``(not available)`` (zero context) now that the Hand off dialog always
+        # calls ``promote_task(..., undefined)``. Extras a destination doesn't read
+        # are harmless.
         seed_artifacts = dict(initial_artifacts or {})
         if not seed_artifacts:
             transcript = await self._chat_transcript(task_id)
             if transcript:
-                seed_artifacts["draft_spec"] = transcript
                 seed_artifacts["promotion_context"] = transcript
+                for pi in dest.promotion_inputs:
+                    seed_artifacts[pi.name] = transcript
 
         # Each lands twice: as an ``artifact`` row (so the destination's first step
         # can read it via ``get_named_artifact`` / the ``{artifact:NAME}`` prompt
@@ -2132,7 +2186,7 @@ class OrchestratorService:
         await self._dispatch_next_step(item)
         await self._cleanup_worktree_if_done(item)
 
-    async def revise(self, task_id: str, feedback: str) -> None:
+    async def revise(self, task_id: str, feedback: str, attachment_filenames: list[str] | None = None) -> None:
         """Revise a task — re-dispatch the current step with feedback.
 
         For ``waiting_for_pr`` the feedback is combined with anything the
@@ -2161,6 +2215,15 @@ class OrchestratorService:
         # nothing dispatches it, so the user thinks their input registered
         # but the agent never sees it. Each branch records the message at
         # the point where dispatch is committed.
+
+        # Attachments uploaded with this feedback are stamped onto the feedback
+        # row so the chat bubble can render them (resolved once from ``row``;
+        # the direct-``add_message`` branches below carry ``feedback_meta``). The
+        # waiting_for_pr branch records its text through _dispatch_pr_fix_locked,
+        # which does not stamp — those files remain visible task-scoped in the
+        # right-panel Attachments list.
+        records = self._resolve_attachment_records(row, attachment_filenames)
+        feedback_meta = {"attachments": records} if records else None
 
         # waiting_for_pr — combine user feedback with anything the monitor
         # already gathered, then dispatch a pr-fix cycle. The pr-fix dispatch
@@ -2237,7 +2300,7 @@ class OrchestratorService:
                 )
                 if not result.won:
                     return
-                await self.db.add_message(task_id, "user", "", feedback, "feedback")
+                await self.db.add_message(task_id, "user", "", feedback, "feedback", metadata=feedback_meta)
                 await self.db.add_message(
                     task_id,
                     "system",
@@ -2296,7 +2359,7 @@ class OrchestratorService:
         # would otherwise leave a feedback row in the DB that no agent
         # ever sees (the dispatch passes ``feedback`` as a kwarg, not via
         # message history).
-        await self.db.add_message(task_id, "user", "", feedback, "feedback")
+        await self.db.add_message(task_id, "user", "", feedback, "feedback", metadata=feedback_meta)
         item = Item(id=row.id, state=row.state, title=row.title, body=row.body, metadata=row.metadata)
         # Phase 2 — for pr-fix: bump the round counter and snapshot the
         # comment IDs the monitor is tracking. Mirrors the post-CAS work
@@ -2365,7 +2428,7 @@ class OrchestratorService:
             return None
         return pending or None
 
-    async def answer(self, task_id: str, answer: str) -> None:
+    async def answer(self, task_id: str, answer: str, attachment_filenames: list[str] | None = None) -> None:
         """Answer a NEEDS_INPUT question — resume the agent.
 
         Phase 2: when the resumed step is ``pr-fix``, an operator answer
@@ -2431,10 +2494,32 @@ class OrchestratorService:
             engine = self._monitor_engine_for(item)
             if engine is not None:
                 triggering_ids = list(engine.snapshot_triggering_ids(task_id))
-        await self.db.add_message(task_id, "user", step.job_type, answer, "answer")
+        records = self._resolve_attachment_records(row, attachment_filenames)
+        await self.db.add_message(
+            task_id,
+            "user",
+            step.job_type,
+            answer,
+            "answer",
+            metadata={"attachments": records} if records else None,
+        )
         await self._dispatch_step(item, step, feedback=answer, triggering_comment_ids=triggering_ids)
 
-    async def send_message(self, task_id: str, message: str) -> None:
+    def _resolve_attachment_records(self, row: TaskRow, filenames: list[str] | None) -> list[dict]:
+        """Pick the task's attachment records whose filename is in ``filenames``.
+
+        Used to stamp the attachments an operator uploaded for a specific send
+        onto the message they rode in with (``message.metadata.attachments``),
+        preserving the task's recorded order. Returns ``[]`` when nothing matches
+        so the caller can skip the metadata key entirely.
+        """
+        if not filenames:
+            return []
+        wanted = set(filenames)
+        records = row.metadata.get("attachments") or []
+        return [a for a in records if a["filename"] in wanted]
+
+    async def send_message(self, task_id: str, message: str, attachment_filenames: list[str] | None = None) -> None:
         """Send a message in a conversational step — re-dispatch with --resume.
 
         Phase 2: when the resumed step is ``pr-fix`` (e.g. an operator using
@@ -2523,7 +2608,15 @@ class OrchestratorService:
             engine = self._monitor_engine_for(item)
             if engine is not None:
                 triggering_ids = list(engine.snapshot_triggering_ids(task_id))
-        await self.db.add_message(task_id, "user", step.job_type, message, "chat")
+        records = self._resolve_attachment_records(row, attachment_filenames)
+        await self.db.add_message(
+            task_id,
+            "user",
+            step.job_type,
+            message,
+            "chat",
+            metadata={"attachments": records} if records else None,
+        )
         await self._dispatch_step(item, step, feedback=message, triggering_comment_ids=triggering_ids)
 
     async def block(self, task_id: str) -> None:

@@ -42,14 +42,19 @@ export function ChatInput({ data }: ChatInputProps) {
   // records (`name (1).png`) and burning the per-task count cap. The failed
   // file and any not-yet-attempted ones stay selected so a retry re-sends only
   // those.
-  const uploadPending = async () => {
+  // Returns the server-assigned filenames of the files uploaded in this batch
+  // (deduped names, unique per task) so the caller can stamp them onto the
+  // message it sends — that linkage is what lets the chat bubble render them.
+  const uploadPending = async (): Promise<string[]> => {
     setAttachError(null)
     const remaining = [...files]
+    const uploaded: string[] = []
     try {
       while (remaining.length > 0) {
         const f = remaining[0]
         try {
-          await uploadAttachment(task.id, f)
+          const rec = await uploadAttachment(task.id, f)
+          uploaded.push(rec.filename)
         } catch (e) {
           setAttachError(`Failed to attach ${f.name}: ${(e as Error).message}`)
           throw e
@@ -59,15 +64,19 @@ export function ChatInput({ data }: ChatInputProps) {
     } finally {
       setFiles(remaining)
     }
+    return uploaded
   }
 
-  // ADR-027 — promotion is valid from any non-terminal state. Mirror the
-  // server-side guard in promote_task exactly: it rejects terminal tasks on
-  // BOTH columns (status in complete/abandoned/archived OR state in
-  // complete/abandoned), since "terminal" is observable on either depending on
-  // the path that finalized the task. Gating on status alone would, in the
-  // edge case where the columns diverge, show a clickable button that 400s.
+  // ADR-043 — the Hand off button is the one-way Think→Execute gesture, so it
+  // only shows while the task is still in the chat (Think) process. Once a task
+  // is handed off to build/fix the button disappears: we don't surface
+  // build↔fix re-routing from the UI (the backend still permits it). We also
+  // require a non-terminal task, mirroring promote_task's server-side guard,
+  // which rejects terminal tasks on BOTH columns (status in
+  // complete/abandoned/archived OR state in complete/abandoned) since "terminal"
+  // is observable on either depending on the path that finalized the task.
   const canPromote =
+    task.flow_name === 'chat' &&
     !['complete', 'abandoned', 'archived'].includes(task.status) &&
     !['complete', 'abandoned'].includes(task.state)
 
@@ -83,24 +92,26 @@ export function ChatInput({ data }: ChatInputProps) {
     setInputValue('')
   }
 
+  // The three message-bearing actions stamp the just-uploaded batch onto the
+  // message they create (message-scoped linkage → bubble thumbnails).
   const sendMutation = useMutation({
     mutationFn: async () => {
-      await uploadPending()
-      return sendMessage(task.id, inputValue)
+      const attached = await uploadPending()
+      return sendMessage(task.id, inputValue, attached)
     },
     onSuccess,
   })
   const reviseMutation = useMutation({
     mutationFn: async () => {
-      await uploadPending()
-      return reviseTask(task.id, inputValue)
+      const attached = await uploadPending()
+      return reviseTask(task.id, inputValue, attached)
     },
     onSuccess,
   })
   const answerMutation = useMutation({
     mutationFn: async () => {
-      await uploadPending()
-      return answerTask(task.id, inputValue)
+      const attached = await uploadPending()
+      return answerTask(task.id, inputValue, attached)
     },
     onSuccess,
   })

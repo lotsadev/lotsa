@@ -259,3 +259,34 @@ describe('ChatMessage — pr_decision is a first-class chat bubble', () => {
     expect(getByText('pr-fix Agent')).toBeInTheDocument()
   })
 })
+
+describe('ChatMessage — readable code blocks under the typography plugin (R5)', () => {
+  // The `@tailwindcss/typography` plugin colours `pre`/`pre code` with its
+  // light "meant for a dark pre background" `--tw-prose-pre-code`, which is
+  // grey-on-grey against the light `bg-muted` we set — and wraps inline `code`
+  // in literal backtick quotes. The PROSE_CLASSES overrides must re-assert the
+  // readable look. Guard the exact classes so the plugin can't silently win again.
+  it('forces fenced code text to the theme foreground (not the plugin pre-code grey)', () => {
+    const msg = makeMessage({
+      role: 'agent',
+      type: 'output',
+      content: '```\nconst x = 1\n```',
+    })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    const prose = container.querySelector('.prose')
+    expect(prose).not.toBeNull()
+    expect(prose!.getAttribute('class') ?? '').toMatch(/\[&_pre\]:text-foreground/)
+  })
+
+  it('strips the plugin-injected backtick quotes around inline code', () => {
+    const msg = makeMessage({ role: 'agent', type: 'output', content: 'use `npm run build`' })
+    const { container } = render(<ChatMessage message={msg} />)
+
+    const prose = container.querySelector('.prose')
+    expect(prose).not.toBeNull()
+    const cls = prose!.getAttribute('class') ?? ''
+    expect(cls).toMatch(/\[&_code\]:before:content-none/)
+    expect(cls).toMatch(/\[&_code\]:after:content-none/)
+  })
+})

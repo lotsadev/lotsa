@@ -4,6 +4,7 @@ import { useTask } from '@/hooks/use-task'
 import { ArtifactsTab } from './artifacts-tab'
 import { ChangesTab } from './changes-tab'
 import { ActivityTab } from './activity-tab'
+import { AttachmentsTab } from './attachments-tab'
 
 interface RightPanelProps {
   taskId: string | null
@@ -15,28 +16,33 @@ export function RightPanel({ taskId }: RightPanelProps) {
   const prevRunning = useRef(false)
   const prevArtifactCount = useRef(0)
 
+  // Read the exact fields the effects below depend on, so their dependency
+  // arrays list primitives/values rather than the whole `data` object — that
+  // keeps them from re-firing on every poll while satisfying exhaustive-deps.
+  const taskStatus = data?.task.status
+  const isConversational = data?.task.is_conversational
+  const artifacts = data?.artifacts
+
   // Auto-switch tab only for non-conversational steps (coding, review)
   // Don't switch for conversational steps (spec, verify) where the agent
   // runs briefly to respond to a message
   useEffect(() => {
-    if (!data) return
-    const running = data.task.status === 'working'
-    const conversational = data.task.is_conversational
-    if (running && !prevRunning.current && !conversational) setActiveTab('changes')
-    if (!running && prevRunning.current && !conversational) setActiveTab('artifacts')
+    if (taskStatus === undefined) return
+    const running = taskStatus === 'working'
+    if (running && !prevRunning.current && !isConversational) setActiveTab('changes')
+    if (!running && prevRunning.current && !isConversational) setActiveTab('artifacts')
     prevRunning.current = running
-  }, [data?.task.status, data?.task.is_conversational])
+  }, [taskStatus, isConversational])
 
   // When a new artifact lands, jump to the Artifacts tab so the user sees it.
   // Wins over the running→changes switch above when both fire on the same render.
   useEffect(() => {
-    if (!data) return
-    const count = Object.keys(data.artifacts ?? {}).length
+    const count = Object.keys(artifacts ?? {}).length
     if (count > prevArtifactCount.current) {
       setActiveTab('artifacts')
     }
     prevArtifactCount.current = count
-  }, [data?.artifacts])
+  }, [artifacts])
 
   if (!taskId || !data) {
     return (
@@ -58,6 +64,9 @@ export function RightPanel({ taskId }: RightPanelProps) {
         <TabsTrigger value="activity" className="flex-1">
           Activity
         </TabsTrigger>
+        <TabsTrigger value="attachments" className="flex-1">
+          Attachments
+        </TabsTrigger>
       </TabsList>
       <TabsContent value="artifacts" className="flex-1 overflow-hidden mt-0">
         <ArtifactsTab
@@ -68,10 +77,19 @@ export function RightPanel({ taskId }: RightPanelProps) {
         />
       </TabsContent>
       <TabsContent value="changes" className="flex-1 overflow-hidden mt-0">
-        <ChangesTab taskId={taskId} active={activeTab === 'changes'} />
+        <ChangesTab
+          taskId={taskId}
+          active={activeTab === 'changes'}
+          status={data.task.status}
+          prNumber={data.task.metadata?.pr_number as number | string | undefined}
+          prUrl={data.task.metadata?.pr_url as string | undefined}
+        />
       </TabsContent>
       <TabsContent value="activity" className="flex-1 overflow-hidden mt-0">
         <ActivityTab key={taskId} taskId={taskId} active={activeTab === 'activity'} />
+      </TabsContent>
+      <TabsContent value="attachments" className="flex-1 overflow-hidden mt-0">
+        <AttachmentsTab key={taskId} taskId={taskId} active={activeTab === 'attachments'} />
       </TabsContent>
     </Tabs>
   )
