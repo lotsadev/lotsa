@@ -49,6 +49,21 @@ jobs:
         pattern: "^PR_FIX_SKIPPED:"
         target: wait_for_pr_signal
 
+  # ``pr_summary`` reuses ``build``'s ``pr_summary-{system,user}.md`` via the
+  # fix → build prompt fallback (``_resolve_prompts_search_paths``) — fix ships
+  # no copy of the prompt. It declares no ``inputs`` (a missing spec must never
+  # block it) and lives only in ``main``, not ``pr_fix`` (a re-push keeps the
+  # existing PR and must not regenerate its text — mirrors ``build``). No
+  # per-step ``model:`` is pinned: consistent with the bundled "ship no per-step
+  # models" policy (see build/process.yaml) — model-pinning fix's summary to a
+  # cheaper tier is left to operator policy in lotsa.yaml.
+  - name: pr_summary
+    type: agent
+    prompt: pr_summary
+    output: pr_description
+    queue_state: summarizing
+    active_state: summarizing
+
   - name: push_pr
     type: action
     tool: push_pr
@@ -87,6 +102,7 @@ flows:
           - source: stdout
             pattern: "^REVIEW_FAIL"
             target: code
+      - pr_summary
       - push_pr
       - wait_for_pr_signal
 

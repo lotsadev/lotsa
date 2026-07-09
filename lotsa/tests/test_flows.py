@@ -314,7 +314,7 @@ def test_fix_process_has_pr_summary_agent_step():
     job = next((j for j in process.jobs if j.name == "pr_summary"), None)
     assert job is not None, "fix process must declare a pr_summary job"
     assert job.type == "agent"
-    assert job.prompt == "pr_summary"
+    assert job.prompt_name == "pr_summary"
     assert job.output == "pr_description"
 
 

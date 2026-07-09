@@ -206,11 +206,18 @@ def test_fix_process_loads_with_main_and_pr_fix_flows():
 
 
 def test_fix_main_flow_step_order():
-    """fix's main flow is code→review→push_pr→wait_for_pr_signal (it now pushes)."""
+    """fix's main flow is code→review→pr_summary→push_pr→wait_for_pr_signal.
+
+    fix opens a human-facing PR, so it summarizes (pr_summary → pr_description
+    artifact) before push — without it, the PR title falls back to the raw
+    first-prompt commit subject. pr_summary lives in ``main`` only (not the
+    ``pr_fix`` sub-flow, which must not regenerate PR text on a re-push).
+    """
     main = build_process("fix").flows["main"]
     assert [b.name for b in main.bindings] == [
         "code",
         "review",
+        "pr_summary",
         "push_pr",
         "wait_for_pr_signal",
     ]
