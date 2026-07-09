@@ -1,4 +1,4 @@
-.PHONY: setup dev build deploy frontend test lint format typecheck frontend-install frontend-dev frontend-build
+.PHONY: setup dev prebuild build deploy frontend test lint format typecheck frontend-install frontend-dev frontend-build
 
 # ---------------------------------------------------------------------------
 # Setup — run once after cloning
@@ -12,7 +12,11 @@ setup:
 # Package — build a wheel/sdist with the dashboard bundled (needs Node)
 # ---------------------------------------------------------------------------
 
-build:
+# Prebuild steps run before packaging. A dependency edge (not a recipe call) so
+# the bundle rebuilds even under `make -j`, closing hatch_build.py's stale-dist skip.
+prebuild: frontend
+
+build: prebuild
 	rm -rf dist build
 	python -m build
 
@@ -26,6 +30,7 @@ build:
 # Contributor convenience: build the dashboard-bundled wheel and deploy it via
 # the CLI's --wheel override (so the box runs your local build, not PyPI).
 # Reads ./deploy.yaml for the host + config, same as a pip user.
+# A fresh dashboard comes transitively via build; no frontend step needed here.
 deploy: build
 	lotsa deploy --wheel $$(ls dist/lotsa-*.whl)
 
