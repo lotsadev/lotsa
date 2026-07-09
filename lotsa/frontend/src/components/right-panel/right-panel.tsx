@@ -15,28 +15,33 @@ export function RightPanel({ taskId }: RightPanelProps) {
   const prevRunning = useRef(false)
   const prevArtifactCount = useRef(0)
 
+  // Read the exact fields the effects below depend on, so their dependency
+  // arrays list primitives/values rather than the whole `data` object — that
+  // keeps them from re-firing on every poll while satisfying exhaustive-deps.
+  const taskStatus = data?.task.status
+  const isConversational = data?.task.is_conversational
+  const artifacts = data?.artifacts
+
   // Auto-switch tab only for non-conversational steps (coding, review)
   // Don't switch for conversational steps (spec, verify) where the agent
   // runs briefly to respond to a message
   useEffect(() => {
-    if (!data) return
-    const running = data.task.status === 'working'
-    const conversational = data.task.is_conversational
-    if (running && !prevRunning.current && !conversational) setActiveTab('changes')
-    if (!running && prevRunning.current && !conversational) setActiveTab('artifacts')
+    if (taskStatus === undefined) return
+    const running = taskStatus === 'working'
+    if (running && !prevRunning.current && !isConversational) setActiveTab('changes')
+    if (!running && prevRunning.current && !isConversational) setActiveTab('artifacts')
     prevRunning.current = running
-  }, [data?.task.status, data?.task.is_conversational])
+  }, [taskStatus, isConversational])
 
   // When a new artifact lands, jump to the Artifacts tab so the user sees it.
   // Wins over the running→changes switch above when both fire on the same render.
   useEffect(() => {
-    if (!data) return
-    const count = Object.keys(data.artifacts ?? {}).length
+    const count = Object.keys(artifacts ?? {}).length
     if (count > prevArtifactCount.current) {
       setActiveTab('artifacts')
     }
     prevArtifactCount.current = count
-  }, [data?.artifacts])
+  }, [artifacts])
 
   if (!taskId || !data) {
     return (
