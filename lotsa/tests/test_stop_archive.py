@@ -587,7 +587,7 @@ class TestArchivedInvariant:
             async def _t():
                 transitions = svc.flow.state_machine.transitions
                 complete_srcs = [src for (src, dst) in transitions if dst == "complete" and src != "complete"]
-                assert complete_srcs, "test setup: full flow should have an edge into 'complete'"
+                assert complete_srcs, "test setup: build flow should have an edge into 'complete'"
                 state = complete_srcs[0]
 
                 task = await db.create_task("Archived w/ edge", flow_name="build", state=state, status="archived")
@@ -607,7 +607,7 @@ class TestArchivedInvariant:
             async def _t():
                 transitions = svc.flow.state_machine.transitions
                 blocked_srcs = [src for (src, dst) in transitions if dst == "blocked" and src != "blocked"]
-                assert blocked_srcs, "test setup: full flow should have an edge into 'blocked'"
+                assert blocked_srcs, "test setup: build flow should have an edge into 'blocked'"
                 state = blocked_srcs[0]
 
                 task = await db.create_task("Archived blockable", flow_name="build", state=state, status="archived")
@@ -627,7 +627,7 @@ class TestArchivedInvariant:
 
             async def _t():
                 jobs = svc.flow.jobs
-                assert len(jobs) >= 2, "test setup: full flow should have multiple jobs"
+                assert len(jobs) >= 2, "test setup: build flow should have multiple jobs"
                 start_state = jobs[0].queue_state
                 target_name = jobs[1].name
 

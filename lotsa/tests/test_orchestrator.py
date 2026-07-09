@@ -4718,6 +4718,26 @@ class TestPromote:
         assert draft is not None, "promotion from chat should auto-seed draft_spec"
         assert full_request in draft
 
+    def test_promote_from_chat_to_fix_carries_conversation_as_instruction(self, service, run):
+        """Regression: the auto-seed must cover the destination's OWN declared
+        ``promotion_inputs``, not a hardcoded ``draft_spec``. ``fix``'s coding step
+        reads ``{artifact:instruction}`` (not ``draft_spec``), so a chat→fix handoff
+        with no explicit fields — the only shape the Hand off dialog produces — must
+        still seed ``instruction`` from the transcript. Before the fix the block
+        only seeded ``draft_spec``/``promotion_context``, so ``instruction`` rendered
+        as ``(not available)`` and the coding agent got zero context."""
+        task = run(service.create_task("Explore an idea"))
+        full_request = "rename the column and sweep every call site that reads it"
+        run(service.db.add_message(task.id, "user", "chat", full_request, "chat"))
+        _wait_until_waiting(service, run, task.id)
+
+        run(service.promote_task(task.id, "fix"))  # no explicit handover
+        run(asyncio.sleep(0.1))
+
+        instruction = run(service.get_named_artifact(task.id, "instruction"))
+        assert instruction is not None, "promotion from chat to fix should auto-seed instruction"
+        assert full_request in instruction
+
     @pytest.mark.parametrize("dest", ["build", "fix"])
     def test_bundled_preset_promotable_without_manual_load(self, service, run, dest):
         """ADR-034 §1/§5 acceptance #4 — every bundled preset is a valid

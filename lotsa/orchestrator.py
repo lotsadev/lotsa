@@ -1945,15 +1945,22 @@ class OrchestratorService:
         # carry the chat conversation forward so the destination's first step has
         # the FULL discussion — not just the (truncated) task title. Without this,
         # a task promoted from chat reaches e.g. ``planning`` with only ``{title}`` /
-        # empty ``{body}`` and reports the request "cut off". Seeded under both the
-        # generic ``promotion_context`` and ``draft_spec`` (what ``build``'s planning
-        # step reads); harmless extras for destinations that read neither.
+        # empty ``{body}`` and reports the request "cut off". Seeded under the
+        # generic ``promotion_context`` AND every artifact name the destination
+        # actually reads — i.e. each of its declared ``promotion_inputs``
+        # (``draft_spec`` for ``build``, ``instruction`` for ``fix``). Keying off
+        # the destination's own declared inputs rather than a hardcoded name is
+        # what keeps a chat→fix handoff from landing at ``{artifact:instruction}``
+        # → ``(not available)`` (zero context) now that the Hand off dialog always
+        # calls ``promote_task(..., undefined)``. Extras a destination doesn't read
+        # are harmless.
         seed_artifacts = dict(initial_artifacts or {})
         if not seed_artifacts:
             transcript = await self._chat_transcript(task_id)
             if transcript:
-                seed_artifacts["draft_spec"] = transcript
                 seed_artifacts["promotion_context"] = transcript
+                for pi in dest.promotion_inputs:
+                    seed_artifacts[pi.name] = transcript
 
         # Each lands twice: as an ``artifact`` row (so the destination's first step
         # can read it via ``get_named_artifact`` / the ``{artifact:NAME}`` prompt
