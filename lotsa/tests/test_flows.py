@@ -297,6 +297,68 @@ def test_bundled_presets_pass_cross_process_validator(preset):
 
 
 # ---------------------------------------------------------------------------
+# ``fix`` gains a pr_summary step (PR-title reliability across both Execute
+# processes). ``fix`` PRs previously took the deterministic raw-prompt fallback
+# because ``fix`` had no ``pr_summary`` step at all. It must now summarize in
+# ``main`` (before push) — but NOT in the ``pr_fix`` sub-flow (re-pushes keep
+# the existing PR and must not regenerate — mirrors ``build``).
+# ---------------------------------------------------------------------------
+
+
+def test_fix_process_has_pr_summary_agent_step():
+    """The ``fix`` process must declare a ``pr_summary`` agent job.
+
+    Fails pre-fix: ``fix`` ships no ``pr_summary`` job (``next(...)`` is
+    ``None`` → the assertion fires)."""
+    process = build_process("fix")
+    job = next((j for j in process.jobs if j.name == "pr_summary"), None)
+    assert job is not None, "fix process must declare a pr_summary job"
+    assert job.type == "agent"
+    assert job.prompt == "pr_summary"
+    assert job.output == "pr_description"
+
+
+def test_fix_pr_summary_declares_no_required_inputs():
+    """pr_summary must not declare ``inputs`` — a missing spec must not block it
+    (matches ``build``'s pr_summary)."""
+    process = build_process("fix")
+    job = next(j for j in process.jobs if j.name == "pr_summary")
+    assert job.inputs == []
+
+
+def test_fix_pr_summary_sits_between_review_and_push_pr_in_main():
+    """In ``fix``'s ``main`` flow, pr_summary runs after review, before push."""
+    process = build_process("fix")
+    names = [b.name for b in process.flows["main"].bindings]
+    assert "pr_summary" in names
+    assert names.index("review") < names.index("pr_summary") < names.index("push_pr")
+
+
+def test_fix_review_routes_to_pr_summary_and_pr_summary_routes_to_push_pr():
+    """The derived state machine wires review → pr_summary → push_pr in main."""
+    main = build_process("fix").flows["main"]
+    by_name = {rj.name: rj for rj in main.jobs}
+    assert by_name["review"].success_state == by_name["pr_summary"].queue_state
+    assert by_name["pr_summary"].success_state == by_name["push_pr"].queue_state
+
+
+def test_fix_pr_fix_flow_has_no_pr_summary_step():
+    """The ``pr_fix`` sub-flow must NOT regenerate the PR text on a re-push."""
+    pr_fix = build_process("fix").flows["pr_fix"]
+    assert not any(b.name == "pr_summary" for b in pr_fix.bindings)
+
+
+def test_fix_pr_summary_prompt_resolves_via_build_fallback():
+    """``fix`` reuses ``build``'s pr_summary prompt via the fix→build fallback —
+    the prompt files are not duplicated into ``fix/``."""
+    process = build_process("fix")
+    system = process.registry.load("pr_summary-system")
+    user = process.registry.load("pr_summary-user")
+    assert len(system) > 50
+    assert len(user) > 50
+
+
+# ---------------------------------------------------------------------------
 # ADR-027 — process catalog ``description`` / ``promotion_inputs`` (PR 1 R4)
 # ---------------------------------------------------------------------------
 

@@ -398,6 +398,82 @@ class TestArtifactCapture:
         row = run(service.db.get_task(task.id))
         assert row.status == "blocked"
 
+    def test_artifact_capture_blocks_on_empty_output(self, service, run):
+        """A successful step that promised an artifact but produced only
+        whitespace must block (→ Retry re-runs the step), not silently save
+        nothing and let a downstream consumer (push_pr) fall back to a
+        raw-prompt PR title.
+
+        Regression: pre-fix the capture block was gated on
+        ``result.stdout.strip()``, so an empty/whitespace result skipped the
+        whole block — no raise, no artifact — and the successful completion
+        advanced the task instead of blocking. Against the pre-fix code the
+        task is NOT blocked (it advances out of the single step), so the
+        ``row.status == "blocked"`` assertion fails.
+        """
+        from lotsa.flows import build_process
+
+        flow_yaml = service.config.work_dir / "empty_artifact_flow.yaml"
+        flow_yaml.write_text("name: empty-test\njobs:\n  - name: coding\n    output: pr_description\n")
+        proc = build_process("custom", process_file=flow_yaml)
+        service.process = proc
+        service._processes[service._active_process_name] = proc
+        service.flow = proc.flows.get("main") or next(iter(proc.flows.values()))
+
+        service.runner = FakeRunner(
+            AgentResult(
+                success=True,
+                stdout="   \n  \n",
+                stderr="",
+                return_code=0,
+                duration_ms=100,
+            )
+        )
+        task = run(service.create_task("Empty artifact test"))
+        run(asyncio.sleep(0.3))
+
+        messages = run(service.db.get_messages(task.id, msg_type="artifact"))
+        assert len(messages) == 0, "an empty artifact must not be persisted"
+        row = run(service.db.get_task(task.id))
+        assert row.status == "blocked"
+
+    def test_artifact_capture_saves_when_failed_step_has_usable_output(self, service, run):
+        """The empty-output guard must remain gated on ``result.success`` — an
+        UNSUCCESSFUL step with usable stdout still persists its artifact and is
+        NOT diverted through the artifact-capture raise.
+
+        Companion invariant to the empty-output guard: the restructure must not
+        start gating artifact capture (or the new empty-raise) on the failure
+        path. (This preserves existing behaviour, so it passes both pre- and
+        post-fix — it guards against a regression in the restructure rather
+        than pinning the new behaviour.)
+        """
+        from lotsa.flows import build_process
+
+        flow_yaml = service.config.work_dir / "failed_artifact_flow.yaml"
+        flow_yaml.write_text("name: failed-test\njobs:\n  - name: coding\n    output: pr_description\n")
+        proc = build_process("custom", process_file=flow_yaml)
+        service.process = proc
+        service._processes[service._active_process_name] = proc
+        service.flow = proc.flows.get("main") or next(iter(proc.flows.values()))
+
+        service.runner = FakeRunner(
+            AgentResult(
+                success=False,
+                stdout="feat(x): a usable summary\n\nThe body has real content.",
+                stderr="boom",
+                return_code=1,
+                duration_ms=100,
+            )
+        )
+        task = run(service.create_task("Failed but usable artifact test"))
+        run(asyncio.sleep(0.3))
+
+        messages = run(service.db.get_messages(task.id, msg_type="artifact"))
+        assert len(messages) >= 1
+        assert messages[-1].metadata.get("artifact_name") == "pr_description"
+        assert "a usable summary" in messages[-1].content
+
 
 class TestArtifactInputValidation:
     def test_missing_input_blocks_task(self, service, run):
