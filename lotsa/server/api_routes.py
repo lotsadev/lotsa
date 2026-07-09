@@ -18,6 +18,7 @@ from lotsa.attachments import (
     MAX_FILES_PER_TASK,
     attachments_root,
     remove_attachment_file,
+    safe_serving_headers,
     sanitize_filename,
     write_attachment,
 )
@@ -387,8 +388,12 @@ async def get_attachment_raw(request: Request, task_id: str, filename: str) -> F
     the served file must be a *recorded* attachment in ``tasks.metadata`` (a file
     merely present on disk is not served); and ``attachments_root`` scopes the
     read strictly to ``{data_dir}/attachments/{project_id}/{task_id}/``. Any miss
-    is a 404. The stored ``mime`` is the ``Content-Type`` and the disposition is
-    ``inline`` so a screenshot opens in the browser.
+    is a 404. Serving headers come from ``safe_serving_headers``: an allowlisted
+    raster image keeps its stored ``mime`` and opens ``inline`` (the screenshot
+    case), while any other type — the stored ``mime`` is the unfiltered upload
+    ``Content-Type`` — is normalized to ``application/octet-stream`` and forced
+    to ``attachment`` so an uploaded ``text/html``/``image/svg+xml`` file can
+    never execute as a same-origin document against the dashboard.
     """
     service = _get_service(request)
     row = await service.db.get_task(task_id)
@@ -405,11 +410,16 @@ async def get_attachment_raw(request: Request, task_id: str, filename: str) -> F
     path = attachments_root(service.config.data_dir, row.project_id, task_id) / safe
     if not path.is_file():
         raise _not_found()
+    media_type, disposition = safe_serving_headers(record.get("mime"))
     return FileResponse(
         path,
-        media_type=record.get("mime") or "application/octet-stream",
-        content_disposition_type="inline",
+        media_type=media_type,
+        content_disposition_type=disposition,
         filename=safe,
+        # Make the declared Content-Type authoritative: without nosniff a browser
+        # may sniff a file uploaded as ``image/png`` but containing HTML back to
+        # ``text/html`` and execute it. Pairs with the allowlist above.
+        headers={"X-Content-Type-Options": "nosniff"},
     )
 
 

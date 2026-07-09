@@ -1167,6 +1167,75 @@ class TestAttachmentVisibility:
 
         run(_test())
 
+    def test_raw_html_upload_is_forced_to_download_not_inline(self, app_with_service, run):
+        """An uploaded ``text/html`` file must never be served ``inline`` with its
+        stored type — that renders as a same-origin script document against the
+        dashboard. It is neutralized to ``application/octet-stream`` +
+        ``attachment`` (download).
+
+        Red pre-fix: the endpoint echoed the stored MIME with a hardcoded
+        ``inline`` disposition → content-type ``text/html`` and no ``attachment``.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            html = b"<script>fetch('/api/tasks')</script>"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "evil.html", html, "text/html")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/evil.html/raw")
+                assert raw.status_code == 200
+                assert raw.content == html  # bytes unchanged; only headers differ
+                assert raw.headers["content-type"].startswith("application/octet-stream")
+                assert "attachment" in raw.headers.get("content-disposition", "")
+                assert raw.headers.get("x-content-type-options") == "nosniff"
+
+        run(_test())
+
+    def test_raw_svg_upload_is_forced_to_download_not_inline(self, app_with_service, run):
+        """``image/svg+xml`` is image-ish but can carry script, so it is excluded
+        from the inline allowlist and forced to download like any other
+        non-raster type."""
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "x.svg", svg, "image/svg+xml")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/x.svg/raw")
+                assert raw.status_code == 200
+                assert raw.headers["content-type"].startswith("application/octet-stream")
+                assert "attachment" in raw.headers.get("content-disposition", "")
+
+        run(_test())
+
+    def test_raw_image_still_served_inline_with_nosniff(self, app_with_service, run):
+        """An allowlisted raster image keeps its real type + ``inline`` (the
+        screenshot case) and additionally carries ``nosniff`` so the declared
+        image type can't be sniffed back to HTML."""
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            png = b"\x89PNG\r\n\x1a\nSCREENSHOT"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "shot.png", png, "image/png")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/shot.png/raw")
+                assert raw.status_code == 200
+                assert raw.content == png
+                assert raw.headers["content-type"].startswith("image/png")
+                assert "inline" in raw.headers.get("content-disposition", "")
+                assert raw.headers.get("x-content-type-options") == "nosniff"
+
+        run(_test())
+
     # ── message ↔ attachment linkage (bubble) ───────────────────────
 
     def test_send_message_stamps_attachment_onto_bubble(self, app_with_service, run):

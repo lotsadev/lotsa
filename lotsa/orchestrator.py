@@ -1727,13 +1727,20 @@ class OrchestratorService:
         a deferred task — this is the point at which the operator's uploads have
         landed, so the row can be stamped with them (``messages`` is append-only,
         so the stamp can only be set at INSERT). The content was stashed in
-        ``metadata['deferred_first_message']`` at create; we insert it once,
-        guarded against a double-release by checking no chat row exists yet.
+        ``metadata['deferred_first_message']`` at create; the insert is claimed
+        once via an atomic metadata-flag CAS (``claim_metadata_flag``), not a
+        read-then-write ``get_messages`` existence check. Two releases can race —
+        an operator ``/dispatch`` against the restart-recovery sweep's
+        ``_classify_and_resume`` (both call this for the same never-dispatched
+        row), or a double-clicked Dispatch — and an existence check lets both
+        observe no chat row and both insert before either's message is visible,
+        producing a duplicate first message. The CAS resolves a single winner
+        independently of whether any DB call happens to suspend.
         """
         deferred = (row.metadata or {}).get("deferred_first_message")
         if deferred is not None:
-            existing_chats = await self.db.get_messages(row.id, msg_type="chat")
-            if not existing_chats:
+            won = await self.db.claim_metadata_flag(row.id, "deferred_first_message_released")
+            if won:
                 records = row.metadata.get("attachments") or []
                 await self.db.add_message(
                     row.id,

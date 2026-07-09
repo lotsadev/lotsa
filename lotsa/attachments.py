@@ -38,6 +38,39 @@ MAX_FILES_PER_TASK = 10  # across a task's lifetime
 # ``materialize_into_worktree``), so nothing here reaches a commit.
 _ATTACH_SUBDIR = PurePosixPath(".lotsa/attachments")
 
+# MIME types safe to serve ``inline`` for in-browser preview. The upload
+# endpoint stores the client-supplied ``Content-Type`` verbatim (no MIME/
+# extension filtering), so a file uploaded as ``text/html`` or
+# ``image/svg+xml`` would — served inline with its stored type — execute as a
+# *same-origin* document against the dashboard's ``/api`` surface. This
+# allowlist (raster images only; the screenshot case that motivated the
+# feature) is the set we render inline; SVG is deliberately excluded because it
+# can carry script. Everything else is neutralized and forced to download.
+_INLINE_SAFE_MIMES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+    }
+)
+
+
+def safe_serving_headers(mime: str | None) -> tuple[str, str]:
+    """Return ``(media_type, content_disposition_type)`` for serving raw bytes.
+
+    Guards the browser-rendering path the raw endpoint opened up: an
+    allowlisted raster image keeps its real type and is served ``inline`` so a
+    screenshot opens in-browser; anything else — notably ``text/html`` and
+    ``image/svg+xml``, which run as same-origin script — is normalized to
+    ``application/octet-stream`` and forced to ``attachment`` (download), so it
+    can never execute against the dashboard. ``None`` (no stored MIME) is
+    treated as unsafe.
+    """
+    if mime in _INLINE_SAFE_MIMES:
+        return mime, "inline"
+    return "application/octet-stream", "attachment"
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()

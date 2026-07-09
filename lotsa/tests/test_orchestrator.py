@@ -6488,3 +6488,34 @@ class TestAttachmentMessageLinkage:
         assert len(mine) == 1
         names = [a["filename"] for a in (mine[0].metadata.get("attachments") or [])]
         assert names == ["mockup.png"]
+
+    def test_deferred_release_lost_claim_inserts_no_duplicate_message(self, service, run):
+        """Two releases can race — an operator ``/dispatch`` against the
+        restart-recovery sweep, or a double-clicked Dispatch. This reproduces the
+        interleave's losing side: a sibling caller has already *claimed* the
+        deferred release (the metadata flag is set) but its chat row isn't visible
+        yet. A second ``_release_first_step`` must observe the claim and insert
+        nothing — otherwise the append-only log gains a duplicate first message.
+
+        Red pre-fix: the guard was a ``get_messages`` existence check, which sees
+        no chat row in this window and inserts a second copy → the ``== 0``
+        assertion fails with one row present. Post-fix the atomic
+        ``claim_metadata_flag`` CAS loses, so the branch is skipped.
+        """
+        task = run(service.create_task(message="Ship the mockup", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+
+        # Simulate the sibling caller having won the claim (flag set) before its
+        # own message insert is visible — the exact window the CAS closes. Set
+        # only the flag; leave the deferred payload intact and no chat row yet.
+        row = run(service.db.get_task(task.id))
+        md = {**row.metadata, "deferred_first_message_released": True}
+        run(service.db.update_task(task.id, metadata=md))
+
+        row = run(service.db.get_task(task.id))
+        run(service._release_first_step(row))
+        run(asyncio.sleep(0.2))
+
+        chats = run(service.db.get_messages(task.id, msg_type="chat"))
+        mine = [m for m in chats if m.role == "user" and m.content == "Ship the mockup"]
+        assert len(mine) == 0, "a caller that lost the release claim must not insert the first message"
