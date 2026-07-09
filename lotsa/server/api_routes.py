@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from starlette.requests import Request
 
@@ -16,7 +16,10 @@ from lotsa import overrides
 from lotsa.attachments import (
     MAX_FILE_BYTES,
     MAX_FILES_PER_TASK,
+    attachments_root,
     remove_attachment_file,
+    safe_serving_headers,
+    sanitize_filename,
     write_attachment,
 )
 from lotsa.orchestrator import (
@@ -103,8 +106,13 @@ class ProcessSummary(BaseModel):
     promotion_inputs: list[PromotionInputResponse] = []
 
 
+# Attachment filenames uploaded for this send, stamped onto the message the
+# backend inserts (``message.metadata.attachments``) so the chat bubble can
+# render them. Append-only-safe: set at INSERT, never an UPDATE. Optional and
+# defaulting to empty so existing callers are unaffected.
 class FeedbackRequest(BaseModel):
     feedback: str
+    attachments: list[str] = []
 
 
 class PromoteRequest(BaseModel):
@@ -114,10 +122,12 @@ class PromoteRequest(BaseModel):
 
 class AnswerRequest(BaseModel):
     answer: str
+    attachments: list[str] = []
 
 
 class MessageRequest(BaseModel):
     message: str
+    attachments: list[str] = []
 
 
 class AcknowledgeOverrideRequest(BaseModel):
@@ -368,6 +378,51 @@ async def upload_attachment(request: Request, task_id: str, filename: str) -> At
     return AttachmentResponse(**record)
 
 
+@router.get("/tasks/{task_id}/attachments/{filename}/raw")
+async def get_attachment_raw(request: Request, task_id: str, filename: str) -> FileResponse:
+    """Serve one prompt attachment's raw bytes for in-browser preview/download.
+
+    The bytes-serving primitive the dashboard's thumbnails and the right-panel
+    Attachments list both need. Three layers keep it safe: ``sanitize_filename``
+    collapses any traversal to a bare basename (same guard as the upload path);
+    the served file must be a *recorded* attachment in ``tasks.metadata`` (a file
+    merely present on disk is not served); and ``attachments_root`` scopes the
+    read strictly to ``{data_dir}/attachments/{project_id}/{task_id}/``. Any miss
+    is a 404. Serving headers come from ``safe_serving_headers``: an allowlisted
+    raster image keeps its stored ``mime`` and opens ``inline`` (the screenshot
+    case), while any other type — the stored ``mime`` is the unfiltered upload
+    ``Content-Type`` — is normalized to ``application/octet-stream`` and forced
+    to ``attachment`` so an uploaded ``text/html``/``image/svg+xml`` file can
+    never execute as a same-origin document against the dashboard.
+    """
+    service = _get_service(request)
+    row = await service.db.get_task(task_id)
+    if row is None:
+        raise _not_found()
+    try:
+        safe = sanitize_filename(filename)
+    except ValueError:
+        raise _not_found() from None
+    records = row.metadata.get("attachments") or []
+    record = next((a for a in records if a["filename"] == safe), None)
+    if record is None:
+        raise _not_found()
+    path = attachments_root(service.config.data_dir, row.project_id, task_id) / safe
+    if not path.is_file():
+        raise _not_found()
+    media_type, disposition = safe_serving_headers(record.get("mime"))
+    return FileResponse(
+        path,
+        media_type=media_type,
+        content_disposition_type=disposition,
+        filename=safe,
+        # Make the declared Content-Type authoritative: without nosniff a browser
+        # may sniff a file uploaded as ``image/png`` but containing HTML back to
+        # ``text/html`` and execute it. Pairs with the allowlist above.
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
 @router.get("/tasks/{task_id}/agent-activity")
 async def get_agent_activity(
     request: Request,
@@ -524,7 +579,7 @@ async def approve_task(request: Request, task_id: str) -> TaskDetailFullResponse
 async def revise_task(request: Request, task_id: str, body: FeedbackRequest) -> TaskDetailFullResponse:
     service = _get_service(request)
     try:
-        await service.revise(task_id, body.feedback)
+        await service.revise(task_id, body.feedback, attachment_filenames=body.attachments)
     except ReviseNotAllowed as exc:
         raise _bad_request(exc, "REVISE_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)
@@ -560,7 +615,7 @@ async def mark_complete_task(request: Request, task_id: str) -> TaskDetailFullRe
 async def answer_task(request: Request, task_id: str, body: AnswerRequest) -> TaskDetailFullResponse:
     service = _get_service(request)
     try:
-        await service.answer(task_id, body.answer)
+        await service.answer(task_id, body.answer, attachment_filenames=body.attachments)
     except AnswerNotAllowed as exc:
         raise _bad_request(exc, "ANSWER_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)
@@ -570,7 +625,7 @@ async def answer_task(request: Request, task_id: str, body: AnswerRequest) -> Ta
 async def send_message(request: Request, task_id: str, body: MessageRequest) -> TaskDetailFullResponse:
     service = _get_service(request)
     try:
-        await service.send_message(task_id, body.message)
+        await service.send_message(task_id, body.message, attachment_filenames=body.attachments)
     except ReviseNotAllowed as exc:
         raise _bad_request(exc, "MESSAGE_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)

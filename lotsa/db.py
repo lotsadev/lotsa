@@ -586,6 +586,31 @@ class TaskDB:
         await self._commit()
         return cur.rowcount == 1
 
+    async def claim_metadata_flag(self, task_id: str, flag: str) -> bool:
+        """Atomically set ``metadata.$.<flag>`` to ``true`` iff currently unset.
+
+        A single-statement CAS (same one-UPDATE discipline as
+        :meth:`append_attachment`) so exactly one caller wins the claim: the
+        ``json_extract(...) IS NULL`` guard in the WHERE clause admits only the
+        first writer, and every later caller sees ``rowcount == 0``. Used to gate
+        a once-only side effect (e.g. the deferred first chat-message insert)
+        behind a persisted marker rather than a read-then-write existence check,
+        which two concurrent releases could both pass before either's write is
+        visible. ``flag`` must be a bare key (no ``$`` / ``.`` / ``[``), which
+        every current caller satisfies with a literal.
+
+        Returns True when this caller set the flag, False when it was already set
+        (or the task no longer exists).
+        """
+        path = f"$.{flag}"
+        cur = await self._execute(
+            "UPDATE tasks SET metadata = json_set(metadata, ?, json('true')), updated_at = ? "
+            "WHERE id = ? AND json_extract(metadata, ?) IS NULL",
+            (path, _now(), task_id, path),
+        )
+        await self._commit()
+        return cur.rowcount == 1
+
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> TaskRow:
         return TaskRow(

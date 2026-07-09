@@ -24,6 +24,7 @@ from lotsa.attachments import (
     MAX_FILES_PER_TASK,
     attachments_root,
     materialize_into_worktree,
+    safe_serving_headers,
     sanitize_filename,
     write_attachment,
 )
@@ -335,3 +336,54 @@ class TestAppendAttachment:
         fresh = run(db.get_task(task.id))
         assert fresh is not None
         assert len(fresh.metadata["attachments"]) == MAX_FILES_PER_TASK
+
+
+class TestClaimMetadataFlag:
+    """The single-winner metadata-flag CAS that gates once-only side effects
+    (e.g. the deferred first-message insert) behind a persisted marker."""
+
+    def test_first_claim_wins_second_loses(self, db, run):
+        task = run(db.create_task("Claim", project_id="default"))
+        first = run(db.claim_metadata_flag(task.id, "released"))
+        second = run(db.claim_metadata_flag(task.id, "released"))
+        assert first is True
+        assert second is False
+
+    def test_claim_persists_flag_and_preserves_other_keys(self, db, run):
+        task = run(db.create_task("Claim", project_id="default", metadata={"session_id": "s-1"}))
+        run(db.claim_metadata_flag(task.id, "released"))
+
+        fresh = run(db.get_task(task.id))
+        assert fresh is not None
+        assert fresh.metadata["released"] is True
+        assert fresh.metadata["session_id"] == "s-1"
+
+    def test_distinct_flags_are_independent(self, db, run):
+        task = run(db.create_task("Claim", project_id="default"))
+        assert run(db.claim_metadata_flag(task.id, "a")) is True
+        # A different flag is a fresh claim, not blocked by the first.
+        assert run(db.claim_metadata_flag(task.id, "b")) is True
+        assert run(db.claim_metadata_flag(task.id, "a")) is False
+
+    def test_claim_on_missing_task_returns_false(self, db, run):
+        assert run(db.claim_metadata_flag("deadbeef", "released")) is False
+
+
+class TestSafeServingHeaders:
+    """The XSS guard for the raw-bytes endpoint: only allowlisted raster images
+    are served inline; everything else downloads as octet-stream."""
+
+    @pytest.mark.parametrize("mime", ["image/png", "image/jpeg", "image/gif", "image/webp"])
+    def test_allowlisted_images_served_inline_with_real_type(self, mime):
+        media_type, disposition = safe_serving_headers(mime)
+        assert media_type == mime
+        assert disposition == "inline"
+
+    @pytest.mark.parametrize(
+        "mime",
+        ["text/html", "image/svg+xml", "application/xhtml+xml", "text/plain", "application/pdf", None],
+    )
+    def test_unsafe_or_unknown_types_forced_to_download(self, mime):
+        media_type, disposition = safe_serving_headers(mime)
+        assert media_type == "application/octet-stream"
+        assert disposition == "attachment"

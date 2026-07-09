@@ -1047,3 +1047,284 @@ class TestAttachmentsEndpoint:
                 assert resp.status_code == 404
 
         run(_test())
+
+
+class TestAttachmentVisibility:
+    """Make uploaded attachments visible in the dashboard (spec: thumbnails +
+    right-panel + raw endpoint).
+
+    Three coordinated pieces are exercised here:
+
+    * ``GET /api/tasks/{id}/attachments/{filename}/raw`` — the missing
+      bytes-serving primitive both the bubble thumbnail and the right-panel
+      list need. Written before the route exists, so the positive tests below
+      currently 404 — that is the expected red.
+    * message ↔ attachment linkage stamped into ``message.metadata.attachments``
+      at INSERT (append-only-safe). Currently the message-POST bodies drop the
+      attachment field on the floor, so the stamped-metadata assertions fail.
+    * the first-message (deferred) path carries its attachments on the first
+      ``You`` bubble once dispatch releases.
+    """
+
+    @staticmethod
+    async def _waiting_task(service, message="Look at the screenshot"):
+        """Create a task and drive it to ``waiting`` (the single evaluate gate in
+        the server test flow parks it there after the agent runs)."""
+        task = await service.create_task(message=message)
+        await wait_for_status(service, task.id, "waiting")
+        return task
+
+    @staticmethod
+    async def _upload(client, task_id, filename, data, ctype):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/attachments?filename={filename}",
+            content=data,
+            headers={"content-type": ctype},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    # ── raw bytes endpoint ──────────────────────────────────────────
+
+    def test_raw_serves_stored_bytes_inline_with_recorded_mime(self, app_with_service, run):
+        """The raw endpoint returns the exact stored bytes, the recorded MIME as
+        Content-Type, and an inline disposition so a screenshot opens in-browser.
+
+        Red pre-fix: the route does not exist → 404, so the 200 assertion fails.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            png = b"\x89PNG\r\n\x1a\nSCREENSHOT-BYTES"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "shot.png", png, "image/png")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/shot.png/raw")
+                assert raw.status_code == 200
+                assert raw.content == png
+                assert raw.headers["content-type"].startswith("image/png")
+                assert "inline" in raw.headers.get("content-disposition", "")
+
+        run(_test())
+
+    def test_raw_unknown_filename_is_404(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get(f"/api/tasks/{task.id}/attachments/nope.png/raw")
+                assert resp.status_code == 404
+
+        run(_test())
+
+    def test_raw_unknown_task_is_404(self, app_with_service, run):
+        app, _ = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/api/tasks/deadbeef/attachments/x.png/raw")
+                assert resp.status_code == 404
+
+        run(_test())
+
+    def test_raw_is_task_scoped(self, app_with_service, run):
+        """A filename recorded on task A must not be served under task B — the
+        record lookup is keyed on the requesting task's own metadata."""
+        app, service = app_with_service
+
+        async def _test():
+            task_a = await self._waiting_task(service)
+            task_b = await self._waiting_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task_a.id, "secret.png", b"AAAA", "image/png")
+                # Same filename, different task → not found.
+                resp = await client.get(f"/api/tasks/{task_b.id}/attachments/secret.png/raw")
+                assert resp.status_code == 404
+
+        run(_test())
+
+    def test_raw_rejects_unrecorded_file_on_disk(self, app_with_service, run):
+        """A file physically present in the attach dir but absent from the task's
+        metadata records must 404 — the endpoint serves only recorded
+        attachments, never arbitrary bytes found on disk."""
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            attach_dir = service.config.data_dir / "attachments" / "default" / task.id
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            (attach_dir / "orphan.png").write_bytes(b"NOT-RECORDED")
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get(f"/api/tasks/{task.id}/attachments/orphan.png/raw")
+                assert resp.status_code == 404
+
+        run(_test())
+
+    def test_raw_html_upload_is_forced_to_download_not_inline(self, app_with_service, run):
+        """An uploaded ``text/html`` file must never be served ``inline`` with its
+        stored type — that renders as a same-origin script document against the
+        dashboard. It is neutralized to ``application/octet-stream`` +
+        ``attachment`` (download).
+
+        Red pre-fix: the endpoint echoed the stored MIME with a hardcoded
+        ``inline`` disposition → content-type ``text/html`` and no ``attachment``.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            html = b"<script>fetch('/api/tasks')</script>"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "evil.html", html, "text/html")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/evil.html/raw")
+                assert raw.status_code == 200
+                assert raw.content == html  # bytes unchanged; only headers differ
+                assert raw.headers["content-type"].startswith("application/octet-stream")
+                assert "attachment" in raw.headers.get("content-disposition", "")
+                assert raw.headers.get("x-content-type-options") == "nosniff"
+
+        run(_test())
+
+    def test_raw_svg_upload_is_forced_to_download_not_inline(self, app_with_service, run):
+        """``image/svg+xml`` is image-ish but can carry script, so it is excluded
+        from the inline allowlist and forced to download like any other
+        non-raster type."""
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "x.svg", svg, "image/svg+xml")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/x.svg/raw")
+                assert raw.status_code == 200
+                assert raw.headers["content-type"].startswith("application/octet-stream")
+                assert "attachment" in raw.headers.get("content-disposition", "")
+
+        run(_test())
+
+    def test_raw_image_still_served_inline_with_nosniff(self, app_with_service, run):
+        """An allowlisted raster image keeps its real type + ``inline`` (the
+        screenshot case) and additionally carries ``nosniff`` so the declared
+        image type can't be sniffed back to HTML."""
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            png = b"\x89PNG\r\n\x1a\nSCREENSHOT"
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await self._upload(client, task.id, "shot.png", png, "image/png")
+
+                raw = await client.get(f"/api/tasks/{task.id}/attachments/shot.png/raw")
+                assert raw.status_code == 200
+                assert raw.content == png
+                assert raw.headers["content-type"].startswith("image/png")
+                assert "inline" in raw.headers.get("content-disposition", "")
+                assert raw.headers.get("x-content-type-options") == "nosniff"
+
+        run(_test())
+
+    # ── message ↔ attachment linkage (bubble) ───────────────────────
+
+    def test_send_message_stamps_attachment_onto_bubble(self, app_with_service, run):
+        """A file uploaded with a chat message is stamped onto that message's
+        ``metadata.attachments`` at insert — the data the ``You`` bubble reads to
+        render a thumbnail.
+
+        Red pre-fix: ``/message`` ignores the ``attachments`` body field, so the
+        inserted user message carries no attachment metadata.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                rec = await self._upload(client, task.id, "shot.png", b"PNG", "image/png")
+
+                sent = await client.post(
+                    f"/api/tasks/{task.id}/message",
+                    json={"message": "here is the screenshot", "attachments": [rec["filename"]]},
+                )
+                assert sent.status_code == 200
+
+                msgs = await client.get(f"/api/tasks/{task.id}/messages")
+                mine = [m for m in msgs.json() if m["role"] == "user" and m["content"] == "here is the screenshot"]
+                assert len(mine) == 1, "the operator's message should be recorded exactly once"
+                names = [a["filename"] for a in (mine[0]["metadata"].get("attachments") or [])]
+                assert names == ["shot.png"]
+
+        run(_test())
+
+    def test_revise_stamps_attachment_onto_feedback(self, app_with_service, run):
+        """The same linkage on the revise (feedback) path."""
+        app, service = app_with_service
+
+        async def _test():
+            task = await self._waiting_task(service)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                rec = await self._upload(client, task.id, "diagram.png", b"PNG", "image/png")
+
+                revised = await client.post(
+                    f"/api/tasks/{task.id}/revise",
+                    json={"feedback": "match this diagram", "attachments": [rec["filename"]]},
+                )
+                assert revised.status_code == 200
+
+                msgs = await client.get(f"/api/tasks/{task.id}/messages")
+                mine = [m for m in msgs.json() if m["role"] == "user" and m["content"] == "match this diagram"]
+                assert len(mine) == 1
+                names = [a["filename"] for a in (mine[0]["metadata"].get("attachments") or [])]
+                assert names == ["diagram.png"]
+
+        run(_test())
+
+    def test_deferred_first_message_carries_attachment(self, app_with_service, run):
+        """The empty-state motivating case: attach a screenshot, create the task,
+        and the first ``You`` bubble shows it after dispatch.
+
+        The create-then-upload-then-dispatch sequence uploads *after* the first
+        message would normally be inserted; the message must still carry the
+        attachment (stamped when the deferred first step is released). Red
+        pre-fix: the first message is inserted at create time with no attachment
+        metadata and nothing stamps it afterwards.
+        """
+        app, service = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                created = await client.post(
+                    "/api/tasks",
+                    json={"message": "Build this from the screenshot", "defer_dispatch": True},
+                )
+                task_id = created.json()["task"]["id"]
+
+                await self._upload(client, task_id, "mockup.png", b"PNGDATA", "image/png")
+
+                disp = await client.post(f"/api/tasks/{task_id}/dispatch")
+                assert disp.status_code == 200
+                await wait_for_status(service, task_id, "waiting")
+
+                msgs = await client.get(f"/api/tasks/{task_id}/messages")
+                chats = [
+                    m for m in msgs.json() if m["role"] == "user" and m["content"] == "Build this from the screenshot"
+                ]
+                assert len(chats) == 1, "the first operator message should exist exactly once (append-only)"
+                names = [a["filename"] for a in (chats[0]["metadata"].get("attachments") or [])]
+                assert names == ["mockup.png"]
+
+        run(_test())

@@ -6,9 +6,10 @@ import remarkBreaks from 'remark-breaks'
 import { Separator } from '@/components/ui/separator'
 import { Button } from '@/components/ui/button'
 import { FileText, ChevronDown, ExternalLink } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatBytes } from '@/lib/utils'
 import { formatRelativeTime, formatFullDateTime } from '@/lib/time'
-import type { Message } from '@/api/types'
+import { AttachmentStrip } from '@/components/attachment-view'
+import type { Message, Attachment } from '@/api/types'
 
 interface ChatMessageProps {
   message: Message
@@ -16,12 +17,6 @@ interface ChatMessageProps {
   // the single "awaiting your answer" bubble a duplicate question folded into
   // (R2). Renders the amber needs-input accent.
   awaitingInput?: boolean
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
 function TruncatedFooter({ message }: { message: Message }) {
@@ -198,6 +193,16 @@ export function ChatMessage({ message, awaitingInput = false }: ChatMessageProps
           </div>
           <div className="rounded-xl border border-primary/30 bg-primary/10 px-4 py-2.5">
             <MarkdownContent content={message.content} />
+            {Array.isArray(message.metadata?.attachments) && (
+              <AttachmentStrip
+                taskId={message.task_id}
+                // Safe assertion: the backend is the sole writer of
+                // `metadata.attachments` (stamped at message INSERT from the
+                // task's own attachment records), so elements always match
+                // `Attachment`'s shape; the `isArray` guard covers the type.
+                attachments={message.metadata.attachments as Attachment[]}
+              />
+            )}
             <MessageMetadata metadata={message.metadata} createdAt={message.created_at} />
           </div>
         </div>

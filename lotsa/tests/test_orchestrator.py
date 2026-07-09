@@ -6393,3 +6393,149 @@ class TestAttachmentMaterialization:
             run(service.stop(row.id))
         # Untouched — not parked at blocked by the deferred branch.
         assert run(service.db.get_task(row.id)).status == "working"
+
+
+class TestAttachmentMessageLinkage:
+    """Stamp uploaded attachments onto the specific message they rode in with, at
+    INSERT time — the ``messages`` table is append-only (no UPDATE), so the
+    linkage can only be set when the row is created.
+
+    Written before the feature exists: the message-creation paths do not accept
+    or record attachment filenames yet, and the deferred first-message insert is
+    not stamped — so the ``metadata['attachments']`` assertions below fail as the
+    expected red.
+    """
+
+    @staticmethod
+    def _seed_attachment(service, run, task_id, name="bug.png", data=b"PNGDATA"):
+        """Place a durable attachment on disk + in ``tasks.metadata`` exactly as
+        the upload endpoint would (without depending on the HTTP layer)."""
+        attach_dir = service.config.data_dir / "attachments" / "default" / task_id
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        (attach_dir / name).write_bytes(data)
+        row = run(service.db.get_task(task_id))
+        meta = dict(row.metadata)
+        meta.setdefault("attachments", [])
+        meta["attachments"].append(
+            {
+                "filename": name,
+                "rel_path": f".lotsa/attachments/{name}",
+                "mime": "image/png",
+                "size_bytes": len(data),
+                "created_at": "2026-07-02T00:00:00+00:00",
+            }
+        )
+        run(service.db.update_task(task_id, metadata=meta))
+
+    def test_send_message_stamps_attachment_records(self, service, run):
+        """``send_message`` records the named attachments onto the chat message it
+        inserts, resolving them from the task's attachment metadata.
+
+        Red pre-fix with a TypeError (``send_message`` has no
+        ``attachment_filenames`` parameter yet); once the parameter exists the
+        stamped-metadata assertion is the behavioural check.
+        """
+        task = run(service.create_task(message="Look at the screenshot"))
+        run(asyncio.sleep(0.2))
+        assert run(service.db.get_task(task.id)).status == "waiting"
+
+        self._seed_attachment(service, run, task.id, name="bug.png")
+        run(service.send_message(task.id, "here it is", attachment_filenames=["bug.png"]))
+        run(asyncio.sleep(0.2))
+
+        msgs = run(service.db.get_messages(task.id))
+        mine = [m for m in msgs if m.role == "user" and m.content == "here it is"]
+        assert len(mine) == 1
+        names = [a["filename"] for a in (mine[0].metadata.get("attachments") or [])]
+        assert names == ["bug.png"]
+
+    def test_send_message_without_attachments_leaves_metadata_clean(self, service, run):
+        """The stamp is opt-in: a message sent with no attachment filenames must
+        not accrue an ``attachments`` key (so the bubble renders no strip)."""
+        task = run(service.create_task(message="Plain message"))
+        run(asyncio.sleep(0.2))
+        assert run(service.db.get_task(task.id)).status == "waiting"
+
+        run(service.send_message(task.id, "no files here", attachment_filenames=None))
+        run(asyncio.sleep(0.2))
+
+        msgs = run(service.db.get_messages(task.id))
+        mine = [m for m in msgs if m.role == "user" and m.content == "no files here"]
+        assert len(mine) == 1
+        assert not (mine[0].metadata.get("attachments"))
+
+    def test_deferred_first_message_stamped_with_attachments(self, service, run):
+        """The empty-state first-message path: attachments upload after the task
+        is created but before its first step dispatches. The first ``You`` chat
+        message must carry them once ``dispatch_created`` releases the step.
+
+        Red pre-fix: the first message is inserted at create time (before the
+        upload), unstamped, and nothing stamps it afterwards.
+        """
+        task = run(service.create_task(message="Build from this mockup", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        # Attachment lands during the deferred window, as the upload endpoint would.
+        self._seed_attachment(service, run, task.id, name="mockup.png")
+
+        run(service.dispatch_created(task.id))
+        run(asyncio.sleep(0.2))
+
+        chats = run(service.db.get_messages(task.id, msg_type="chat"))
+        mine = [m for m in chats if m.role == "user" and m.content == "Build from this mockup"]
+        # Exactly one — append-only, no second stamped copy alongside an
+        # unstamped create-time row.
+        assert len(mine) == 1, "the first operator message must exist exactly once"
+        names = [a["filename"] for a in (mine[0].metadata.get("attachments") or [])]
+        assert names == ["mockup.png"]
+
+    def test_deferred_first_message_stamped_via_recovery_release(self, service, run):
+        """Restart recovery releases a stranded deferred task through
+        ``_release_first_step`` (not ``dispatch_created``). That path must stamp
+        the first message too, so a crash between upload and dispatch doesn't
+        lose the linkage.
+        """
+        task = run(service.create_task(message="Ship the mockup", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+        self._seed_attachment(service, run, task.id, name="mockup.png")
+
+        # The recovery sweep calls _release_first_step directly on the fresh row.
+        row = run(service.db.get_task(task.id))
+        run(service._release_first_step(row))
+        run(asyncio.sleep(0.2))
+
+        chats = run(service.db.get_messages(task.id, msg_type="chat"))
+        mine = [m for m in chats if m.role == "user" and m.content == "Ship the mockup"]
+        assert len(mine) == 1
+        names = [a["filename"] for a in (mine[0].metadata.get("attachments") or [])]
+        assert names == ["mockup.png"]
+
+    def test_deferred_release_lost_claim_inserts_no_duplicate_message(self, service, run):
+        """Two releases can race — an operator ``/dispatch`` against the
+        restart-recovery sweep, or a double-clicked Dispatch. This reproduces the
+        interleave's losing side: a sibling caller has already *claimed* the
+        deferred release (the metadata flag is set) but its chat row isn't visible
+        yet. A second ``_release_first_step`` must observe the claim and insert
+        nothing — otherwise the append-only log gains a duplicate first message.
+
+        Red pre-fix: the guard was a ``get_messages`` existence check, which sees
+        no chat row in this window and inserts a second copy → the ``== 0``
+        assertion fails with one row present. Post-fix the atomic
+        ``claim_metadata_flag`` CAS loses, so the branch is skipped.
+        """
+        task = run(service.create_task(message="Ship the mockup", defer_dispatch=True))
+        run(asyncio.sleep(0.2))
+
+        # Simulate the sibling caller having won the claim (flag set) before its
+        # own message insert is visible — the exact window the CAS closes. Set
+        # only the flag; leave the deferred payload intact and no chat row yet.
+        row = run(service.db.get_task(task.id))
+        md = {**row.metadata, "deferred_first_message_released": True}
+        run(service.db.update_task(task.id, metadata=md))
+
+        row = run(service.db.get_task(task.id))
+        run(service._release_first_step(row))
+        run(asyncio.sleep(0.2))
+
+        chats = run(service.db.get_messages(task.id, msg_type="chat"))
+        mine = [m for m in chats if m.role == "user" and m.content == "Ship the mockup"]
+        assert len(mine) == 0, "a caller that lost the release claim must not insert the first message"

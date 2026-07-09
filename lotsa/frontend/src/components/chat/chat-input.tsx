@@ -42,14 +42,19 @@ export function ChatInput({ data }: ChatInputProps) {
   // records (`name (1).png`) and burning the per-task count cap. The failed
   // file and any not-yet-attempted ones stay selected so a retry re-sends only
   // those.
-  const uploadPending = async () => {
+  // Returns the server-assigned filenames of the files uploaded in this batch
+  // (deduped names, unique per task) so the caller can stamp them onto the
+  // message it sends — that linkage is what lets the chat bubble render them.
+  const uploadPending = async (): Promise<string[]> => {
     setAttachError(null)
     const remaining = [...files]
+    const uploaded: string[] = []
     try {
       while (remaining.length > 0) {
         const f = remaining[0]
         try {
-          await uploadAttachment(task.id, f)
+          const rec = await uploadAttachment(task.id, f)
+          uploaded.push(rec.filename)
         } catch (e) {
           setAttachError(`Failed to attach ${f.name}: ${(e as Error).message}`)
           throw e
@@ -59,6 +64,7 @@ export function ChatInput({ data }: ChatInputProps) {
     } finally {
       setFiles(remaining)
     }
+    return uploaded
   }
 
   // ADR-043 — the Hand off button is the one-way Think→Execute gesture, so it
@@ -86,24 +92,26 @@ export function ChatInput({ data }: ChatInputProps) {
     setInputValue('')
   }
 
+  // The three message-bearing actions stamp the just-uploaded batch onto the
+  // message they create (message-scoped linkage → bubble thumbnails).
   const sendMutation = useMutation({
     mutationFn: async () => {
-      await uploadPending()
-      return sendMessage(task.id, inputValue)
+      const attached = await uploadPending()
+      return sendMessage(task.id, inputValue, attached)
     },
     onSuccess,
   })
   const reviseMutation = useMutation({
     mutationFn: async () => {
-      await uploadPending()
-      return reviseTask(task.id, inputValue)
+      const attached = await uploadPending()
+      return reviseTask(task.id, inputValue, attached)
     },
     onSuccess,
   })
   const answerMutation = useMutation({
     mutationFn: async () => {
-      await uploadPending()
-      return answerTask(task.id, inputValue)
+      const attached = await uploadPending()
+      return answerTask(task.id, inputValue, attached)
     },
     onSuccess,
   })

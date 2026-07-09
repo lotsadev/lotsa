@@ -23,6 +23,16 @@ export const fetchAgentActivity = (taskId: string, since = 0) =>
 export const fetchMessages = (taskId: string) =>
   apiFetch<Message[]>(`/api/tasks/${taskId}/messages`)
 
+// Task-scoped attachment metadata (all files on the task, regardless of which
+// message they rode in with). Bytes are fetched separately via attachmentRawUrl.
+export const fetchAttachments = (taskId: string) =>
+  apiFetch<Attachment[]>(`/api/tasks/${taskId}/attachments`)
+
+// URL of one attachment's raw bytes — an image opens full-size, other types
+// download. Filenames can contain spaces/parens (dedup suffixing), so encode.
+export const attachmentRawUrl = (taskId: string, filename: string) =>
+  `/api/tasks/${taskId}/attachments/${encodeURIComponent(filename)}/raw`
+
 export const fetchDiff = (taskId: string) =>
   apiFetch<{ diff: string | null }>(`/api/tasks/${taskId}/diff`)
 
@@ -80,22 +90,24 @@ export const uploadAttachment = async (taskId: string, file: File): Promise<Atta
 export const approveTask = (taskId: string) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/approve`, { method: 'POST' })
 
-export const reviseTask = (taskId: string, feedback: string) =>
+// The `attachments` filenames stamp the just-uploaded files onto the message
+// this send creates, so the chat bubble can render them (default [] = none).
+export const reviseTask = (taskId: string, feedback: string, attachments: string[] = []) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/revise`, {
     method: 'POST',
-    body: JSON.stringify({ feedback }),
+    body: JSON.stringify({ feedback, attachments }),
   })
 
-export const answerTask = (taskId: string, answer: string) =>
+export const answerTask = (taskId: string, answer: string, attachments: string[] = []) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/answer`, {
     method: 'POST',
-    body: JSON.stringify({ answer }),
+    body: JSON.stringify({ answer, attachments }),
   })
 
-export const sendMessage = (taskId: string, message: string) =>
+export const sendMessage = (taskId: string, message: string, attachments: string[] = []) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/message`, {
     method: 'POST',
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, attachments }),
   })
 
 export const blockTask = (taskId: string) =>

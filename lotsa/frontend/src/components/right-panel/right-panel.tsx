@@ -4,6 +4,7 @@ import { useTask } from '@/hooks/use-task'
 import { ArtifactsTab } from './artifacts-tab'
 import { ChangesTab } from './changes-tab'
 import { ActivityTab } from './activity-tab'
+import { AttachmentsTab } from './attachments-tab'
 
 interface RightPanelProps {
   taskId: string | null
@@ -63,6 +64,9 @@ export function RightPanel({ taskId }: RightPanelProps) {
         <TabsTrigger value="activity" className="flex-1">
           Activity
         </TabsTrigger>
+        <TabsTrigger value="attachments" className="flex-1">
+          Attachments
+        </TabsTrigger>
       </TabsList>
       <TabsContent value="artifacts" className="flex-1 overflow-hidden mt-0">
         <ArtifactsTab
@@ -83,6 +87,9 @@ export function RightPanel({ taskId }: RightPanelProps) {
       </TabsContent>
       <TabsContent value="activity" className="flex-1 overflow-hidden mt-0">
         <ActivityTab key={taskId} taskId={taskId} active={activeTab === 'activity'} />
+      </TabsContent>
+      <TabsContent value="attachments" className="flex-1 overflow-hidden mt-0">
+        <AttachmentsTab key={taskId} taskId={taskId} active={activeTab === 'attachments'} />
       </TabsContent>
     </Tabs>
   )
