@@ -5756,14 +5756,24 @@ class OrchestratorService:
                                         # ``_extract_needs_decision_question``) and
                                         # the cap-fire synthesised messages.
                                         # Contract documented on
-                                        # ``_record_pr_decision``.
+                                        # ``_record_pr_decision``. The ``pr_decision``
+                                        # row below is the SINGLE user-facing carrier
+                                        # of this reasoning; the divider stays bare.
                                         last_line = _strip_pr_fix_marker_prefix(line)
                                         break
+                            # A bare, constant divider marker — deliberately NOT the
+                            # reasoning. Embedding ``last_line`` here too duplicated
+                            # the sentence (the ``pr_decision`` chat bubble below
+                            # already conveys it) and, because the divider label is
+                            # rendered monospaced and non-wrapping, a long reasoning
+                            # line forced the dashboard to scroll horizontally. The
+                            # divider still separates rounds visually — it just
+                            # doesn't repeat the reasoning.
                             await self.db.add_message(
                                 item.id,
                                 "system",
                                 info.step.job_type,
-                                f"pr-fix skipped: {last_line}",
+                                "pr-fix skipped",
                                 "stage_transition",
                                 metadata={"from_step": "pr-fix", "to_step": monitor_state},
                             )
