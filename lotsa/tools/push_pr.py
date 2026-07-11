@@ -48,6 +48,7 @@ async def push_pr(task: TaskContext, config: dict[str, Any]) -> ToolResult:
             flow_name=task.flow_name,
             pr_description=pr_description,
             spec=draft_spec,
+            process_name=task.process_name,
         )
 
     try:

@@ -5275,20 +5275,35 @@ class OrchestratorService:
             # Save stdout as named artifact if this step declares an output
             # (skip conversational steps — their artifact is saved in the drainer
             # at SPEC_COMPLETE detection with cleaned content). Narration ahead
-            # of the content anchor is stripped at the source; an artifact that
-            # is unusable after stripping fails the dispatch (→ blocked, Retry
-            # re-runs the agent) instead of persisting garbage for downstream
-            # {artifact:NAME} prompt injection and the push step to consume.
-            if step.output and not step.conversational and result.stdout and result.stdout.strip():
-                cleaned = _strip_artifact_narration(result.stdout)
-                if result.success and len(cleaned) < _MIN_ARTIFACT_CHARS:
+            # of the content anchor is stripped at the source. A *successful*
+            # step that promised an artifact but couldn't deliver a usable one
+            # fails the dispatch (→ blocked, Retry re-runs the agent) instead of
+            # silently persisting nothing — two ways it can fail: empty/whitespace
+            # stdout, or stdout that reduces below the minimum after narration
+            # stripping. Both previously degraded silently (the empty case slipped
+            # through the old `and result.stdout.strip()` gate), letting a
+            # downstream consumer fall back to garbage — for pr_summary, a
+            # raw-prompt PR title. An *unsuccessful* result never blocks here; it
+            # routes through the normal failure path (and still persists any
+            # non-empty stdout for {artifact:NAME} prompt injection / the push step).
+            if step.output and not step.conversational:
+                raw = result.stdout or ""
+                if result.success and not raw.strip():
                     raise ArtifactCaptureError(
                         f"Declared output artifact {step.output!r} is unusable: "
-                        f"step stdout reduced to {len(cleaned)} chars after narration "
-                        f"stripping (minimum {_MIN_ARTIFACT_CHARS}). Retry re-runs the step."
+                        f"step succeeded but produced empty/whitespace stdout. "
+                        f"Retry re-runs the step."
                     )
-                artifact_meta = {"artifact_name": step.output}
-                await self.source.save_artifact(item.id, step.job_type, cleaned, metadata=artifact_meta)
+                if raw.strip():
+                    cleaned = _strip_artifact_narration(raw)
+                    if result.success and len(cleaned) < _MIN_ARTIFACT_CHARS:
+                        raise ArtifactCaptureError(
+                            f"Declared output artifact {step.output!r} is unusable: "
+                            f"step stdout reduced to {len(cleaned)} chars after narration "
+                            f"stripping (minimum {_MIN_ARTIFACT_CHARS}). Retry re-runs the step."
+                        )
+                    artifact_meta = {"artifact_name": step.output}
+                    await self.source.save_artifact(item.id, step.job_type, cleaned, metadata=artifact_meta)
 
             await self.source.append_event(
                 item.id,
