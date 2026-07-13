@@ -179,4 +179,23 @@ def create_app(config: LotsaConfig) -> FastAPI:
         async def favicon():
             return FileResponse(str(favicon_path), media_type="image/svg+xml")
 
+    # ── Legal pages ──────────────────────────────────────────────────
+    # Pre-rendered static HTML, committed (not gitignored like dist/) so it
+    # ships in the wheel via the existing lotsa/rigg package inclusion.
+    legal_dir = _STATIC_DIR / "legal"
+
+    privacy_path = legal_dir / "privacy.html"
+    if privacy_path.exists():
+
+        @app.get("/privacy", include_in_schema=False)
+        async def privacy():
+            return FileResponse(str(privacy_path), media_type="text/html")
+
+    terms_path = legal_dir / "terms.html"
+    if terms_path.exists():
+
+        @app.get("/terms", include_in_schema=False)
+        async def terms():
+            return FileResponse(str(terms_path), media_type="text/html")
+
     return app

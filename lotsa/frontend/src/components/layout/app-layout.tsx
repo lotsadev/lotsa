@@ -26,6 +26,7 @@ import { EmptyState } from '@/components/empty-state'
 import { ChatPanel } from '@/components/chat/chat-panel'
 import { RightPanel } from '@/components/right-panel/right-panel'
 import { ThemeToggle } from './theme-toggle'
+import { InfoMenu } from './info-menu'
 
 interface AppLayoutProps {
   selectedTaskId: string | null
@@ -47,7 +48,10 @@ function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
       {/* Header — full width, above everything */}
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
         <h1 className="text-lg font-bold tracking-tight">Lotsa</h1>
-        <ThemeToggle />
+        <div className="flex items-center gap-1">
+          <InfoMenu />
+          <ThemeToggle />
+        </div>
       </header>
 
       {/* Body — sidebar + resizable content area */}
@@ -136,6 +140,7 @@ function MobileShellInner({
           >
             <PanelRight className="size-4" />
           </Button>
+          <InfoMenu />
           <ThemeToggle />
         </div>
       </header>

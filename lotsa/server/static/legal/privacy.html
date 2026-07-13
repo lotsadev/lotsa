@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — Lotsa</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --link: #0f766e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f0e;
+      --fg: #e7e9e8;
+      --muted: #9aa0a6;
+      --border: #262b2a;
+      --link: #5eead4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.875rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header a {
+    color: var(--fg);
+    text-decoration: none;
+    font-weight: 600;
+  }
+  header nav a {
+    color: var(--muted);
+    font-weight: 400;
+    margin-left: 1rem;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.125rem; margin-top: 2rem; }
+  p, li { font-size: 0.9375rem; }
+  p.subtitle { color: var(--muted); font-size: 0.8125rem; margin-top: 0; }
+  a { color: var(--link); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+  ul, ol { padding-left: 1.25rem; }
+  code { background: var(--border); padding: 0.1em 0.35em; border-radius: 3px; font-size: 0.875em; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← Back to Lotsa</a>
+  <nav><a href="/terms">Terms of Use</a></nav>
+</header>
+<main>
+<h1>Privacy Policy</h1>
+<p class="subtitle"><strong>Effective date:</strong> 2026-07-13 · <strong>Last updated:</strong> 2026-07-13</p>
+<p>Lotsa is open-source software that you download and run yourself — there
+is no Lotsa server, no account, and no company standing between you and
+your code. This policy describes exactly what a running instance of Lotsa
+does and does not send over the network.</p>
+<h2>The short version</h2>
+<ul>
+<li>No accounts, no telemetry, no analytics, no crash reporting, no
+  phone-home update checks.</li>
+<li>Lotsa doesn't collect or transmit any data on its own initiative — the
+  only network calls it makes are the ones your configuration tells it to
+  make.</li>
+<li>Everything Lotsa stores (tasks, messages, git worktrees) lives in your
+  own <code>--data-dir</code> (default <code>~/.lotsa</code>), on your own machine, under your
+  own control.</li>
+</ul>
+<h2>What Lotsa sends over the network</h2>
+<p>Only two kinds of outbound call exist, and both require you to have
+configured them:</p>
+<ol>
+<li><strong>The LLM provider you configure.</strong> By default this is the Anthropic
+   API (<code>ANTHROPIC_API_KEY</code> or <code>CLAUDE_CODE_OAUTH_TOKEN</code>), reached via the
+   Claude Code CLI. If you set <code>ANTHROPIC_BASE_URL</code> to a different
+   endpoint (including a self-hosted proxy), calls go there instead.
+   Whatever endpoint you configure receives the task description,
+   relevant code, and conversation history needed to do the work — the
+   same information you'd give a human contractor working on the same
+   task. That provider's own privacy policy governs what happens to that
+   data on their end; Lotsa has no visibility into it and asks for none.</li>
+<li><strong>GitHub</strong>, only if you set <code>GITHUB_TOKEN</code> and use the push/PR
+   features. Lotsa pushes branches and opens/updates pull requests on
+   repositories you've configured under <code>projects:</code>. GitHub's own privacy
+   policy governs that data.</li>
+</ol>
+<p>There is no third outbound call. No analytics SDK, no error-reporting
+service, no update-check ping, nothing else.</p>
+<h2>What Lotsa stores locally</h2>
+<ul>
+<li><strong><code>lotsa.db</code></strong> — a local SQLite file holding tasks, messages, and the
+  audit trail of what the orchestrator did and when.</li>
+<li><strong>Worktrees</strong> — per-task git checkouts of the repos you've registered,
+  used to dispatch the coding agent.</li>
+<li><strong><code>lotsa.yaml</code></strong> — your configuration. Secrets like API keys are read
+  from environment variables, not written into this file.</li>
+</ul>
+<p>All of it lives under your <code>--data-dir</code> and never leaves your machine
+except via the two outbound calls above.</p>
+<h2>Third parties</h2>
+<p>The only third parties involved are the ones <strong>you</strong> choose to configure:
+your LLM provider (Anthropic by default, or whichever <code>ANTHROPIC_BASE_URL</code>
+you point at), and GitHub if you enable push/PR features. Lotsa introduces
+no third party of its own.</p>
+<h2>Cookies and browser storage</h2>
+<p>The dashboard is a local web UI served at <code>127.0.0.1</code> by default. It sets
+no tracking cookies. It stores small UI preferences (like your last-used
+project and color theme) in your browser's <code>localStorage</code>, which never
+leaves your device.</p>
+<h2>Children</h2>
+<p>Lotsa is developer tooling and isn't directed at children.</p>
+<h2>Changes</h2>
+<p>This policy lives in the repository at
+<a href="https://github.com/lotsadev/lotsa/blob/main/PRIVACY.md"><code>PRIVACY.md</code></a> —
+check its git history for changes, or the date above for the latest
+revision.</p>
+<h2>Contact</h2>
+<p>Questions or concerns: open an issue at
+<a href="https://github.com/lotsadev/lotsa/issues">github.com/lotsadev/lotsa/issues</a>.</p>
+</main>
+</body>
+</html>
