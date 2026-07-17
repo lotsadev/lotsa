@@ -171,10 +171,7 @@ def _has_edge(rules, outcome: str, target: str) -> bool:
     the migrated patterns while still failing on the legacy marker literals.
     """
     sample = f"AGENT_RESULT: {outcome}"
-    return any(
-        r.source == "stdout" and r.target == target and re.search(r.pattern, sample)
-        for r in (rules or [])
-    )
+    return any(r.source == "stdout" and r.target == target and re.search(r.pattern, sample) for r in (rules or []))
 
 
 def test_build_main_review_routes_on_generic_pass_fail():

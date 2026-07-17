@@ -24,7 +24,7 @@ correct and coherent.
 
 ## Output markers
 
-- On success: emit `CONFLICTS_RESOLVED: <one-line summary of what you resolved>`
+- On success: emit `AGENT_RESULT: COMPLETED: <one-line summary of what you resolved>`
   as the last line of your output.
 - When a conflict requires judgment you cannot ground in the repo (e.g. both
   sides rewrote the same function with incompatible intents and neither tests

@@ -852,20 +852,22 @@ def test_resolve_output_target_unknown_routes_to_blocked():
 
 
 def test_full_pr_fix_needs_decision_routes_to_needs_input():
+    # ADR-044: pr-fix's blocking-question outcome is AGENT_RESULT: INPUT.
     process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
-    needs = next(r for r in (pr_fix_binding.rules or []) if "NEEDS_DECISION" in r.pattern)
+    needs = next(r for r in (pr_fix_binding.rules or []) if "INPUT" in r.pattern)
     assert needs.target == "needs_input"
 
 
 def test_full_pr_fix_needs_decision_precedes_blocked():
+    # INPUT (needs_input) must precede the FAILED→blocked edge (first-match wins).
     process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
-    patterns = [r.pattern for r in (pr_fix_binding.rules or [])]
-    needs_idx = next(i for i, p in enumerate(patterns) if "NEEDS_DECISION" in p)
-    blocked_idx = next(i for i, p in enumerate(patterns) if "BLOCKED" in p)
+    rules = list(pr_fix_binding.rules or [])
+    needs_idx = next(i for i, r in enumerate(rules) if "INPUT" in r.pattern)
+    blocked_idx = next(i for i, r in enumerate(rules) if r.target == "blocked")
     assert needs_idx < blocked_idx
 
 
@@ -954,8 +956,8 @@ def test_build_process_from_inline_resolves_relative_prompts_dir(tmp_path):
     )
     main = process.flows["main"]
     expected = (tmp_path / "prompts" / "mkt").resolve()
-    # The registry's first search path is the resolved prompts dir.
-    assert any(p.resolve() == expected for p in main.registry._search_paths)
+    # The registry's operator-override dir is the resolved prompts dir.
+    assert main.registry.override_dir.resolve() == expected
 
 
 def test_build_process_from_inline_defaults_prompts_dir_to_prompts(tmp_path):
@@ -968,7 +970,7 @@ def test_build_process_from_inline_defaults_prompts_dir_to_prompts(tmp_path):
         base_dir=tmp_path,
     )
     expected = (tmp_path / "prompts").resolve()
-    assert any(p.resolve() == expected for p in process.flows["main"].registry._search_paths)
+    assert process.flows["main"].registry.override_dir.resolve() == expected
 
 
 def test_build_process_from_inline_absolute_prompts_dir(tmp_path):
@@ -984,7 +986,7 @@ def test_build_process_from_inline_absolute_prompts_dir(tmp_path):
         },
         base_dir=tmp_path / "other-base",
     )
-    assert any(p.resolve() == absolute_dir.resolve() for p in process.flows["main"].registry._search_paths)
+    assert process.flows["main"].registry.override_dir.resolve() == absolute_dir.resolve()
 
 
 def test_build_process_from_inline_rejects_empty_steps(tmp_path):

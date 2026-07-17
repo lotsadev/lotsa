@@ -25,7 +25,6 @@ import pytest
 from lotsa.flows import (
     BUNDLED_PROMPTS,
     PRESET_NAMES,
-    _resolve_prompts_search_paths,
     build_process,
 )
 
@@ -159,18 +158,18 @@ def test_build_review_routing_pass_next_fail_code():
     main = build_process("build").flows["main"]
     binding = main.binding_for("review")
     targets = {(r.pattern, r.target) for r in (binding.rules or [])}
-    assert ("^REVIEW_PASS", "next") in targets
-    assert ("^REVIEW_FAIL", "code") in targets
+    assert ("^AGENT_RESULT: PASSED", "next") in targets
+    assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
 def test_build_verify_routing():
-    """verify: VERIFIED→next, NEEDS_CODE→code, NEEDS_REVIEW→review."""
+    """verify is a gate (ADR-044): PASSED→next, FAILED→code (the old two-way
+    NEEDS_CODE/NEEDS_REVIEW failure collapses to FAILED→code)."""
     process = build_process("build")
     by_name = {j.name: j for j in process.jobs}
     targets = {(r.pattern, r.target) for r in by_name["verify"].rules}
-    assert ("^VERIFIED:", "next") in targets
-    assert ("^NEEDS_CODE:", "code") in targets
-    assert ("^NEEDS_REVIEW:", "review") in targets
+    assert ("^AGENT_RESULT: PASSED", "next") in targets
+    assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
 def test_build_pr_fix_subflow_shape():
@@ -246,8 +245,8 @@ def test_fix_review_routing_pass_next_fail_code():
     main = build_process("fix").flows["main"]
     binding = main.binding_for("review")
     targets = {(r.pattern, r.target) for r in (binding.rules or [])}
-    assert ("^REVIEW_PASS", "next") in targets
-    assert ("^REVIEW_FAIL", "code") in targets
+    assert ("^AGENT_RESULT: PASSED", "next") in targets
+    assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
 def test_fix_pr_fix_subflow_shape():
@@ -270,7 +269,7 @@ _BUILD_PROMPT_STEMS = (
     "coding",
     "review",
     "verify",
-    "pr-fix",
+    "pr_fix",
     "resolve_conflicts",
     "pr_summary",
 )
@@ -284,31 +283,23 @@ def test_build_resolves_every_referenced_prompt():
         assert system.strip(), f"{stem}-system.md resolved empty for build"
 
 
-def test_fix_coding_from_own_dir_generics_fall_back_to_build():
-    """fix ships only its distinctive coding prompt; review/pr-fix/resolve_conflicts
-    resolve via the build fallback (acceptance #2)."""
+def test_fix_resolves_its_distinct_coder_and_shared_agents_from_catalog():
+    """ADR-044: fix references its distinctive ``fix_coding`` agent and shares
+    ``review``/``pr_fix``/``resolve_conflicts`` with build — all resolved from the
+    single agent catalog (the old fix→build prompt fallback is gone)."""
     registry = build_process("fix").registry
-    # Own dir.
-    assert registry.load("coding-system").strip()
-    # Fallback to build/.
-    for stem in ("review", "pr-fix", "resolve_conflicts"):
-        assert registry.load(f"{stem}-system").strip(), f"fix must resolve {stem}-system via the build fallback"
+    # fix's distinctive coder.
+    assert registry.load("fix_coding-system").strip()
+    # Shared catalog agents.
+    for stem in ("review", "pr_fix", "resolve_conflicts"):
+        assert registry.load(f"{stem}-system").strip(), f"fix must resolve {stem}-system from the catalog"
 
 
-def test_resolve_prompts_search_paths_fix_falls_back_to_build():
-    """The fallback branch routes ``fix`` → its own dir + ``build`` (was
-    ``quickfix`` → ``full``)."""
-    paths = _resolve_prompts_search_paths("fix", None)
-    assert (BUNDLED_PROMPTS / "fix") in paths
-    assert (BUNDLED_PROMPTS / "build") in paths
-
-
-def test_unknown_process_default_fallback_is_build_not_standard():
-    """A non-preset flow name falls back to the ``build`` generic prompts,
-    since ``standard`` is deleted."""
-    paths = _resolve_prompts_search_paths("some_inline_process", None)
-    assert (BUNDLED_PROMPTS / "build") in paths
-    assert (BUNDLED_PROMPTS / "standard") not in paths
+# NOTE (ADR-044): prompt resolution moved to the shared agent catalog via
+# ``AgentPromptRegistry``; the former ``_resolve_prompts_search_paths`` per-process
+# fallback (and its two tests) were removed with the function. Catalog resolution
+# is covered by ``test_fix_resolves_its_distinct_coder_and_shared_agents_from_catalog``
+# and ``test_agent_catalog.py``.
 
 
 # ───────────────────────────────────────────────────────────────────────────

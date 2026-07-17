@@ -1,0 +1,5 @@
+name: planning
+class: worker
+outcomes: [COMPLETED]
+needs_worktree: true
+produces_changes: false

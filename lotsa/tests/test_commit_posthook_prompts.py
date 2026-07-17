@@ -22,6 +22,16 @@ import pytest
 import yaml
 
 _FULL = Path(__file__).resolve().parents[1] / "prompts" / "build"
+# ADR-044 — prompt bodies live in the shared agent catalog; process.yaml stays
+# under the process dir. Map a prompt base to its catalog agent (pr-fix uses the
+# ``pr_fix`` agent).
+_CATALOG = Path(__file__).resolve().parents[1] / "prompts" / "agents"
+
+
+def _catalog_system(prompt_base: str) -> str:
+    agent = "pr_fix" if prompt_base == "pr-fix" else prompt_base
+    return (_CATALOG / agent / "system.md").read_text().lower()
+
 
 _PRODUCERS = ("test", "code", "verify", "pr-fix")
 # ADR-043 dissolved the ``spec`` step; ``plan``/``review`` remain non-producers.
@@ -59,14 +69,14 @@ def test_non_producer_job_has_no_commit_posthook(job_name: str):
 
 @pytest.mark.parametrize("prompt_base", ("coding", "testing", "pr-fix", "verify"))
 def test_producer_prompt_has_do_not_commit_line(prompt_base: str):
-    text = (_FULL / f"{prompt_base}-system.md").read_text().lower()
+    text = _catalog_system(prompt_base)
     assert "you do not commit" in text, f"{prompt_base}-system.md must state that the orchestrator owns commit"
 
 
 @pytest.mark.parametrize("prompt_base", ("coding", "testing"))
 def test_producer_prompt_drops_git_commit_instruction(prompt_base: str):
     """The literal ``git commit`` command must be gone from the producer prompts."""
-    text = (_FULL / f"{prompt_base}-system.md").read_text().lower()
+    text = _catalog_system(prompt_base)
     assert "git commit" not in text, f"{prompt_base}-system.md must not instruct the agent to run ``git commit``"
 
 

@@ -116,8 +116,9 @@ def test_class_constrains_admissible_outcomes():
 
     for name, agent in load_agent_catalog().items():
         declared = set(agent.outcomes)
+        cls = "gate" if agent.is_gate else "worker"
         admissible = _GATE_ADMISSIBLE if agent.is_gate else _WORKER_ADMISSIBLE
-        assert declared.issubset(admissible), f"{name!r} ({'gate' if agent.is_gate else 'worker'}) declares {declared - admissible}"
+        assert declared.issubset(admissible), f"{name!r} ({cls}) declares {declared - admissible}"
 
 
 def test_reserved_property_slots_are_booleans():
@@ -194,9 +195,7 @@ def _write_agent(dir_: Path, name: str, *, klass: str, outcomes: list[str]) -> N
     (agent_dir / "user.md").write_text("user prompt body\n")
     import yaml
 
-    (agent_dir / "agent.yaml").write_text(
-        yaml.safe_dump({"name": name, "class": klass, "outcomes": outcomes})
-    )
+    (agent_dir / "agent.yaml").write_text(yaml.safe_dump({"name": name, "class": klass, "outcomes": outcomes}))
 
 
 def test_out_of_vocab_outcome_fails_loud(tmp_path):

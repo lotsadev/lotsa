@@ -318,6 +318,14 @@ tool output) and do not redo completed work."""
 # still wedged past this bound is abandoned and recovered by the next resume sweep.
 _DRAIN_APPLY_TIMEOUT_SECONDS = 5.0
 
+# ADR-044 — the universal agent-outcome vocabulary. An agent reports one of
+# these; the flow *edge* decides what it means next. Group 1 is the outcome
+# word, group 2 the trailing same-line free-text payload (question / reason).
+_AGENT_RESULT_RE = re.compile(
+    r"^AGENT_RESULT:\s*(COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$",
+    re.MULTILINE,
+)
+# Retained alias — ``NEEDS_INPUT: <q>`` == ``AGENT_RESULT: INPUT <q>``.
 _NEEDS_INPUT_RE = re.compile(r"^NEEDS_INPUT:\s*(.+)", re.MULTILINE)
 
 _MAX_TITLE_LEN = 80
@@ -359,68 +367,89 @@ def _run_stats(result: AgentResult) -> dict | None:
     return stats or None
 
 
+def _extract_agent_outcome(stdout: str) -> tuple[str, str] | None:
+    """Return ``(outcome, payload)`` of the LAST ``AGENT_RESULT`` marker (ADR-044).
+
+    ``payload`` is the trailing same-line free text (question / reason),
+    whitespace-trimmed. Returns ``None`` when no valid marker is present.
+    """
+    matches = _AGENT_RESULT_RE.findall(stdout or "")
+    if not matches:
+        return None
+    outcome, payload = matches[-1]
+    return outcome, payload.strip()
+
+
 def _extract_needs_input(stdout: str) -> str | None:
-    """Extract the last NEEDS_INPUT question from agent output."""
-    matches = _NEEDS_INPUT_RE.findall(stdout)
-    return matches[-1].strip() if matches else None
+    """Extract the last blocking-question payload from agent output.
 
-
-_PR_FIX_NEEDS_DECISION_RE = re.compile(r"^PR_FIX_NEEDS_DECISION:\s*(.*)$", re.MULTILINE)
+    Recognises both the generic ``AGENT_RESULT: INPUT <question>`` marker and
+    the retained ``NEEDS_INPUT: <question>`` alias, returning whichever appears
+    last in the output.
+    """
+    last: str | None = None
+    for line in (stdout or "").splitlines():
+        s = line.strip()
+        m = _AGENT_RESULT_RE.match(s)
+        if m is not None and m.group(1) == "INPUT":
+            last = m.group(2).strip()
+            continue
+        alias = _NEEDS_INPUT_RE.match(s)
+        if alias is not None:
+            last = alias.group(1).strip()
+    return last
 
 
 def _extract_needs_decision_question(stdout: str) -> str:
-    """Extract the question from a PR_FIX_NEEDS_DECISION: marker.
+    """Extract a pr-fix ``AGENT_RESULT: INPUT`` question (or a placeholder).
 
     Returns the trimmed question text after the marker. If the marker is
-    present but has no question text, returns a fallback placeholder so
-    the operator-facing chat input never renders an empty prompt.
+    present but has no question text, returns a fallback placeholder so the
+    operator-facing chat input never renders an empty prompt.
     """
-    m = _PR_FIX_NEEDS_DECISION_RE.search(stdout or "")
-    if m:
-        text = m.group(1).strip()
-        if text:
-            return text
-    return "Agent emitted PR_FIX_NEEDS_DECISION without a question."
+    question = _extract_needs_input(stdout or "")
+    return question or "Agent emitted AGENT_RESULT: INPUT without a question."
 
 
-_PR_FIX_MARKER_PREFIX_RE = re.compile(r"^PR_FIX_(?:DONE|SKIPPED|BLOCKED|NEEDS_DECISION):\s*(.*)$")
+_AGENT_RESULT_PREFIX_RE = re.compile(r"^AGENT_RESULT:\s*(?:COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$")
 # A pr-fix dispatched right after resolve_conflicts receives that agent's stdout
 # as feedback (the rule-route carry-forward, ``feedback=result.stdout``), which
-# carries this marker. Used to recognise that "feedback" as the conflict-
-# resolution echo, not genuine reviewer input.
-_CONFLICTS_RESOLVED_RE = re.compile(r"^CONFLICTS_RESOLVED:", re.MULTILINE)
+# carries an ``AGENT_RESULT:`` marker. Used to recognise that "feedback" as an
+# agent echo, not genuine reviewer input.
+_AGENT_ECHO_RE = re.compile(r"^AGENT_RESULT:", re.MULTILINE)
 
 
-def _strip_pr_fix_marker_prefix(line: str) -> str:
-    """Strip a ``PR_FIX_<MARKER>:`` prefix from ``line`` if present.
+def _strip_agent_result_prefix(line: str) -> str:
+    """Strip a leading ``AGENT_RESULT: <OUTCOME>`` prefix from ``line`` if present.
 
-    The drainer captures the agent's outcome by scanning the tail of stdout
-    for the last non-empty line and writing it into the ``pr_decision``
-    audit row's ``reasoning`` field. That line typically still carries the
-    marker prefix (``PR_FIX_DONE: addressed the lint comments``), while
-    the parallel NEEDS_DECISION path uses
-    ``_extract_needs_decision_question`` which strips the marker. Without
-    this helper the audit field's format would diverge across decision
-    types, forcing display and query callers to pattern-match per
-    ``decision`` value.
+    The drainer captures the agent's outcome by scanning the tail of stdout for
+    the last non-empty line and writing it into the ``pr_decision`` audit row's
+    ``reasoning`` field. That line typically still carries the marker prefix
+    (``AGENT_RESULT: COMPLETED addressed the lint comments``). This helper keeps
+    the audit field uniform across outcome types.
 
-    Returns the substring after the marker (whitespace-trimmed) when the
-    line starts with one of the four ``PR_FIX_*`` markers; otherwise
-    returns the input unchanged. Empty/whitespace input returns ``""``.
+    Returns the substring after the marker (whitespace-trimmed) when the line
+    starts with an ``AGENT_RESULT:`` marker; otherwise returns the input
+    unchanged. Empty/whitespace input returns ``""``.
     """
     if not line:
         return ""
-    m = _PR_FIX_MARKER_PREFIX_RE.match(line.strip())
+    m = _AGENT_RESULT_PREFIX_RE.match(line.strip())
     if m:
         return m.group(1).strip()
     return line.strip()
 
 
+# Backward-compatible alias — some drainer call sites and tests reference the
+# pr-fix-specific name; the generic stripper handles every outcome.
+_strip_pr_fix_marker_prefix = _strip_agent_result_prefix
+
+
 def _feedback_is_actionable(feedback: str | None) -> bool:
     """Whether feedback delivered to a pr-fix dispatch was real.
 
-    A ``PR_FIX_SKIPPED`` only counts toward ``max_consecutive_skipped`` when
-    the agent actually had something to skip. These are benign — the agent
+    An ``AGENT_RESULT: SKIPPED`` only counts toward ``max_consecutive_skipped``
+    when the agent actually had something to skip. These are benign — the agent
     correctly had nothing to do, so such skips must not burn the cap:
 
     - Empty/whitespace feedback (an empty retry, or a dispatch with no operator
@@ -428,13 +457,13 @@ def _feedback_is_actionable(feedback: str | None) -> bool:
       ``"No specific feedback found."`` sentinel (an internal task: in-progress-
       review skips tripped the cap before the real review landed).
     - The ``resolve_conflicts`` echo: a pr-fix dispatched right after that step
-      is fed its stdout (the ``CONFLICTS_RESOLVED:`` report) as feedback via the
-      rule-route carry-forward. The conflict is already resolved, so skipping it
-      is benign (internal tasks / 04ee0735: the echo skip burned the cap and
+      is fed its stdout (its ``AGENT_RESULT: COMPLETED`` report) as feedback via
+      the rule-route carry-forward. The conflict is already resolved, so skipping
+      it is benign (internal tasks / 04ee0735: the echo skip burned the cap and
       re-blocked a conflict-resolved, review-ready PR).
     """
     delivered = (feedback or "").strip()
-    if _CONFLICTS_RESOLVED_RE.search(delivered):
+    if _AGENT_ECHO_RE.search(delivered):
         return False
     return bool(delivered) and delivered != "No specific feedback found."
 

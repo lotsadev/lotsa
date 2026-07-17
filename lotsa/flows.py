@@ -32,8 +32,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml as _yaml
 
+from lotsa.agents import AGENTS_DIR
 from rigg import DispatchRule, PromptRegistry, StateMachine, TransitionRule
 from rigg.models import Item
+from rigg.prompt_registry import PromptNotFound
 
 if TYPE_CHECKING:
     from rigg.models import AgentResult
@@ -41,6 +43,60 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 BUNDLED_PROMPTS = Path(__file__).parent / "prompts"
+
+
+class AgentPromptRegistry:
+    """Load prompts from the ADR-044 agent catalog (``agents/<name>/<kind>.md``).
+
+    Presents the same ``load`` / ``load_optional`` surface as
+    :class:`rigg.PromptRegistry` so callers (the orchestrator, dispatch-rule
+    builders) are unchanged: they still ask for ``"<agent>-system"`` /
+    ``"<agent>-user"``. Resolution order for ``"<agent>-<kind>"``:
+
+    1. operator override dir, flat legacy name ``<agent>-<kind>.md`` (keeps
+       pre-catalog custom ``--prompts-dir`` layouts and inline-process prompts
+       working);
+    2. operator override dir, catalog layout ``<agent>/<kind>.md``;
+    3. the bundled catalog ``<catalog_dir>/<agent>/<kind>.md``.
+    """
+
+    def __init__(self, override_dir: Path | None, catalog_dir: Path = AGENTS_DIR) -> None:
+        self.override_dir = override_dir
+        self.catalog_dir = catalog_dir
+
+    @staticmethod
+    def _split(name: str) -> tuple[str, str | None]:
+        for suffix in ("-system", "-user"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)], suffix[1:]
+        return name, None
+
+    def _candidates(self, name: str) -> list[Path]:
+        agent, kind = self._split(name)
+        out: list[Path] = []
+        if self.override_dir is not None:
+            out.append(self.override_dir / f"{name}.md")
+            if kind is not None:
+                out.append(self.override_dir / agent / f"{kind}.md")
+        if kind is not None:
+            out.append(self.catalog_dir / agent / f"{kind}.md")
+        out.append(self.catalog_dir / f"{name}.md")
+        return out
+
+    def load(self, name: str) -> str:
+        if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
+            raise PromptNotFound(f"Invalid prompt name {name!r} — must be a plain basename")
+        for candidate in self._candidates(name):
+            if candidate.is_file():
+                return candidate.read_text()
+        raise PromptNotFound(f"Prompt {name!r} not found in override {self.override_dir} or catalog {self.catalog_dir}")
+
+    def load_optional(self, name: str) -> str | None:
+        try:
+            return self.load(name)
+        except PromptNotFound:
+            return None
+
 
 JobType = Literal["agent", "action", "monitor"]
 
@@ -723,29 +779,6 @@ def resolve_output_target(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_prompts_search_paths(
-    flow_name: str,
-    prompts_dir: Path | None,
-) -> list[Path]:
-    paths: list[Path] = []
-    if prompts_dir is not None:
-        paths.append(prompts_dir)
-    if flow_name in PRESET_NAMES:
-        paths.append(BUNDLED_PROMPTS / flow_name)
-    else:
-        paths.append(BUNDLED_PROMPTS / "build")
-    # ``fix`` ships only its distinctive ``coding`` prompt (the "execute this
-    # instruction" framing); its ``review`` / ``pr-fix`` / ``resolve_conflicts``
-    # jobs reuse the generic prompts. Fall back to ``build`` (which carries every
-    # generic diff/PR/git-driven prompt) so those resolve without duplicating the
-    # text (ADR-043 §8 / ADR-027 §3 — the generics are shared across processes;
-    # fix's narrowness comes from the coder prompt). Inline / unknown processes
-    # fall back to ``build`` via the ``else`` branch above for the same reason.
-    if flow_name == "fix":
-        paths.append(BUNDLED_PROMPTS / "build")
-    return paths
-
-
 def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
     """Stitch sub-flow entry/exit edges into each flow's state machine.
 
@@ -1065,8 +1098,7 @@ def build_process(
     else:
         raise ValueError(f"Unknown process: {name!r}. Choose from: {PRESET_NAMES}")
 
-    search_paths = _resolve_prompts_search_paths(name, prompts_dir)
-    registry = PromptRegistry(search_paths=search_paths)
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
 
     flows: dict[str, FlowConfig] = {}
     for flow_name, bindings in flow_bindings.items():
@@ -1262,8 +1294,7 @@ def build_process_from_inline(
     resolved, gate_states = _resolve_jobs(jobs, bindings)
     sm = _build_state_machine(resolved, gate_states)
 
-    search_paths = [prompts_dir, BUNDLED_PROMPTS / "build"]
-    registry = PromptRegistry(search_paths=search_paths)
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
 
     flow = FlowConfig(
         name="main",

@@ -309,7 +309,7 @@ def test_main_flow_review_fail_routes_to_code():
     process = build_process("build")
     main = process.flows["main"]
     review_binding = next(b for b in main.bindings if b.name == "review")
-    fail_rules = [r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern]
+    fail_rules = [r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern]
     assert fail_rules, "main.review must override REVIEW_FAIL routing"
     assert fail_rules[0].target == "code"
 
@@ -321,7 +321,7 @@ def test_pr_fix_flow_review_fail_routes_to_pr_fix():
     process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     review_binding = next(b for b in pr_fix.bindings if b.name == "review")
-    fail_rules = [r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern]
+    fail_rules = [r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern]
     assert fail_rules, "pr_fix.review must override REVIEW_FAIL routing"
     assert fail_rules[0].target == "pr-fix"
 

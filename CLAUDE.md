@@ -130,6 +130,7 @@ contract or introduces a new top-level dependency.
 | 041 | Project toolchain & environment provisioning — declared `setup`/`test`/`build`/`lint` + per-project cache + optional per-project `image:`; egress Open by default and pluggable (ADR-031's upstream Layer 0) (**Proposed** — post-launch) | CE |
 | 042 | `lotsa deploy` CLI — bundle the deploy assets in the wheel, ship + run the installer over ssh from a declarative `deploy.yaml`; PyPI install by default; Debian/Ubuntu + systemd target with a fail-fast platform preflight (**Implemented**) | CE |
 | 043 | Two-phase Think→Execute task model — three-process catalog (`chat`/`build`/`fix`) replaces the flat five presets; ungated build, PR-primary Execute, operator mark-complete + `awaiting_operator` escape hatch; fixes the ADR-013 `standard` violation (**Implemented** — supersedes ADR-014's catalog; amends ADR-027/030/034) | CE |
+| 044 | Workflows for agents — generic `AGENT_RESULT:` outcome vocabulary (`COMPLETED`/`PASSED`/`FAILED`/`SKIPPED`/`INPUT`) + a shared, process-independent agent catalog (`lotsa/prompts/agents/`); routing moves from marker name to flow edge (**Implemented — Phase 1**; Phases 2–6 proposed: property-derived hooks, `needs_worktree` prehook, workflow-model cleanup, git-native `.lotsa/` provenance, visual editor). Amends ADR-043/039/014 | CE |
 
 Design rationale for a specific area belongs in that directory's `CLAUDE.md`
 or in an ADR. This index is the registry.
