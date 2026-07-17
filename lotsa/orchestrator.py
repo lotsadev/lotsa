@@ -7205,8 +7205,9 @@ class OrchestratorService:
         if "{available_processes}" in base:
             base = base.replace("{available_processes}", self._render_available_processes())
         # ADR-029 §6 — prompt portability: ``{lotsa_prompts_dir}`` resolves to the
-        # installed bundled prompts directory so a prompt (e.g. review-system.md)
-        # can address its workflow files by an absolute path that works on every
+        # installed bundled prompts directory so a prompt (e.g. the catalog's
+        # ``agents/review/system.md``) can address its workflow files by an
+        # absolute path (``{lotsa_prompts_dir}/review/checklist.md``) that works on every
         # repo, not just the Lotsa repo. Done before the conversational return so
         # every step prompt (conversational or not) can use it.
         if "{lotsa_prompts_dir}" in base:
