@@ -28,12 +28,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import yaml as _yaml
 
 from lotsa.agents import AGENTS_DIR
-from rigg import DispatchRule, PromptRegistry, StateMachine, TransitionRule
+from rigg import DispatchRule, StateMachine, TransitionRule
 from rigg.models import Item
 from rigg.prompt_registry import PromptNotFound
 
@@ -43,6 +43,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 BUNDLED_PROMPTS = Path(__file__).parent / "prompts"
+
+
+@runtime_checkable
+class PromptLoader(Protocol):
+    """The prompt-resolution surface the flow/orchestrator layer depends on.
+
+    Both :class:`rigg.PromptRegistry` and the catalog-aware
+    :class:`AgentPromptRegistry` (below) satisfy it — callers only ever invoke
+    ``load`` / ``load_optional``, so the process/flow config is typed against
+    this Protocol rather than either concrete class.
+    """
+
+    def load(self, name: str) -> str: ...
+
+    def load_optional(self, name: str) -> str | None: ...
 
 
 class AgentPromptRegistry:
@@ -288,7 +303,7 @@ class FlowConfig:
     state_machine: StateMachine
     jobs: list[ResolvedJob]
     bindings: list[FlowBinding]
-    registry: PromptRegistry
+    registry: PromptLoader
     gate_states: set[str] = field(default_factory=set)
 
     @property
@@ -319,7 +334,7 @@ class Process:
     name: str
     jobs: list[ResolvedJob]
     flows: dict[str, FlowConfig]
-    registry: PromptRegistry
+    registry: PromptLoader
     description: str | None = None
     promotion_inputs: list[PromotionInput] = field(default_factory=list)
 

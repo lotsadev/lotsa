@@ -261,8 +261,8 @@ An agent declares its emittable set in the catalog `agent.yaml` (`class:
 worker|gate` + `outcomes:`); `pr-fix` is the canonical worker declaring a wider
 set (`COMPLETED`/`SKIPPED`/`FAILED`/`INPUT`).
 
-Parser (`_AGENT_RESULT_RE`, `_extract_agent_outcome`, `_extract_needs_input`,
-`_strip_agent_result_prefix`) lives at module scope in `lotsa/orchestrator.py`.
+Parser (`_AGENT_RESULT_RE`, `_extract_needs_input`, `_strip_agent_result_prefix`)
+lives at module scope in `lotsa/orchestrator.py`.
 The vocabulary constant `AGENT_OUTCOMES` lives in `lotsa/agents.py`. If you add
 a routing rule, express it as an `AGENT_RESULT:`-pattern edge in `process.yaml`
 and update the dispatch logic in one PR — never let an emitter ship without a

@@ -367,19 +367,6 @@ def _run_stats(result: AgentResult) -> dict | None:
     return stats or None
 
 
-def _extract_agent_outcome(stdout: str) -> tuple[str, str] | None:
-    """Return ``(outcome, payload)`` of the LAST ``AGENT_RESULT`` marker (ADR-044).
-
-    ``payload`` is the trailing same-line free text (question / reason),
-    whitespace-trimmed. Returns ``None`` when no valid marker is present.
-    """
-    matches = _AGENT_RESULT_RE.findall(stdout or "")
-    if not matches:
-        return None
-    outcome, payload = matches[-1]
-    return outcome, payload.strip()
-
-
 def _extract_needs_input(stdout: str) -> str | None:
     """Extract the last blocking-question payload from agent output.
 

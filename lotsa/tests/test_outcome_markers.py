@@ -14,8 +14,6 @@ by which step is active. ``NEEDS_INPUT:`` is retained as a recognised alias for
 Contract these tests pin down (the coding step implements it in
 ``lotsa.orchestrator``):
 
-* ``_extract_agent_outcome(stdout) -> (outcome, payload) | None`` — the LAST
-  ``AGENT_RESULT`` marker; payload is the trailing same-line free text.
 * ``_extract_needs_input(stdout)`` — extended to return the payload of the last
   ``AGENT_RESULT: INPUT`` **and** the ``NEEDS_INPUT:`` alias.
 * ``_strip_agent_result_prefix(line)`` — strips a leading ``AGENT_RESULT:
@@ -39,52 +37,6 @@ from rigg.models import AgentResult
 
 def _result(stdout: str) -> AgentResult:
     return AgentResult(success=True, stdout=stdout, stderr="", return_code=0, duration_ms=1)
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# _extract_agent_outcome — outcome + payload
-# ───────────────────────────────────────────────────────────────────────────
-
-
-def test_extract_bare_outcome_has_empty_payload():
-    from lotsa.orchestrator import _extract_agent_outcome
-
-    assert _extract_agent_outcome("AGENT_RESULT: COMPLETED") == ("COMPLETED", "")
-
-
-def test_extract_outcome_with_trailing_payload():
-    from lotsa.orchestrator import _extract_agent_outcome
-
-    outcome, payload = _extract_agent_outcome("AGENT_RESULT: FAILED review found 3 correctness bugs")
-    assert outcome == "FAILED"
-    assert payload == "review found 3 correctness bugs"
-
-
-def test_extract_tolerates_colon_after_outcome_word():
-    from lotsa.orchestrator import _extract_agent_outcome
-
-    outcome, payload = _extract_agent_outcome("AGENT_RESULT: INPUT: Which API version should I target?")
-    assert outcome == "INPUT"
-    assert payload == "Which API version should I target?"
-
-
-def test_extract_returns_last_marker_when_several_present():
-    from lotsa.orchestrator import _extract_agent_outcome
-
-    stdout = "AGENT_RESULT: SKIPPED nothing actionable\ndoing more work\nAGENT_RESULT: COMPLETED done"
-    assert _extract_agent_outcome(stdout) == ("COMPLETED", "done")
-
-
-def test_extract_returns_none_without_a_marker():
-    from lotsa.orchestrator import _extract_agent_outcome
-
-    assert _extract_agent_outcome("just prose, no structured outcome here") is None
-
-
-def test_extract_ignores_unknown_outcome_word():
-    from lotsa.orchestrator import _extract_agent_outcome
-
-    assert _extract_agent_outcome("AGENT_RESULT: MAYBE unsure") is None
 
 
 # ───────────────────────────────────────────────────────────────────────────

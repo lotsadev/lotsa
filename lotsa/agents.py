@@ -128,17 +128,10 @@ def load_agent_catalog(agents_dir: Path | None = None) -> dict[str, Agent]:
     return catalog
 
 
-def agent_prompt_path(agent: str, kind: str, agents_dir: Path | None = None) -> Path:
-    """Return the on-disk path of an agent's ``system`` / ``user`` prompt body."""
-    base = agents_dir if agents_dir is not None else AGENTS_DIR
-    return Path(base) / agent / f"{kind}.md"
-
-
 __all__ = [
     "AGENT_OUTCOMES",
     "AGENTS_DIR",
     "Agent",
-    "agent_prompt_path",
     "load_agent",
     "load_agent_catalog",
 ]

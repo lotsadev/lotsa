@@ -2,4 +2,4 @@ name: verify
 class: gate
 outcomes: [PASSED, FAILED]
 needs_worktree: true
-produces_changes: true
+produces_changes: false
