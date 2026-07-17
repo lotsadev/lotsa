@@ -1131,6 +1131,25 @@ class TestFeedbackIsActionable:
         )
         assert _feedback_is_actionable(echo) is False
 
+    def test_review_failed_verdict_carried_into_pr_fix_is_actionable(self):
+        """A ``review`` FAILED verdict routed into pr-fix (the ``review.FAILED →
+        pr-fix`` edge in the pr_fix sub-flow) is carried as feedback via the same
+        rule-route carry-forward. Unlike the resolve_conflicts COMPLETED echo,
+        this is genuine, actionable reviewer feedback — a subsequent pr-fix skip
+        must still count toward max_consecutive_skipped.
+
+        RED against the pre-fix code: ``_AGENT_ECHO_RE`` matched the bare
+        ``^AGENT_RESULT:`` prefix, so this FAILED verdict was misclassified as a
+        benign echo and returned False, silently letting the skip dodge the cap.
+        """
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        verdict = (
+            "Found a real correctness bug in the retry path that must be fixed.\n"
+            "AGENT_RESULT: FAILED: retry path double-increments the counter"
+        )
+        assert _feedback_is_actionable(verdict) is True
+
 
 class TestGatherPendingPrFeedback:
     """retry/jump feedback re-resolution (fix #2): orchestrator re-aggregates the

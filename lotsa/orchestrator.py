@@ -401,9 +401,19 @@ def _extract_needs_decision_question(stdout: str) -> str:
 _AGENT_RESULT_PREFIX_RE = re.compile(r"^AGENT_RESULT:\s*(?:COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$")
 # A pr-fix dispatched right after resolve_conflicts receives that agent's stdout
 # as feedback (the rule-route carry-forward, ``feedback=result.stdout``), which
-# carries an ``AGENT_RESULT:`` marker. Used to recognise that "feedback" as an
-# agent echo, not genuine reviewer input.
-_AGENT_ECHO_RE = re.compile(r"^AGENT_RESULT:", re.MULTILINE)
+# carries the resolve_conflicts worker's ``AGENT_RESULT: COMPLETED`` report. Used
+# to recognise that "feedback" as a benign step-completion echo, not genuine
+# reviewer input.
+#
+# Scoped to ``COMPLETED`` deliberately: under the generic vocabulary (ADR-044)
+# every terminal marker shares the ``AGENT_RESULT:`` prefix, so matching the bare
+# prefix would also swallow a ``review`` step's ``AGENT_RESULT: FAILED`` verdict
+# when it is carried forward into ``pr-fix`` (the ``review.FAILED → pr-fix`` edge
+# in the ``pr_fix`` sub-flow). A review failure is real, actionable feedback: a
+# subsequent ``SKIPPED`` must still burn ``max_consecutive_skipped``. Only the
+# ``COMPLETED`` worker echo (resolve_conflicts) is benign — a ``FAILED``/``PASSED``
+# gate verdict is not.
+_AGENT_ECHO_RE = re.compile(r"^AGENT_RESULT:\s*COMPLETED\b", re.MULTILINE)
 
 
 def _strip_agent_result_prefix(line: str) -> str:
@@ -448,6 +458,12 @@ def _feedback_is_actionable(feedback: str | None) -> bool:
       the rule-route carry-forward. The conflict is already resolved, so skipping
       it is benign (internal tasks / 04ee0735: the echo skip burned the cap and
       re-blocked a conflict-resolved, review-ready PR).
+
+    Only the ``COMPLETED`` worker echo is benign. A ``review`` step's
+    ``AGENT_RESULT: FAILED`` verdict, carried into pr-fix via the
+    ``review.FAILED → pr-fix`` edge, is genuine actionable feedback — a
+    subsequent skip *must* count toward the cap. ``_AGENT_ECHO_RE`` is scoped to
+    ``COMPLETED`` so it never swallows a gate verdict.
     """
     delivered = (feedback or "").strip()
     if _AGENT_ECHO_RE.search(delivered):

@@ -171,7 +171,29 @@ def test_coding_is_a_worker_that_produces_changes():
     coding = load_agent("coding")
     assert coding.is_worker is True
     assert coding.produces_changes is True
-    assert set(coding.outcomes) == {"COMPLETED"}
+    # COMPLETED is the normal worker exit; INPUT is declared because the coding
+    # prompt documents escalating a genuine blocker via NEEDS_INPUT (ADR-044:
+    # INPUT is orthogonal — admissible for any agent whose prompt uses it).
+    assert set(coding.outcomes) == {"COMPLETED", "INPUT"}
+
+
+def test_worker_agents_that_document_needs_input_declare_it():
+    """INPUT is orthogonal (any agent may raise a blocking question), but the
+    declared ``outcomes`` set is the contract for what an agent *can* emit — so
+    every worker whose prompt documents ``NEEDS_INPUT`` must declare ``INPUT``.
+    Guards against a prompt drifting to use INPUT while the catalog understates
+    the emittable set."""
+    import re
+
+    from lotsa.agents import AGENTS_DIR, load_agent_catalog
+
+    needs_input_re = re.compile(r"NEEDS_INPUT|AGENT_RESULT:\s*INPUT")
+    for name, agent in load_agent_catalog().items():
+        system = (AGENTS_DIR / name / "system.md").read_text()
+        if needs_input_re.search(system):
+            assert "INPUT" in agent.outcomes, (
+                f"{name!r}: system.md documents NEEDS_INPUT but agent.yaml omits INPUT from outcomes"
+            )
 
 
 def test_chat_does_not_need_a_worktree():

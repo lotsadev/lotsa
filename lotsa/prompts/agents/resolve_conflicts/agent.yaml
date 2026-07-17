@@ -1,5 +1,5 @@
 name: resolve_conflicts
 class: worker
-outcomes: [COMPLETED]
+outcomes: [COMPLETED, INPUT]
 needs_worktree: true
 produces_changes: true

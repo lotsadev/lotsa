@@ -1,5 +1,5 @@
 name: chat
 class: worker
-outcomes: [COMPLETED]
+outcomes: [COMPLETED, INPUT]
 needs_worktree: false
 produces_changes: false

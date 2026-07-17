@@ -73,14 +73,14 @@ lotsa/
 │   ├── schemas.py      — Pydantic models for dashboard requests
 │   └── static/dist/    — built frontend output (**gitignored** — run `npm run build` in `lotsa/frontend/` before `lotsa serve`)
 ├── frontend/           — Vite + React + shadcn/ui dashboard (ADR-012)
-├── prompts/            — bundled process presets and standalone prompts:
-│                         build/, fix/ — each carries a process.yaml +
-│                         {step}-system.md + {step}-user.md (ADR-014/043
-│                         process catalog); build/ also holds the generic
-│                         review/pr-fix/resolve_conflicts/pr_summary prompts
-│                         that fix/ reuses. chat/ holds the Think-phase
-│                         prompt; review/ holds the /review skill (SKILL.md +
-│                         checklist.md), not a process.
+├── prompts/            — bundled agent catalog, process presets, and skills:
+│                         agents/<name>/ — the shared, process-independent
+│                         agent catalog (ADR-044): each holds agent.yaml +
+│                         system.md + user.md. build/, fix/, chat/ — process
+│                         presets, each just a process.yaml that wires catalog
+│                         agents by name (chat/ also carries its
+│                         task-creation-system.md). review/ holds the /review
+│                         skill (SKILL.md + checklist.md), not a process.
 ├── tests/              — pytest, mirrors module layout
 ├── Dockerfile.agent    — base image for --docker mode
 └── README.md           — user-facing quickstart and CLI reference
@@ -392,9 +392,9 @@ public — do not regress to duck-typed `getattr` lookups.
 ### What counts as "FEEDBACK"
 
 Bot comments are included by default. The `pr_fix` agent triages — it can
-emit `PR_FIX_SKIPPED:` to decline non-actionable bot chatter without
-producing a push. Operators opt **out** of bot comments via `lotsa.yaml`
-only if they want the old narrow behaviour.
+emit `AGENT_RESULT: SKIPPED` (ADR-044) to decline non-actionable bot chatter
+without producing a push. Operators opt **out** of bot comments via
+`lotsa.yaml` only if they want the old narrow behaviour.
 
 ### APPROVED is not COMPLETE
 
@@ -805,8 +805,8 @@ operator had already framed.
 If the full scope is genuinely unworkable in one session, the right
 move is to surface that via `NEEDS_INPUT` (planner) or report a
 scope gap (coder), not to ship a quietly narrowed result. See
-`lotsa/prompts/build/planning-system.md` Step 1-2 and
-`lotsa/prompts/build/coding-system.md` Step 4.5 for the prompt-level
+`lotsa/prompts/agents/planning/system.md` Step 1-2 and
+`lotsa/prompts/agents/coding/system.md` Step 4.5 for the prompt-level
 rules.
 
 ---
