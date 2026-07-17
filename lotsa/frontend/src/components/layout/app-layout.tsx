@@ -1,5 +1,6 @@
-import { useState } from 'react'
-import { PanelRight } from 'lucide-react'
+import { useState, type CSSProperties } from 'react'
+import { PanelRight, PanelRightClose, PanelRightOpen } from 'lucide-react'
+import { usePanelRef, useDefaultLayout } from 'react-resizable-panels'
 import {
   SidebarProvider,
   Sidebar,
@@ -34,31 +35,101 @@ interface AppLayoutProps {
 
 // Single 768px breakpoint (the codebase's definition of "mobile") switches
 // between the chat-primary mobile shell and the desktop multi-column layout.
-// The two are separate subtrees so the desktop path stays byte-for-byte
-// unchanged (AC#4) and all mobile risk is isolated to MobileShell.
+// The two are separate subtrees so each shell's collapse wiring stays
+// isolated — desktop changes can't regress MobileShell and vice versa.
 export function AppLayout(props: AppLayoutProps) {
   const isMobile = useIsMobile()
   return isMobile ? <MobileShell {...props} /> : <DesktopShell {...props} />
 }
 
+// Persists the desktop chat/artifacts split — including the artifacts
+// collapsed state (0%) — to localStorage. In react-resizable-panels v4 the
+// `useDefaultLayout` hook is the replacement for the old `autoSaveId` prop.
+const DESKTOP_LAYOUT_ID = 'lotsa-desktop-layout'
+
+// shadcn's SidebarProvider writes the open/closed choice to the
+// `sidebar_state` cookie but only *reads* it during SSR. The dashboard is a
+// pure client SPA, so we read the cookie here and seed `defaultOpen` to make
+// the left task-list collapse survive a reload.
+function readSidebarOpenCookie(): boolean {
+  if (typeof document === 'undefined') return true
+  const match = document.cookie.match(/(?:^|;\s*)sidebar_state=(true|false)/)
+  return match ? match[1] === 'true' : true
+}
+
 function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
+  // v4 exposes the imperative collapse/expand API via a dedicated `panelRef`
+  // prop (not the React `ref`); `usePanelRef` returns a correctly-typed ref.
+  const artifactsPanel = usePanelRef()
+  const [artifactsCollapsed, setArtifactsCollapsed] = useState(false)
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id: DESKTOP_LAYOUT_ID,
+  })
+
+  const toggleArtifacts = () => {
+    const panel = artifactsPanel.current
+    if (!panel) return
+    if (panel.isCollapsed()) {
+      panel.expand()
+    } else {
+      panel.collapse()
+    }
+  }
+
   return (
-    <div className="flex h-screen flex-col overflow-hidden">
-      {/* Header — full width, above everything */}
-      <header className="flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
-        <h1 className="text-lg font-bold tracking-tight">Lotsa</h1>
-        <ThemeToggle />
+    <SidebarProvider
+      defaultOpen={readSidebarOpenCookie()}
+      style={{ '--sidebar-width': '18rem' } as CSSProperties}
+      className="h-screen flex-col overflow-hidden min-h-0!"
+    >
+      {/* Header — full width, above everything. z-20 keeps it above the
+          offcanvas sidebar's fixed rail (z-10). */}
+      <header className="z-20 flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
+        <div className="flex items-center gap-2">
+          {/* Left task-list toggle — mirrors the mobile shell (⌘/Ctrl+B for
+              free). Collapse state persists via the `sidebar_state` cookie. */}
+          <SidebarTrigger />
+          <h1 className="text-lg font-bold tracking-tight">Lotsa</h1>
+        </div>
+        <div className="flex items-center gap-1">
+          {/* Right artifacts-panel toggle. */}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={toggleArtifacts}
+            aria-expanded={!artifactsCollapsed}
+            aria-label={
+              artifactsCollapsed ? 'Show artifacts panel' : 'Hide artifacts panel'
+            }
+          >
+            {artifactsCollapsed ? (
+              <PanelRightOpen className="size-4" />
+            ) : (
+              <PanelRightClose className="size-4" />
+            )}
+          </Button>
+          <ThemeToggle />
+        </div>
       </header>
 
       {/* Body — sidebar + resizable content area */}
-      <SidebarProvider className="flex-1 !min-h-0">
-        <Sidebar collapsible="none" className="w-[18rem] shrink-0 border-r border-border">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* Offcanvas task list. The fixed rail is pinned below the h-12 header
+            (top-12, `!important` beats the primitive's `inset-y-0`) and left to
+            stretch to the viewport bottom (h-auto drops the primitive's h-svh
+            so top+bottom govern) so it never covers the title/triggers. */}
+        <Sidebar collapsible="offcanvas" className="top-12! h-auto">
           <AppSidebar selectedTaskId={selectedTaskId} onSelectTask={onSelectTask} />
         </Sidebar>
         <SidebarInset className="flex-1 overflow-hidden">
-          <ResizablePanelGroup orientation="horizontal" className="h-full">
+          <ResizablePanelGroup
+            orientation="horizontal"
+            className="h-full"
+            defaultLayout={defaultLayout}
+            onLayoutChanged={onLayoutChanged}
+          >
             {/* Chat panel */}
-            <ResizablePanel defaultSize={55} minSize={35}>
+            <ResizablePanel id="chat" defaultSize={55} minSize={35}>
               <div className="flex h-full flex-col overflow-hidden">
                 {selectedTaskId ? (
                   <ChatPanel taskId={selectedTaskId} />
@@ -68,18 +139,28 @@ function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
               </div>
             </ResizablePanel>
 
-            <ResizableHandle withHandle />
+            {/* Hide the drag handle while the artifacts panel is collapsed;
+                the header button is the way back. */}
+            {!artifactsCollapsed && <ResizableHandle withHandle />}
 
             {/* Right panel — artifacts + changes */}
-            <ResizablePanel defaultSize={45} minSize={25}>
+            <ResizablePanel
+              id="artifacts"
+              panelRef={artifactsPanel}
+              defaultSize={45}
+              minSize={25}
+              collapsible
+              collapsedSize={0}
+              onResize={(size) => setArtifactsCollapsed(size.asPercentage === 0)}
+            >
               <div className="flex h-full flex-col overflow-hidden">
                 <RightPanel taskId={selectedTaskId} />
               </div>
             </ResizablePanel>
           </ResizablePanelGroup>
         </SidebarInset>
-      </SidebarProvider>
-    </div>
+      </div>
+    </SidebarProvider>
   )
 }
 
