@@ -151,7 +151,7 @@ Six agent-dispatched steps plus an automated PR-monitoring phase — the full SD
 1. **Plan** — agent reads the codebase and writes an implementation plan (ungated; its reasoning carries forward). The task body, or a spec carried from chat, is the brief
 2. **Test** — agent writes failing tests (resumes the same session)
 3. **Code** — agent implements to make the tests pass (resumes the same session)
-4. **Review** — agent reviews the diff independently (fresh session, no implementation bias); `REVIEW_FAIL` loops back to code
+4. **Review** — agent reviews the diff independently (fresh session, no implementation bias); a failed review (`AGENT_RESULT: FAILED`) loops back to code
 5. **Verify** — conversational; agent confirms what was built before opening the PR
 6. **Push & monitor** — the `push_pr` action opens the PR, then `wait_for_pr_signal` polls GitHub. Reviewer comments and failing checks dispatch a `pr_fix` sub-flow that re-runs review and pushes again until merged
 
@@ -246,7 +246,7 @@ flows:
     steps:
       - name: pr-fix
         rules:
-          - { source: stdout, pattern: "PR_FIX_SKIPPED", target: wait }
+          - { source: stdout, pattern: "^AGENT_RESULT: SKIPPED", target: wait }
       - name: review                 # the per-flow rules below override main's
         rules:
           - { source: stdout, pattern: "Critical|High", target: pr-fix }
