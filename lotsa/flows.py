@@ -679,12 +679,12 @@ def _build_state_machine(
 # Leading markdown noise an agent may put before a line-anchored routing
 # marker: a heading prefix (``#``..``######`` + space) and/or tight inline
 # wrappers (inline code, bold, italic, strikethrough). Stripped in
-# ``_match_marker``'s fallback so ``## SPEC_COMPLETE:`` (an internal task),
-# ``\`SPEC_COMPLETE:\``` (an internal task), and ``**REVIEW_PASS**`` all route.
+# ``_match_marker``'s fallback so ``## AGENT_RESULT: PASSED`` (an internal task),
+# ``\`AGENT_RESULT: PASSED\``` (an internal task), and ``**AGENT_RESULT: PASSED**`` all route.
 # Deliberately narrow on the wrapper side: a wrapper run must abut the text
-# with NO space, so a bullet quoting a marker mid-document ("* `SPEC_…` is
+# with NO space, so a bullet quoting a marker mid-document ("* `AGENT_RESULT:` is
 # emitted when …" — ``*`` then a space) cannot false-match. The heading
-# alternative DOES consume its trailing space (``## `` → ``SPEC_…``) because
+# alternative DOES consume its trailing space (``## `` → ``AGENT_RESULT:``) because
 # a ``#``-prefixed line is unambiguously a heading, not a list item.
 _MARKER_WRAPPER_RE = re.compile(r"^(?:#{1,6}[ \t]+|[`*_~]{1,3})+")
 
@@ -771,7 +771,7 @@ def resolve_output_target(
             return rj.queue_state
     # Cross-flow rule targets other than the orchestrator's SKIPPED→monitor
     # short-circuit resolve to ``"blocked"`` here. The drainer's
-    # ``PR_FIX_SKIPPED:`` branch handles the one cross-flow handoff the
+    # ``AGENT_RESULT: SKIPPED`` branch handles the one cross-flow handoff the
     # bundled processes use (sub-flow → host monitor) by short-circuiting
     # the rule resolver and routing back to the parent flow's monitor by
     # name. Any *other* custom rule that names a job belonging to a sibling
@@ -808,7 +808,7 @@ def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
       and the task stalls at ``status=working`` until the next restart.
     * sub-flow exit (sub_step.active_state, host_job.queue_state) is missing
       → the drainer's post-rule CAS check rejects the routing (e.g.
-      PR_FIX_SKIPPED → wait_for_pr_signal, PR_FIX_DONE → reviewing).
+      pr-fix SKIPPED → wait_for_pr_signal, pr-fix COMPLETED → reviewing).
 
     The fix is to mutate the underlying ``StateMachine`` after construction:
     register the missing edges and add any newly-referenced states. This is
@@ -883,7 +883,7 @@ def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
                     sm_states.add(target.queue_state)
                     sm_trans[(rj.active_state, target.queue_state)] = TransitionRule()
                     # The other-flow step may also need to terminate at
-                    # blocked from this flow's perspective (PR_FIX_BLOCKED).
+                    # blocked from this flow's perspective (pr-fix FAILED → blocked).
                     sm_trans[(rj.active_state, "blocked")] = TransitionRule()
                     # And needs the self-loop for retry on its own active state.
                     sm_trans[(rj.active_state, rj.active_state)] = TransitionRule()
@@ -939,14 +939,14 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
     Both rule surfaces are checked: the job-level default ``rules:`` AND the
     per-flow binding override ``rules:`` (``{name: review, rules: [...]}``).
     The override rules ARE the "sub-flow rules" R6 names — sub-flow routing
-    (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``) lives in binding overrides,
+    (e.g. ``pr_fix.review`` FAILED → pr-fix) lives in binding overrides,
     not the job defaults, so validating only ``Job.rules`` would let a
     cross-process sub-flow target slip straight through to the runtime
     ``blocked`` fallback.
 
     Recognized non-job keywords: ``next`` (success edge), the terminal states
     ``blocked`` / ``complete`` / ``abandoned``, and ``needs_input`` — the last
-    is special-cased in the completion drainer's PR_FIX_NEEDS_DECISION path
+    is special-cased in the completion drainer's ``AGENT_RESULT: INPUT`` path
     (e.g. the bundled ``build`` process's ``pr-fix`` rule routes to it), so it
     is a legitimate target even though it is not a job.
     """

@@ -97,7 +97,7 @@ def _marker_requirement_footer(rules: list) -> str:
     """A mandatory-marker footer derived from a step's stdout output rules.
 
     Marker-driven steps advance only if the agent emits the literal token (e.g.
-    ``VERIFIED:``). Agents — especially on cheaper models — often write a prose
+    ``AGENT_RESULT: PASSED``). Agents — especially on cheaper models — often write a prose
     conclusion and omit it, stranding the task (ADR-039 records the longer-term
     fix). This footer makes the marker non-optional, and is derived from the
     step's own ``rules`` so it can never drift from process.yaml. Returns ``""``
@@ -498,9 +498,9 @@ async def _read_head_sha(work_dir: Path) -> str | None:
 
 
 def _strip_spec_marker(stdout: str) -> str:
-    """Remove the leading SPEC_COMPLETE: (or similar) marker line from *stdout*.
+    """Remove the leading conversational completion marker line from *stdout*.
 
-    The conversational rule's regex matches a line like ``SPEC_COMPLETE: foo``;
+    The conversational rule's regex matches a line like ``AGENT_RESULT: COMPLETED foo``;
     the persisted artifact should be everything that follows that line, with
     surrounding whitespace trimmed.
     """
@@ -2352,7 +2352,7 @@ class OrchestratorService:
         # waiting / needs_input — re-dispatch the current step. Resolve against
         # the task's ACTIVE flow first (see ``_resolve_step_for_row``): a pr_fix
         # ``review`` resolved against root gets *main's* review (success_state
-        # ``verify``), whose REVIEW_PASS auto-advance targets an edge absent from
+        # ``verify``), whose ``review`` PASSED auto-advance targets an edge absent from
         # pr_fix's SM and silently strands the task — the same failure mode
         # ``retry()`` fixes (an internal task).
         step = self._resolve_step_for_row(row)
@@ -2492,7 +2492,7 @@ class OrchestratorService:
         # Phase 2 — for pr-fix resumes, capture the round count for the
         # post-CAS counter bump. ADR-019 Commitment 5: the ``max_pr_fix_rounds``
         # cap is NOT enforced on this operator-initiated path — an operator
-        # answering a ``PR_FIX_NEEDS_DECISION`` is supervised dialogue, not an
+        # answering a pr-fix ``AGENT_RESULT: INPUT`` is supervised dialogue, not an
         # autonomous loop, so the very answer the agent requested can be
         # delivered even after the cap has fired. The counter still increments.
         is_pr_fix = step.name == "pr-fix"
@@ -3309,8 +3309,8 @@ class OrchestratorService:
             #  (b) Jumping INTO pr-fix: ``jump_to_step("pr-fix")`` previously
             #      did not write ``current_flow="pr_fix"``, so the subsequent
             #      ``review`` completion evaluated main-flow rule overrides
-            #      (``REVIEW_FAIL → code``) instead of the pr_fix-flow
-            #      overrides (``REVIEW_FAIL → pr-fix``). The
+            #      (``review FAILED → code``) instead of the pr_fix-flow
+            #      overrides (``review FAILED → pr-fix``). The
             #      ``_dispatch_pr_fix_locked`` entry point already writes
             #      ``current_flow="pr_fix"`` (see line ~1700); this brings
             #      jump_to_step's pr-fix path to the same invariant.
@@ -4123,7 +4123,7 @@ class OrchestratorService:
             return await self._handle_conflict_dispatch(item, sync_result.conflicting_files, current_rounds)
 
         # Clean merge or already-current: proceed to pr-fix dispatch.
-        # Record the round's dispatch cutoff so PR_FIX_SKIPPED: can advance
+        # Record the round's dispatch cutoff so a pr-fix ``AGENT_RESULT: SKIPPED`` can advance
         # pr_comments_since to this cursor without re-deriving it. Both the
         # monitor-driven and revise-driven entry paths land here, so this
         # is the single source of truth for "the agent saw feedback up to
@@ -4134,8 +4134,8 @@ class OrchestratorService:
         # Set ``current_flow`` here — the task has just been claimed into
         # ``pr-fixing`` and every subsequent step lookup must resolve against
         # the ``pr_fix`` flow's bindings (e.g. so ``review``'s per-flow rule
-        # override ``REVIEW_FAIL → pr-fix`` is the one the drainer evaluates,
-        # not the root flow's ``REVIEW_FAIL → code``). Reset is owned by the
+        # override ``review FAILED → pr-fix`` is the one the drainer evaluates,
+        # not the root flow's ``review FAILED → code``). Reset is owned by the
         # sub-flow exit paths: the SKIPPED drainer branch (``pr-fix →
         # wait_for_pr_signal``) and ``_execute_action_step``'s success path
         # when the next step is a monitor.
@@ -5306,7 +5306,7 @@ class OrchestratorService:
 
             # Save stdout as named artifact if this step declares an output
             # (skip conversational steps — their artifact is saved in the drainer
-            # at SPEC_COMPLETE detection with cleaned content). Narration ahead
+            # at conversational-marker detection with cleaned content). Narration ahead
             # of the content anchor is stripped at the source. A *successful*
             # step that promised an artifact but couldn't deliver a usable one
             # fails the dispatch (→ blocked, Retry re-runs the agent) instead of
@@ -5515,7 +5515,7 @@ class OrchestratorService:
                     # with no MERGE_HEAD — a different, confusing task than the
                     # one the prompt describes when the operator answers. The
                     # posthooks run on the resume pass once the agent emits its
-                    # terminal marker (``CONFLICTS_RESOLVED:`` etc.).
+                    # terminal marker (``AGENT_RESULT: COMPLETED`` etc.).
                     pending_question = _extract_needs_input(result.stdout)
                     if info.step.posthooks and pending_question is None:
                         posthook_work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
@@ -5679,7 +5679,7 @@ class OrchestratorService:
                                 )
                             continue
 
-                        # R4: pr-fix may emit PR_FIX_SKIPPED: with a target
+                        # R4: pr-fix may emit ``AGENT_RESULT: SKIPPED`` with a target
                         # naming the monitor's state — ``waiting_for_pr`` in
                         # the legacy synthetic-state model, ``wait_for_pr_signal``
                         # (or whatever the YAML names its pr_monitor job) in
@@ -5796,12 +5796,12 @@ class OrchestratorService:
                             if result.stdout:
                                 for line in reversed(result.stdout.splitlines()):
                                     if line.strip():
-                                        # Strip the ``PR_FIX_<MARKER>:`` prefix so
+                                        # Strip the ``AGENT_RESULT: <OUTCOME>`` prefix so
                                         # the ``pr_decision.reasoning`` audit field
                                         # carries the human-readable summary in the
-                                        # same format as NEEDS_DECISION (which uses
-                                        # ``_extract_needs_decision_question``) and
-                                        # the cap-fire synthesised messages.
+                                        # same format as the ``AGENT_RESULT: INPUT`` path
+                                        # (which uses ``_extract_needs_decision_question``)
+                                        # and the cap-fire synthesised messages.
                                         # Contract documented on
                                         # ``_record_pr_decision``. The ``pr_decision``
                                         # row below is the SINGLE user-facing carrier
@@ -5955,9 +5955,9 @@ class OrchestratorService:
                         # ADR-014 Layer A — ``previous_step_name`` kwarg removed
                         # from ``resolve_output_target``. The autonomous code↔
                         # review loop is now spelled by name in the main flow's
-                        # per-binding rule override (REVIEW_FAIL → code).
+                        # per-binding rule override (review FAILED → code).
                         # Resolve against the task's *active* flow so sub-flow
-                        # rule targets (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``)
+                        # rule targets (e.g. ``pr_fix.review`` FAILED → pr-fix)
                         # find their target job in the right bindings.
                         active_flow_for_rule = self._resolve_flow(item)
                         target = resolve_output_target(
@@ -5966,7 +5966,7 @@ class OrchestratorService:
                             active_flow_for_rule,
                         )
                         # Save chat message for conversational steps so the conversation
-                        # history isn't lost when routing (e.g. NEEDS_REVIEW from verify)
+                        # history isn't lost when routing (e.g. a FAILED verdict routing back to code)
                         if info.step.conversational:
                             await self.db.add_message(
                                 item.id,
@@ -5978,7 +5978,7 @@ class OrchestratorService:
                             )
                         # Validate the rule-target transition against the *active*
                         # flow's SM, not main's. Sub-flow bindings (e.g.
-                        # pr_fix.review's REVIEW_FAIL → pr-fix) declare edges that
+                        # pr_fix.review's FAILED → pr-fix) declare edges that
                         # only exist in the sub-flow's SM — checking against main
                         # would reject the CAS and strand the task in working.
                         if (item.state, target) not in active_flow_for_rule.state_machine.transitions:
@@ -6037,7 +6037,7 @@ class OrchestratorService:
                             if result.stdout:
                                 for line in reversed(result.stdout.splitlines()):
                                     if line.strip():
-                                        # Strip ``PR_FIX_<MARKER>:`` prefix —
+                                        # Strip ``AGENT_RESULT: <OUTCOME>`` prefix —
                                         # keeps the audit field format consistent
                                         # across decision types. See
                                         # ``_strip_pr_fix_marker_prefix`` and
@@ -6089,7 +6089,7 @@ class OrchestratorService:
                             )
                         if target != "blocked":
                             # Pass the agent's output as feedback so the next step
-                            # knows why it was routed (e.g. REVIEW_FAIL summary)
+                            # knows why it was routed (e.g. a review FAILED summary)
                             await self._dispatch_next_step(item, feedback=result.stdout)
                         await self._cleanup_worktree_if_done(item)
                     else:
@@ -6121,7 +6121,7 @@ class OrchestratorService:
                                 item.id, "agent", info.step.job_type, result.stdout, "chat", metadata=chat_meta
                             )
                             # Persist the artifact RIGHT NOW (not at approve time). The drainer is
-                            # the only place where SPEC_COMPLETE can be reliably observed; if we
+                            # the only place where the conversational completion marker can be reliably observed; if we
                             # defer to approve, closing the browser between detection and approve
                             # loses the spec content.
                             if spec is not None and info.step.output:
@@ -6206,8 +6206,8 @@ class OrchestratorService:
                         # If the step declared output rules but NONE matched,
                         # block rather than silently auto-advancing to the
                         # sequential next step.  This catches cases like a
-                        # pr-fix agent that fails to emit PR_FIX_DONE: /
-                        # PR_FIX_BLOCKED: — without this guard the task would
+                        # pr-fix agent that fails to emit ``AGENT_RESULT: COMPLETED`` /
+                        # ``AGENT_RESULT: FAILED`` — without this guard the task would
                         # fall through to whatever step happens to follow
                         # pr-fix in YAML (e.g. verify), bypassing review.
                         # ``rule_target is None`` means the rule list was
@@ -6611,16 +6611,16 @@ class OrchestratorService:
           next round.
 
         ``reasoning`` format contract: a plain human-readable summary
-        with the ``PR_FIX_<MARKER>:`` prefix already stripped — display
+        with the ``AGENT_RESULT: <OUTCOME>`` prefix already stripped — display
         and query callers can treat the field uniformly across
         ``decision`` values without per-type pattern-matching:
 
-        * DONE/SKIPPED/agent-emitted BLOCKED: the drainer extracts the
+        * COMPLETED/SKIPPED/agent-emitted FAILED: the drainer extracts the
           last non-empty stdout line and passes it through
           ``_strip_pr_fix_marker_prefix`` before calling this helper, so
-          a stdout line of ``"PR_FIX_DONE: addressed the lint comments"``
+          a stdout line of ``"AGENT_RESULT: COMPLETED addressed the lint comments"``
           arrives as ``"addressed the lint comments"``.
-        * NEEDS_DECISION: ``_extract_needs_decision_question`` strips
+        * INPUT (needs-decision): ``_extract_needs_decision_question`` strips
           the marker and returns just the question text (or a fallback
           placeholder when the marker has no trailing text).
         * Cap-fire paths: synthesised sentences with no marker prefix to
@@ -6888,7 +6888,7 @@ class OrchestratorService:
         ``success_state`` differs from the same-named root job (pr_fix
         ``review`` → ``push_pr`` vs main ``review`` → ``verify``). Resolving
         only against root dispatches *main's* job on a sub-flow task; the
-        REVIEW_PASS auto-advance then targets ``(reviewing → verify)`` — an
+        ``review`` PASSED auto-advance then targets ``(reviewing → verify)`` — an
         edge absent from pr_fix's SM — so the completion is silently dropped
         and the task stalls at ``reviewing/working`` (an internal task's multi-day
         stall, confirmed via the drainer strand-warning).
@@ -6919,7 +6919,7 @@ class OrchestratorService:
 
         When ``item`` is supplied, the lookup runs against the item's
         currently-active flow (see ``_resolve_flow``); this is what makes
-        sub-flow rule overrides (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``)
+        sub-flow rule overrides (e.g. ``pr_fix.review`` FAILED → pr-fix)
         take effect at dispatch time. Callers that don't have an item
         (e.g. dispatch-table sanity checks) fall back to the root flow.
         """
