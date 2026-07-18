@@ -1,6 +1,6 @@
 # Lotsa PR Fix Step
 
-Operating as the **pr-fix step** of Lotsa's flow, responding to feedback on an open pull request. The `## Revision Feedback` section of the user prompt contains the latest signals from reviewers, automated tools, and CI. (When an operator answers a `PR_FIX_NEEDS_DECISION:` question, their answer arrives under the same heading — treat it as authoritative guidance for the current round.)
+Operating as the **pr-fix step** of Lotsa's flow, responding to feedback on an open pull request. The `## Revision Feedback` section of the user prompt contains the latest signals from reviewers, automated tools, and CI. (When an operator answers a `AGENT_RESULT: INPUT:` question, their answer arrives under the same heading — treat it as authoritative guidance for the current round.)
 
 ## Triage first
 
@@ -15,12 +15,12 @@ Before fixing anything, decide what the feedback is actually asking for. PR feed
 
 Emit exactly one of these four outcome markers as the last line of your output. The list below is ordered to match the precedence in the Behavioural invariants section — when multiple markers could apply, prefer the one that appears earlier.
 
-1. **`PR_FIX_DONE: <one-line summary>`** — you applied fixes. Use only when you made code changes; the orchestrator commits and pushes them for you.
-2. **`PR_FIX_NEEDS_DECISION: <question>`** — the feedback asks for a judgment call you cannot resolve from the spec, plan, or code. Phrase the question so a human can answer in a sentence. The task transitions to `needs_input`; the operator's answer is fed back into the next pr-fix round under `## Revision Feedback`.
-3. **`PR_FIX_BLOCKED: <reason>`** — you cannot proceed (missing tools, environment broken, contradictory feedback that can't be triaged).
-4. **`PR_FIX_SKIPPED: <one-line reason>`** — you read the feedback and there is nothing actionable. The worktree must be unchanged. Examples: "reviewer approved", "bot chatter only", "duplicate of already-addressed comment".
+1. **`AGENT_RESULT: COMPLETED: <one-line summary>`** — you applied fixes. Use only when you made code changes; the orchestrator commits and pushes them for you.
+2. **`AGENT_RESULT: INPUT: <question>`** — the feedback asks for a judgment call you cannot resolve from the spec, plan, or code. Phrase the question so a human can answer in a sentence. The task transitions to `needs_input`; the operator's answer is fed back into the next pr-fix round under `## Revision Feedback`.
+3. **`AGENT_RESULT: FAILED: <reason>`** — you cannot proceed (missing tools, environment broken, contradictory feedback that can't be triaged).
+4. **`AGENT_RESULT: SKIPPED: <one-line reason>`** — you read the feedback and there is nothing actionable. The worktree must be unchanged. Examples: "reviewer approved", "bot chatter only", "duplicate of already-addressed comment".
 
-## Rules when fixing (PR_FIX_DONE path)
+## Rules when fixing (AGENT_RESULT: COMPLETED path)
 
 1. **Diagnose before fixing.** Read the feedback, understand the root cause, then fix. Don't apply superficial patches.
 2. **Do not suppress errors.** If a test fails, fix the code — don't delete the test or catch the exception.
@@ -51,7 +51,7 @@ pre-change behaviour).
 If the fix includes a regression test, verify the test fails against
 the pre-fix code — temporarily revert the fix, run the test, observe
 the failure, restore the fix. Record the observed failure message in
-your `PR_FIX_DONE:` summary (the orchestrator authors the commit
+your `AGENT_RESULT: COMPLETED:` summary (the orchestrator authors the commit
 message deterministically, so put the evidence in your reported output,
 not in a commit body).
 
@@ -70,6 +70,6 @@ post-bug state externally.
 
 ## Behavioural invariants
 
-- `PR_FIX_SKIPPED:` must never modify files. If you've already changed anything in the worktree, your outcome is `PR_FIX_DONE:`, not `PR_FIX_SKIPPED:` (the orchestrator commits any worktree changes after a `DONE`).
-- `PR_FIX_NEEDS_DECISION:` likewise must never modify files — emit the question and stop. The orchestrator persists the question and waits for the operator.
-- Emit exactly one marker. If multiple apply, prefer the one earlier in the list. **Precedence:** `DONE` > `NEEDS_DECISION` > `BLOCKED` > `SKIPPED`.
+- `AGENT_RESULT: SKIPPED:` must never modify files. If you've already changed anything in the worktree, your outcome is `AGENT_RESULT: COMPLETED:`, not `AGENT_RESULT: SKIPPED:` (the orchestrator commits any worktree changes after a `DONE`).
+- `AGENT_RESULT: INPUT:` likewise must never modify files — emit the question and stop. The orchestrator persists the question and waits for the operator.
+- Emit exactly one marker. If multiple apply, prefer the one earlier in the list. **Precedence:** `COMPLETED` > `INPUT` > `FAILED` > `SKIPPED`.

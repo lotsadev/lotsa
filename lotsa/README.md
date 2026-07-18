@@ -169,7 +169,7 @@ flows:
     steps:
       - name: pr-fix
         rules:
-          - { source: stdout, pattern: "PR_FIX_SKIPPED", target: wait }
+          - { source: stdout, pattern: "^AGENT_RESULT: SKIPPED", target: wait }
       - name: review                 # the per-flow rules below override main's
         rules:
           - { source: stdout, pattern: "Critical|High", target: pr-fix }

@@ -97,7 +97,7 @@ def _marker_requirement_footer(rules: list) -> str:
     """A mandatory-marker footer derived from a step's stdout output rules.
 
     Marker-driven steps advance only if the agent emits the literal token (e.g.
-    ``VERIFIED:``). Agents — especially on cheaper models — often write a prose
+    ``AGENT_RESULT: PASSED``). Agents — especially on cheaper models — often write a prose
     conclusion and omit it, stranding the task (ADR-039 records the longer-term
     fix). This footer makes the marker non-optional, and is derived from the
     step's own ``rules`` so it can never drift from process.yaml. Returns ``""``
@@ -318,6 +318,14 @@ tool output) and do not redo completed work."""
 # still wedged past this bound is abandoned and recovered by the next resume sweep.
 _DRAIN_APPLY_TIMEOUT_SECONDS = 5.0
 
+# ADR-044 — the universal agent-outcome vocabulary. An agent reports one of
+# these; the flow *edge* decides what it means next. Group 1 is the outcome
+# word, group 2 the trailing same-line free-text payload (question / reason).
+_AGENT_RESULT_RE = re.compile(
+    r"^AGENT_RESULT:\s*(COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$",
+    re.MULTILINE,
+)
+# Retained alias — ``NEEDS_INPUT: <q>`` == ``AGENT_RESULT: INPUT <q>``.
 _NEEDS_INPUT_RE = re.compile(r"^NEEDS_INPUT:\s*(.+)", re.MULTILINE)
 
 _MAX_TITLE_LEN = 80
@@ -360,67 +368,85 @@ def _run_stats(result: AgentResult) -> dict | None:
 
 
 def _extract_needs_input(stdout: str) -> str | None:
-    """Extract the last NEEDS_INPUT question from agent output."""
-    matches = _NEEDS_INPUT_RE.findall(stdout)
-    return matches[-1].strip() if matches else None
+    """Extract the last blocking-question payload from agent output.
 
-
-_PR_FIX_NEEDS_DECISION_RE = re.compile(r"^PR_FIX_NEEDS_DECISION:\s*(.*)$", re.MULTILINE)
+    Recognises both the generic ``AGENT_RESULT: INPUT <question>`` marker and
+    the retained ``NEEDS_INPUT: <question>`` alias, returning whichever appears
+    last in the output.
+    """
+    last: str | None = None
+    for line in (stdout or "").splitlines():
+        s = line.strip()
+        m = _AGENT_RESULT_RE.match(s)
+        if m is not None and m.group(1) == "INPUT":
+            last = m.group(2).strip()
+            continue
+        alias = _NEEDS_INPUT_RE.match(s)
+        if alias is not None:
+            last = alias.group(1).strip()
+    return last
 
 
 def _extract_needs_decision_question(stdout: str) -> str:
-    """Extract the question from a PR_FIX_NEEDS_DECISION: marker.
+    """Extract a pr-fix ``AGENT_RESULT: INPUT`` question (or a placeholder).
 
     Returns the trimmed question text after the marker. If the marker is
-    present but has no question text, returns a fallback placeholder so
-    the operator-facing chat input never renders an empty prompt.
+    present but has no question text, returns a fallback placeholder so the
+    operator-facing chat input never renders an empty prompt.
     """
-    m = _PR_FIX_NEEDS_DECISION_RE.search(stdout or "")
-    if m:
-        text = m.group(1).strip()
-        if text:
-            return text
-    return "Agent emitted PR_FIX_NEEDS_DECISION without a question."
+    question = _extract_needs_input(stdout or "")
+    return question or "Agent emitted AGENT_RESULT: INPUT without a question."
 
 
-_PR_FIX_MARKER_PREFIX_RE = re.compile(r"^PR_FIX_(?:DONE|SKIPPED|BLOCKED|NEEDS_DECISION):\s*(.*)$")
+_AGENT_RESULT_PREFIX_RE = re.compile(r"^AGENT_RESULT:\s*(?:COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$")
 # A pr-fix dispatched right after resolve_conflicts receives that agent's stdout
 # as feedback (the rule-route carry-forward, ``feedback=result.stdout``), which
-# carries this marker. Used to recognise that "feedback" as the conflict-
-# resolution echo, not genuine reviewer input.
-_CONFLICTS_RESOLVED_RE = re.compile(r"^CONFLICTS_RESOLVED:", re.MULTILINE)
+# carries the resolve_conflicts worker's ``AGENT_RESULT: COMPLETED`` report. Used
+# to recognise that "feedback" as a benign step-completion echo, not genuine
+# reviewer input.
+#
+# Scoped to ``COMPLETED`` deliberately: under the generic vocabulary (ADR-044)
+# every terminal marker shares the ``AGENT_RESULT:`` prefix, so matching the bare
+# prefix would also swallow a ``review`` step's ``AGENT_RESULT: FAILED`` verdict
+# when it is carried forward into ``pr-fix`` (the ``review.FAILED → pr-fix`` edge
+# in the ``pr_fix`` sub-flow). A review failure is real, actionable feedback: a
+# subsequent ``SKIPPED`` must still burn ``max_consecutive_skipped``. Only the
+# ``COMPLETED`` worker echo (resolve_conflicts) is benign — a ``FAILED``/``PASSED``
+# gate verdict is not.
+_AGENT_ECHO_RE = re.compile(r"^AGENT_RESULT:\s*COMPLETED\b", re.MULTILINE)
 
 
-def _strip_pr_fix_marker_prefix(line: str) -> str:
-    """Strip a ``PR_FIX_<MARKER>:`` prefix from ``line`` if present.
+def _strip_agent_result_prefix(line: str) -> str:
+    """Strip a leading ``AGENT_RESULT: <OUTCOME>`` prefix from ``line`` if present.
 
-    The drainer captures the agent's outcome by scanning the tail of stdout
-    for the last non-empty line and writing it into the ``pr_decision``
-    audit row's ``reasoning`` field. That line typically still carries the
-    marker prefix (``PR_FIX_DONE: addressed the lint comments``), while
-    the parallel NEEDS_DECISION path uses
-    ``_extract_needs_decision_question`` which strips the marker. Without
-    this helper the audit field's format would diverge across decision
-    types, forcing display and query callers to pattern-match per
-    ``decision`` value.
+    The drainer captures the agent's outcome by scanning the tail of stdout for
+    the last non-empty line and writing it into the ``pr_decision`` audit row's
+    ``reasoning`` field. That line typically still carries the marker prefix
+    (``AGENT_RESULT: COMPLETED addressed the lint comments``). This helper keeps
+    the audit field uniform across outcome types.
 
-    Returns the substring after the marker (whitespace-trimmed) when the
-    line starts with one of the four ``PR_FIX_*`` markers; otherwise
-    returns the input unchanged. Empty/whitespace input returns ``""``.
+    Returns the substring after the marker (whitespace-trimmed) when the line
+    starts with an ``AGENT_RESULT:`` marker; otherwise returns the input
+    unchanged. Empty/whitespace input returns ``""``.
     """
     if not line:
         return ""
-    m = _PR_FIX_MARKER_PREFIX_RE.match(line.strip())
+    m = _AGENT_RESULT_PREFIX_RE.match(line.strip())
     if m:
         return m.group(1).strip()
     return line.strip()
 
 
+# Backward-compatible alias — some drainer call sites and tests reference the
+# pr-fix-specific name; the generic stripper handles every outcome.
+_strip_pr_fix_marker_prefix = _strip_agent_result_prefix
+
+
 def _feedback_is_actionable(feedback: str | None) -> bool:
     """Whether feedback delivered to a pr-fix dispatch was real.
 
-    A ``PR_FIX_SKIPPED`` only counts toward ``max_consecutive_skipped`` when
-    the agent actually had something to skip. These are benign — the agent
+    An ``AGENT_RESULT: SKIPPED`` only counts toward ``max_consecutive_skipped``
+    when the agent actually had something to skip. These are benign — the agent
     correctly had nothing to do, so such skips must not burn the cap:
 
     - Empty/whitespace feedback (an empty retry, or a dispatch with no operator
@@ -428,13 +454,19 @@ def _feedback_is_actionable(feedback: str | None) -> bool:
       ``"No specific feedback found."`` sentinel (an internal task: in-progress-
       review skips tripped the cap before the real review landed).
     - The ``resolve_conflicts`` echo: a pr-fix dispatched right after that step
-      is fed its stdout (the ``CONFLICTS_RESOLVED:`` report) as feedback via the
-      rule-route carry-forward. The conflict is already resolved, so skipping it
-      is benign (internal tasks / 04ee0735: the echo skip burned the cap and
+      is fed its stdout (its ``AGENT_RESULT: COMPLETED`` report) as feedback via
+      the rule-route carry-forward. The conflict is already resolved, so skipping
+      it is benign (internal tasks / 04ee0735: the echo skip burned the cap and
       re-blocked a conflict-resolved, review-ready PR).
+
+    Only the ``COMPLETED`` worker echo is benign. A ``review`` step's
+    ``AGENT_RESULT: FAILED`` verdict, carried into pr-fix via the
+    ``review.FAILED → pr-fix`` edge, is genuine actionable feedback — a
+    subsequent skip *must* count toward the cap. ``_AGENT_ECHO_RE`` is scoped to
+    ``COMPLETED`` so it never swallows a gate verdict.
     """
     delivered = (feedback or "").strip()
-    if _CONFLICTS_RESOLVED_RE.search(delivered):
+    if _AGENT_ECHO_RE.search(delivered):
         return False
     return bool(delivered) and delivered != "No specific feedback found."
 
@@ -466,9 +498,9 @@ async def _read_head_sha(work_dir: Path) -> str | None:
 
 
 def _strip_spec_marker(stdout: str) -> str:
-    """Remove the leading SPEC_COMPLETE: (or similar) marker line from *stdout*.
+    """Remove the leading conversational completion marker line from *stdout*.
 
-    The conversational rule's regex matches a line like ``SPEC_COMPLETE: foo``;
+    The conversational rule's regex matches a line like ``AGENT_RESULT: COMPLETED foo``;
     the persisted artifact should be everything that follows that line, with
     surrounding whitespace trimmed.
     """
@@ -2320,7 +2352,7 @@ class OrchestratorService:
         # waiting / needs_input — re-dispatch the current step. Resolve against
         # the task's ACTIVE flow first (see ``_resolve_step_for_row``): a pr_fix
         # ``review`` resolved against root gets *main's* review (success_state
-        # ``verify``), whose REVIEW_PASS auto-advance targets an edge absent from
+        # ``verify``), whose ``review`` PASSED auto-advance targets an edge absent from
         # pr_fix's SM and silently strands the task — the same failure mode
         # ``retry()`` fixes (an internal task).
         step = self._resolve_step_for_row(row)
@@ -2460,7 +2492,7 @@ class OrchestratorService:
         # Phase 2 — for pr-fix resumes, capture the round count for the
         # post-CAS counter bump. ADR-019 Commitment 5: the ``max_pr_fix_rounds``
         # cap is NOT enforced on this operator-initiated path — an operator
-        # answering a ``PR_FIX_NEEDS_DECISION`` is supervised dialogue, not an
+        # answering a pr-fix ``AGENT_RESULT: INPUT`` is supervised dialogue, not an
         # autonomous loop, so the very answer the agent requested can be
         # delivered even after the cap has fired. The counter still increments.
         is_pr_fix = step.name == "pr-fix"
@@ -3277,8 +3309,8 @@ class OrchestratorService:
             #  (b) Jumping INTO pr-fix: ``jump_to_step("pr-fix")`` previously
             #      did not write ``current_flow="pr_fix"``, so the subsequent
             #      ``review`` completion evaluated main-flow rule overrides
-            #      (``REVIEW_FAIL → code``) instead of the pr_fix-flow
-            #      overrides (``REVIEW_FAIL → pr-fix``). The
+            #      (``review FAILED → code``) instead of the pr_fix-flow
+            #      overrides (``review FAILED → pr-fix``). The
             #      ``_dispatch_pr_fix_locked`` entry point already writes
             #      ``current_flow="pr_fix"`` (see line ~1700); this brings
             #      jump_to_step's pr-fix path to the same invariant.
@@ -4091,7 +4123,7 @@ class OrchestratorService:
             return await self._handle_conflict_dispatch(item, sync_result.conflicting_files, current_rounds)
 
         # Clean merge or already-current: proceed to pr-fix dispatch.
-        # Record the round's dispatch cutoff so PR_FIX_SKIPPED: can advance
+        # Record the round's dispatch cutoff so a pr-fix ``AGENT_RESULT: SKIPPED`` can advance
         # pr_comments_since to this cursor without re-deriving it. Both the
         # monitor-driven and revise-driven entry paths land here, so this
         # is the single source of truth for "the agent saw feedback up to
@@ -4102,8 +4134,8 @@ class OrchestratorService:
         # Set ``current_flow`` here — the task has just been claimed into
         # ``pr-fixing`` and every subsequent step lookup must resolve against
         # the ``pr_fix`` flow's bindings (e.g. so ``review``'s per-flow rule
-        # override ``REVIEW_FAIL → pr-fix`` is the one the drainer evaluates,
-        # not the root flow's ``REVIEW_FAIL → code``). Reset is owned by the
+        # override ``review FAILED → pr-fix`` is the one the drainer evaluates,
+        # not the root flow's ``review FAILED → code``). Reset is owned by the
         # sub-flow exit paths: the SKIPPED drainer branch (``pr-fix →
         # wait_for_pr_signal``) and ``_execute_action_step``'s success path
         # when the next step is a monitor.
@@ -5274,7 +5306,7 @@ class OrchestratorService:
 
             # Save stdout as named artifact if this step declares an output
             # (skip conversational steps — their artifact is saved in the drainer
-            # at SPEC_COMPLETE detection with cleaned content). Narration ahead
+            # at conversational-marker detection with cleaned content). Narration ahead
             # of the content anchor is stripped at the source. A *successful*
             # step that promised an artifact but couldn't deliver a usable one
             # fails the dispatch (→ blocked, Retry re-runs the agent) instead of
@@ -5483,7 +5515,7 @@ class OrchestratorService:
                     # with no MERGE_HEAD — a different, confusing task than the
                     # one the prompt describes when the operator answers. The
                     # posthooks run on the resume pass once the agent emits its
-                    # terminal marker (``CONFLICTS_RESOLVED:`` etc.).
+                    # terminal marker (``AGENT_RESULT: COMPLETED`` etc.).
                     pending_question = _extract_needs_input(result.stdout)
                     if info.step.posthooks and pending_question is None:
                         posthook_work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
@@ -5647,7 +5679,7 @@ class OrchestratorService:
                                 )
                             continue
 
-                        # R4: pr-fix may emit PR_FIX_SKIPPED: with a target
+                        # R4: pr-fix may emit ``AGENT_RESULT: SKIPPED`` with a target
                         # naming the monitor's state — ``waiting_for_pr`` in
                         # the legacy synthetic-state model, ``wait_for_pr_signal``
                         # (or whatever the YAML names its pr_monitor job) in
@@ -5764,12 +5796,12 @@ class OrchestratorService:
                             if result.stdout:
                                 for line in reversed(result.stdout.splitlines()):
                                     if line.strip():
-                                        # Strip the ``PR_FIX_<MARKER>:`` prefix so
+                                        # Strip the ``AGENT_RESULT: <OUTCOME>`` prefix so
                                         # the ``pr_decision.reasoning`` audit field
                                         # carries the human-readable summary in the
-                                        # same format as NEEDS_DECISION (which uses
-                                        # ``_extract_needs_decision_question``) and
-                                        # the cap-fire synthesised messages.
+                                        # same format as the ``AGENT_RESULT: INPUT`` path
+                                        # (which uses ``_extract_needs_decision_question``)
+                                        # and the cap-fire synthesised messages.
                                         # Contract documented on
                                         # ``_record_pr_decision``. The ``pr_decision``
                                         # row below is the SINGLE user-facing carrier
@@ -5923,9 +5955,9 @@ class OrchestratorService:
                         # ADR-014 Layer A — ``previous_step_name`` kwarg removed
                         # from ``resolve_output_target``. The autonomous code↔
                         # review loop is now spelled by name in the main flow's
-                        # per-binding rule override (REVIEW_FAIL → code).
+                        # per-binding rule override (review FAILED → code).
                         # Resolve against the task's *active* flow so sub-flow
-                        # rule targets (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``)
+                        # rule targets (e.g. ``pr_fix.review`` FAILED → pr-fix)
                         # find their target job in the right bindings.
                         active_flow_for_rule = self._resolve_flow(item)
                         target = resolve_output_target(
@@ -5934,7 +5966,7 @@ class OrchestratorService:
                             active_flow_for_rule,
                         )
                         # Save chat message for conversational steps so the conversation
-                        # history isn't lost when routing (e.g. NEEDS_REVIEW from verify)
+                        # history isn't lost when routing (e.g. a FAILED verdict routing back to code)
                         if info.step.conversational:
                             await self.db.add_message(
                                 item.id,
@@ -5946,7 +5978,7 @@ class OrchestratorService:
                             )
                         # Validate the rule-target transition against the *active*
                         # flow's SM, not main's. Sub-flow bindings (e.g.
-                        # pr_fix.review's REVIEW_FAIL → pr-fix) declare edges that
+                        # pr_fix.review's FAILED → pr-fix) declare edges that
                         # only exist in the sub-flow's SM — checking against main
                         # would reject the CAS and strand the task in working.
                         if (item.state, target) not in active_flow_for_rule.state_machine.transitions:
@@ -6005,7 +6037,7 @@ class OrchestratorService:
                             if result.stdout:
                                 for line in reversed(result.stdout.splitlines()):
                                     if line.strip():
-                                        # Strip ``PR_FIX_<MARKER>:`` prefix —
+                                        # Strip ``AGENT_RESULT: <OUTCOME>`` prefix —
                                         # keeps the audit field format consistent
                                         # across decision types. See
                                         # ``_strip_pr_fix_marker_prefix`` and
@@ -6057,7 +6089,7 @@ class OrchestratorService:
                             )
                         if target != "blocked":
                             # Pass the agent's output as feedback so the next step
-                            # knows why it was routed (e.g. REVIEW_FAIL summary)
+                            # knows why it was routed (e.g. a review FAILED summary)
                             await self._dispatch_next_step(item, feedback=result.stdout)
                         await self._cleanup_worktree_if_done(item)
                     else:
@@ -6089,7 +6121,7 @@ class OrchestratorService:
                                 item.id, "agent", info.step.job_type, result.stdout, "chat", metadata=chat_meta
                             )
                             # Persist the artifact RIGHT NOW (not at approve time). The drainer is
-                            # the only place where SPEC_COMPLETE can be reliably observed; if we
+                            # the only place where the conversational completion marker can be reliably observed; if we
                             # defer to approve, closing the browser between detection and approve
                             # loses the spec content.
                             if spec is not None and info.step.output:
@@ -6174,8 +6206,8 @@ class OrchestratorService:
                         # If the step declared output rules but NONE matched,
                         # block rather than silently auto-advancing to the
                         # sequential next step.  This catches cases like a
-                        # pr-fix agent that fails to emit PR_FIX_DONE: /
-                        # PR_FIX_BLOCKED: — without this guard the task would
+                        # pr-fix agent that fails to emit ``AGENT_RESULT: COMPLETED`` /
+                        # ``AGENT_RESULT: FAILED`` — without this guard the task would
                         # fall through to whatever step happens to follow
                         # pr-fix in YAML (e.g. verify), bypassing review.
                         # ``rule_target is None`` means the rule list was
@@ -6579,16 +6611,16 @@ class OrchestratorService:
           next round.
 
         ``reasoning`` format contract: a plain human-readable summary
-        with the ``PR_FIX_<MARKER>:`` prefix already stripped — display
+        with the ``AGENT_RESULT: <OUTCOME>`` prefix already stripped — display
         and query callers can treat the field uniformly across
         ``decision`` values without per-type pattern-matching:
 
-        * DONE/SKIPPED/agent-emitted BLOCKED: the drainer extracts the
+        * COMPLETED/SKIPPED/agent-emitted FAILED: the drainer extracts the
           last non-empty stdout line and passes it through
           ``_strip_pr_fix_marker_prefix`` before calling this helper, so
-          a stdout line of ``"PR_FIX_DONE: addressed the lint comments"``
+          a stdout line of ``"AGENT_RESULT: COMPLETED addressed the lint comments"``
           arrives as ``"addressed the lint comments"``.
-        * NEEDS_DECISION: ``_extract_needs_decision_question`` strips
+        * INPUT (needs-decision): ``_extract_needs_decision_question`` strips
           the marker and returns just the question text (or a fallback
           placeholder when the marker has no trailing text).
         * Cap-fire paths: synthesised sentences with no marker prefix to
@@ -6856,7 +6888,7 @@ class OrchestratorService:
         ``success_state`` differs from the same-named root job (pr_fix
         ``review`` → ``push_pr`` vs main ``review`` → ``verify``). Resolving
         only against root dispatches *main's* job on a sub-flow task; the
-        REVIEW_PASS auto-advance then targets ``(reviewing → verify)`` — an
+        ``review`` PASSED auto-advance then targets ``(reviewing → verify)`` — an
         edge absent from pr_fix's SM — so the completion is silently dropped
         and the task stalls at ``reviewing/working`` (an internal task's multi-day
         stall, confirmed via the drainer strand-warning).
@@ -6887,7 +6919,7 @@ class OrchestratorService:
 
         When ``item`` is supplied, the lookup runs against the item's
         currently-active flow (see ``_resolve_flow``); this is what makes
-        sub-flow rule overrides (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``)
+        sub-flow rule overrides (e.g. ``pr_fix.review`` FAILED → pr-fix)
         take effect at dispatch time. Callers that don't have an item
         (e.g. dispatch-table sanity checks) fall back to the root flow.
         """
@@ -7173,8 +7205,9 @@ class OrchestratorService:
         if "{available_processes}" in base:
             base = base.replace("{available_processes}", self._render_available_processes())
         # ADR-029 §6 — prompt portability: ``{lotsa_prompts_dir}`` resolves to the
-        # installed bundled prompts directory so a prompt (e.g. review-system.md)
-        # can address its workflow files by an absolute path that works on every
+        # installed bundled prompts directory so a prompt (e.g. the catalog's
+        # ``agents/review/system.md``) can address its workflow files by an
+        # absolute path (``{lotsa_prompts_dir}/review/checklist.md``) that works on every
         # repo, not just the Lotsa repo. Done before the conversational return so
         # every step prompt (conversational or not) can use it.
         if "{lotsa_prompts_dir}" in base:

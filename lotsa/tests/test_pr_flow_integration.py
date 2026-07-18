@@ -44,7 +44,7 @@ def test_full_process_main_review_fail_targets_code():
     process = build_process("build")
     main = process.flows["main"]
     review_binding = next(b for b in main.bindings if b.name == "review")
-    fail = next(r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern)
+    fail = next(r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern)
     assert fail.target == "code"
 
 
@@ -110,11 +110,11 @@ def test_flow_without_monitor_has_no_pr_phase_states(tmp_path):
 
 
 def test_full_process_pr_fix_review_fail_targets_pr_fix():
-    """Per-flow override: in pr_fix, review's REVIEW_FAIL loops back to pr-fix."""
+    """Per-flow override: in pr_fix, review's AGENT_RESULT: FAILED loops back to pr-fix."""
     process = build_process("build")
     pr_fix = process.flows["pr_fix"]
     review_binding = next(b for b in pr_fix.bindings if b.name == "review")
-    fail = next(r for r in (review_binding.rules or []) if "REVIEW_FAIL" in r.pattern)
+    fail = next(r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern)
     assert fail.target == "pr-fix"
 
 
@@ -151,7 +151,7 @@ def test_main_flow_has_sub_flow_entry_edge_into_pr_fix():
 
 
 def test_main_flow_has_sub_flow_exit_edges_back_through_pr_fix_rules():
-    """PR_FIX_SKIPPED / PR_FIX_DONE land on main's SM via ``self.flow``.
+    """AGENT_RESULT: SKIPPED / AGENT_RESULT: COMPLETED land on main's SM via ``self.flow``.
 
     The drainer evaluates pr-fix's rules and CAS's against ``self.flow`` (= main).
     Each rule target that names a main-flow job needs the corresponding edge
@@ -160,12 +160,12 @@ def test_main_flow_has_sub_flow_exit_edges_back_through_pr_fix_rules():
     process = build_process("build")
     main = process.flows["main"]
     pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
-    # PR_FIX_SKIPPED → wait_for_pr_signal
+    # AGENT_RESULT: SKIPPED → wait_for_pr_signal
     assert (pr_fix_step.active_state, "wait_for_pr_signal") in main.state_machine.transitions
-    # PR_FIX_DONE → review
+    # AGENT_RESULT: COMPLETED → review
     review = next(rj for rj in main.jobs if rj.name == "review")
     assert (pr_fix_step.active_state, review.queue_state) in main.state_machine.transitions
-    # PR_FIX_BLOCKED → blocked
+    # AGENT_RESULT: FAILED → blocked
     assert (pr_fix_step.active_state, "blocked") in main.state_machine.transitions
 
 
@@ -471,7 +471,7 @@ def test_transition_task_legacy_waiting_for_pr_state_completes_on_merge(tmp_path
 # Runtime: ``current_flow`` metadata drives step lookup so sub-flow rule
 # overrides take effect at dispatch time. Regression for the PR #65 review
 # finding that ``_dispatch_next_step``'s ``find_step(self.flow, ...)`` always
-# picked the root flow's review binding (REVIEW_FAIL → code), breaking the
+# picked the root flow's review binding (AGENT_RESULT: FAILED → code), breaking the
 # pr_fix → review → pr-fix cycle that was meant to replace ``target: previous``.
 # ---------------------------------------------------------------------------
 
@@ -531,17 +531,17 @@ def test_resolve_flow_returns_subflow_when_metadata_set(tmp_path):
                 # bindings that actually carry the expected per-flow rules.
                 main_review = svc._find_step_for_state("reviewing", item=item_main)
                 assert main_review is not None
-                main_fail = next(r for r in main_review.rules if "REVIEW_FAIL" in r.pattern)
+                main_fail = next(r for r in main_review.rules if "AGENT_RESULT: FAILED" in r.pattern)
                 assert main_fail.target == "code", (
-                    "root-flow lookup must return main's review binding (REVIEW_FAIL → code)"
+                    "root-flow lookup must return main's review binding (AGENT_RESULT: FAILED → code)"
                 )
 
                 subflow_review = svc._find_step_for_state("reviewing", item=item_subflow)
                 assert subflow_review is not None
-                subflow_fail = next(r for r in subflow_review.rules if "REVIEW_FAIL" in r.pattern)
+                subflow_fail = next(r for r in subflow_review.rules if "AGENT_RESULT: FAILED" in r.pattern)
                 assert subflow_fail.target == "pr-fix", (
                     "pr_fix sub-flow lookup must return pr_fix's review binding "
-                    "(REVIEW_FAIL → pr-fix). Regression for PR #65 review: a task "
+                    "(AGENT_RESULT: FAILED → pr-fix). Regression for PR #65 review: a task "
                     "mid-pr_fix-cycle was dispatching main's review and looping "
                     "back into ``code`` instead of ``pr-fix``."
                 )
@@ -561,13 +561,13 @@ def test_resolve_flow_returns_subflow_when_metadata_set(tmp_path):
 # asserts the task lands back in the host flow's monitor state with
 # ``current_flow`` reset to ``main``. Regression for two bugs where the
 # orchestrator validated transitions against the root flow's SM and rejected
-# legitimate sub-flow edges (REVIEW_PASS → push_pr, push_pr → wait_for_pr_signal),
+# legitimate sub-flow edges (AGENT_RESULT: PASSED → push_pr, push_pr → wait_for_pr_signal),
 # stranding the task at ``status=working`` with no advance.
 # ---------------------------------------------------------------------------
 
 
 def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
-    """In pr_fix, the drainer's REVIEW_PASS routing must land on push_pr,
+    """In pr_fix, the drainer's AGENT_RESULT: PASSED routing must land on push_pr,
     not be rejected by main's SM.
 
     The pre-fix bug: ``self.flow.state_machine.transitions`` (main's SM) has
@@ -645,7 +645,7 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
                 # Synthesise the drainer completion the agent would have produced.
                 info = InFlightStep(item=item, step=review_step, feedback=None, step_work_dir=tmp_path)
                 info.agent_result = AgentResult(
-                    success=True, stdout="REVIEW_PASS", stderr="", return_code=0, duration_ms=1
+                    success=True, stdout="AGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=1
                 )
                 svc._in_flight[item.id] = info
                 svc._completions.put_nowait(info)
@@ -655,7 +655,7 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
 
                 row = run(svc.db.get_task(task.id))
                 assert row.state == "push_pr", (
-                    f"Expected pr_fix's REVIEW_PASS to land on push_pr, got state={row.state!r}. "
+                    f"Expected pr_fix's AGENT_RESULT: PASSED to land on push_pr, got state={row.state!r}. "
                     "Regression: drainer was validating against main's SM, where "
                     "(reviewing, push_pr) is not a registered edge."
                 )
@@ -670,14 +670,14 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
 
 
 def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path, monkeypatch):
-    """Real-dispatch repro: PR_FIX_DONE → review → REVIEW_PASS must reach push_pr.
+    """Real-dispatch repro: AGENT_RESULT: COMPLETED → review → AGENT_RESULT: PASSED must reach push_pr.
 
     The sibling test above hand-builds the review InFlightStep from
     ``flows["pr_fix"]`` (so its ``success_state`` is already push_pr) — it never
     exercises how the orchestrator RESOLVES which review step to dispatch when
-    routing ``PR_FIX_DONE → review``. This drives that real path: a pr-fix
+    routing ``AGENT_RESULT: COMPLETED → review``. This drives that real path: a pr-fix
     completion is drained (routing to review = a real dispatch), then the review
-    agent emits ``REVIEW_PASS``.
+    agent emits ``AGENT_RESULT: PASSED``.
 
     This test PASSES — it confirms the routing is correct: real dispatch resolves
     pr_fix's review (``success_state == push_pr``) and the ``(reviewing, push_pr)``
@@ -713,7 +713,7 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
         run = loop.run_until_complete
         (tmp_path / "data").mkdir()
         # The pr-fix step's ``commit`` posthook runs ``git add``/commit on
-        # PR_FIX_DONE; init a real repo so it succeeds and routing actually reaches
+        # AGENT_RESULT: COMPLETED; init a real repo so it succeeds and routing actually reaches
         # the review dispatch under test (otherwise the task blocks at pr-fix on
         # "not a git repository").
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, capture_output=True)
@@ -735,9 +735,9 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
             return ToolResult(success=True, output="never reached", metadata={})
 
         register_tool("push_pr", stub_push_pr)
-        # The review step the drainer dispatches (after PR_FIX_DONE) returns REVIEW_PASS.
+        # The review step the drainer dispatches (after AGENT_RESULT: COMPLETED) returns AGENT_RESULT: PASSED.
         svc.runner = FakeRunner(
-            AgentResult(success=True, stdout="REVIEW_PASS", stderr="", return_code=0, duration_ms=1)
+            AgentResult(success=True, stdout="AGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=1)
         )
 
         run(svc.start())
@@ -760,11 +760,11 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
             item = Item(id=task.id, state="pr-fixing", title="Test", metadata={"current_flow": "pr_fix"})
             pr_fix_step = next(rj for rj in svc.process.flows["pr_fix"].jobs if rj.name == "pr-fix")
 
-            # Synthesise the pr-fix completion → drainer routes PR_FIX_DONE → review
-            # (the REAL review dispatch under test) → review agent returns REVIEW_PASS.
+            # Synthesise the pr-fix completion → drainer routes AGENT_RESULT: COMPLETED → review
+            # (the REAL review dispatch under test) → review agent returns AGENT_RESULT: PASSED.
             info = InFlightStep(item=item, step=pr_fix_step, feedback=None, step_work_dir=tmp_path)
             info.agent_result = AgentResult(
-                success=True, stdout="PR_FIX_DONE: applied the fix", stderr="", return_code=0, duration_ms=1
+                success=True, stdout="AGENT_RESULT: COMPLETED: applied the fix", stderr="", return_code=0, duration_ms=1
             )
             svc._in_flight[item.id] = info
             svc._completions.put_nowait(info)
@@ -776,7 +776,7 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
                 if row.state == "push_pr":
                     break
             assert row is not None and row.state == "push_pr", (
-                "PR_FIX_DONE → review → REVIEW_PASS must advance to push_pr in pr_fix; "
+                "AGENT_RESULT: COMPLETED → review → AGENT_RESULT: PASSED must advance to push_pr in pr_fix; "
                 f"got state={row.state if row else None!r} status={row.status if row else None!r}. "
                 "Real dispatch must resolve pr_fix's review (success_state=push_pr) so the "
                 "(reviewing, push_pr) auto-advance edge holds."
@@ -794,7 +794,7 @@ def test_retry_review_in_pr_fix_advances_to_push_pr(tmp_path):
 
     Definitive root cause of an internal task's multi-day stall: ``retry()`` resolved
     ``current_step`` against the ROOT flow (main), so retrying review-in-pr_fix ran
-    *main's* review job. Its REVIEW_PASS auto-advance targeted ``(reviewing ->
+    *main's* review job. Its AGENT_RESULT: PASSED auto-advance targeted ``(reviewing ->
     verify)`` — an edge that doesn't exist in pr_fix's SM — so the completion was
     silently dropped and the task stayed ``reviewing/working``. Every Retry
     re-stalled it (confirmed live: drainer WARNING "no (reviewing -> verify) edge
@@ -832,7 +832,7 @@ def test_retry_review_in_pr_fix_advances_to_push_pr(tmp_path):
 
         register_tool("push_pr", stub_push_pr)
         svc.runner = FakeRunner(
-            AgentResult(success=True, stdout="REVIEW_PASS", stderr="", return_code=0, duration_ms=1)
+            AgentResult(success=True, stdout="AGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=1)
         )
 
         run(svc.start())
@@ -879,7 +879,7 @@ def test_answer_review_in_pr_fix_advances_to_push_pr(tmp_path):
     ``answer()``/``revise()``/``send_message()`` all resolved ``current_step``
     against the ROOT flow only. If a pr_fix ``review`` agent emits
     ``NEEDS_INPUT:`` and the operator answers, root resolution runs *main's*
-    review; its REVIEW_PASS auto-advance targets ``(reviewing -> verify)`` — an
+    review; its AGENT_RESULT: PASSED auto-advance targets ``(reviewing -> verify)`` — an
     edge absent from pr_fix's SM — so the completion is silently dropped and the
     task stalls at ``reviewing/working``. All three siblings now resolve via the
     shared ``_resolve_step_for_row`` helper (active flow first).
@@ -916,7 +916,7 @@ def test_answer_review_in_pr_fix_advances_to_push_pr(tmp_path):
 
         register_tool("push_pr", stub_push_pr)
         svc.runner = FakeRunner(
-            AgentResult(success=True, stdout="REVIEW_PASS", stderr="", return_code=0, duration_ms=1)
+            AgentResult(success=True, stdout="AGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=1)
         )
 
         run(svc.start())
@@ -1525,10 +1525,10 @@ def test_jump_to_step_into_pr_fix_sets_current_flow_metadata(tmp_path):
 
     Pre-fix behavior: ``_dispatch_pr_fix_locked`` set ``current_flow="pr_fix"``
     so the subsequent ``review`` completion evaluated pr_fix-flow rule
-    overrides (e.g. ``REVIEW_FAIL → pr-fix``). ``jump_to_step("pr-fix")``
+    overrides (e.g. ``AGENT_RESULT: FAILED → pr-fix``). ``jump_to_step("pr-fix")``
     was the sixth entry point (per its own docstring) but never wrote the
     metadata — silently letting the drainer evaluate main-flow overrides
-    (``REVIEW_FAIL → code``) instead. Round-7 review fix.
+    (``AGENT_RESULT: FAILED → code``) instead. Round-7 review fix.
     """
     import asyncio
 
@@ -1674,7 +1674,7 @@ def test_jump_to_step_out_of_pr_fix_resets_current_flow_to_root(tmp_path):
 def _stage_needs_input_pr_fix_task(svc, run):
     """Stage a task at (state=pr-fixing, status=needs_input, current_step=pr-fix)
     — the shape the bundled ``full`` process leaves behind after the pr-fix
-    agent emits ``^PR_FIX_NEEDS_DECISION:``. Seeds the spec/plan artifacts so
+    agent emits ``^AGENT_RESULT: INPUT:``. Seeds the spec/plan artifacts so
     a subsequent ``_dispatch_step`` doesn't bail on the missing-artifact
     check (which would mask whether the cross-flow lookup landed correctly).
     """
@@ -2080,7 +2080,7 @@ def test_revise_on_needs_input_pr_fix_task_finds_subflow_step_via_process_catalo
 # across two messages, and its stage_transition divider must stay short.
 #
 # Live bug (operator report): when a pr-fix round declined feedback as
-# non-actionable (PR_FIX_SKIPPED), the drainer wrote the agent's one-line
+# non-actionable (AGENT_RESULT: SKIPPED), the drainer wrote the agent's one-line
 # reasoning into BOTH a ``stage_transition`` divider (as
 # ``f"pr-fix skipped: {last_line}"``) AND the append-only ``pr_decision`` audit
 # row. The same sentence therefore rendered twice — once as a monospaced
@@ -2140,7 +2140,7 @@ def test_pr_fix_skipped_writes_short_divider_and_single_reasoning(tmp_path):
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout=f"Read the feedback.\nPR_FIX_SKIPPED: {long_reason}\n",
+                stdout=f"Read the feedback.\nAGENT_RESULT: SKIPPED: {long_reason}\n",
                 stderr="",
                 return_code=0,
                 duration_ms=88,

@@ -607,5 +607,5 @@ def test_pr_fix_flow_has_no_pr_summary_step():
 def test_pr_summary_prompt_files_exist():
     from lotsa.flows import BUNDLED_PROMPTS
 
-    assert (BUNDLED_PROMPTS / "build" / "pr_summary-system.md").is_file()
-    assert (BUNDLED_PROMPTS / "build" / "pr_summary-user.md").is_file()
+    assert (BUNDLED_PROMPTS / "agents" / "pr_summary" / "system.md").is_file()
+    assert (BUNDLED_PROMPTS / "agents" / "pr_summary" / "user.md").is_file()

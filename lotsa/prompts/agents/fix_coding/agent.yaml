@@ -1,0 +1,5 @@
+name: fix_coding
+class: worker
+outcomes: [COMPLETED, INPUT]
+needs_worktree: true
+produces_changes: true

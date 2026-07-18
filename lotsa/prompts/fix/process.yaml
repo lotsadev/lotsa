@@ -12,16 +12,17 @@ promotion_inputs:
 jobs:
   - name: code
     type: agent
-    prompt: coding
+    prompt: fix_coding
     queue_state: coding
     active_state: coding
     posthooks: [commit]
 
-  # ``review``/``pr-fix``/``resolve_conflicts`` reuse the generic prompts via
-  # the fix → build fallback in ``_resolve_prompts_search_paths`` — fix ships
-  # only its distinctive ``coding`` prompt (the "execute this instruction"
-  # framing). Routing lives at the flow-step level below (per-flow overrides
-  # take precedence over job defaults — see lotsa/CLAUDE.md).
+  # ``review``/``pr-fix``/``resolve_conflicts`` reference the shared, process-
+  # independent agents in the catalog (``lotsa/prompts/agents/<name>/``),
+  # resolved by ``AgentPromptRegistry`` (ADR-044) — fix ships only its
+  # distinctive ``fix_coding`` agent (the "execute this instruction" framing).
+  # Routing lives at the flow-step level below (per-flow overrides take
+  # precedence over job defaults — see lotsa/CLAUDE.md).
   - name: review
     type: agent
     prompt: review
@@ -30,28 +31,28 @@ jobs:
 
   - name: pr-fix
     type: agent
-    prompt: pr-fix
+    prompt: pr_fix
     resume: true
     queue_state: pr-fixing
     active_state: pr-fixing
     posthooks: [commit]
     rules:
       - source: stdout
-        pattern: "^PR_FIX_DONE:"
+        pattern: "^AGENT_RESULT: COMPLETED"
         target: review
       - source: stdout
-        pattern: "^PR_FIX_NEEDS_DECISION:"
+        pattern: "^AGENT_RESULT: INPUT"
         target: needs_input
       - source: stdout
-        pattern: "^PR_FIX_BLOCKED:"
+        pattern: "^AGENT_RESULT: FAILED"
         target: blocked
       - source: stdout
-        pattern: "^PR_FIX_SKIPPED:"
+        pattern: "^AGENT_RESULT: SKIPPED"
         target: wait_for_pr_signal
 
-  # ``pr_summary`` reuses ``build``'s ``pr_summary-{system,user}.md`` via the
-  # fix → build prompt fallback (``_resolve_prompts_search_paths``) — fix ships
-  # no copy of the prompt. It declares no ``inputs`` (a missing spec must never
+  # ``pr_summary`` references the shared ``pr_summary`` agent in the catalog
+  # (``lotsa/prompts/agents/pr_summary/``) via ``AgentPromptRegistry`` (ADR-044)
+  # — fix ships no copy of the prompt. It declares no ``inputs`` (a missing spec must never
   # block it) and lives only in ``main``, not ``pr_fix`` (a re-push keeps the
   # existing PR and must not regenerate its text — mirrors ``build``). No
   # per-step ``model:`` is pinned: consistent with the bundled "ship no per-step
@@ -77,7 +78,7 @@ jobs:
     posthooks: [commit]
     rules:
       - source: stdout
-        pattern: "^CONFLICTS_RESOLVED:"
+        pattern: "^AGENT_RESULT: COMPLETED"
         target: pr-fix
 
   - name: wait_for_pr_signal
@@ -97,10 +98,10 @@ flows:
       - name: review
         rules:
           - source: stdout
-            pattern: "^REVIEW_PASS"
+            pattern: "^AGENT_RESULT: PASSED"
             target: next
           - source: stdout
-            pattern: "^REVIEW_FAIL"
+            pattern: "^AGENT_RESULT: FAILED"
             target: code
       - pr_summary
       - push_pr
@@ -111,28 +112,28 @@ flows:
       - name: pr-fix
         rules:
           - source: stdout
-            pattern: "^PR_FIX_DONE:"
+            pattern: "^AGENT_RESULT: COMPLETED"
             target: review
           - source: stdout
-            pattern: "^PR_FIX_NEEDS_DECISION:"
+            pattern: "^AGENT_RESULT: INPUT"
             target: needs_input
           - source: stdout
-            pattern: "^PR_FIX_BLOCKED:"
+            pattern: "^AGENT_RESULT: FAILED"
             target: blocked
           - source: stdout
-            pattern: "^PR_FIX_SKIPPED:"
+            pattern: "^AGENT_RESULT: SKIPPED"
             target: wait_for_pr_signal
       - name: resolve_conflicts
         rules:
           - source: stdout
-            pattern: "^CONFLICTS_RESOLVED:"
+            pattern: "^AGENT_RESULT: COMPLETED"
             target: pr-fix
       - name: review
         rules:
           - source: stdout
-            pattern: "^REVIEW_PASS"
+            pattern: "^AGENT_RESULT: PASSED"
             target: next
           - source: stdout
-            pattern: "^REVIEW_FAIL"
+            pattern: "^AGENT_RESULT: FAILED"
             target: pr-fix
       - push_pr

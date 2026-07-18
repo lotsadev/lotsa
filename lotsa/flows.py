@@ -28,12 +28,14 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import yaml as _yaml
 
-from rigg import DispatchRule, PromptRegistry, StateMachine, TransitionRule
+from lotsa.agents import AGENTS_DIR
+from rigg import DispatchRule, StateMachine, TransitionRule
 from rigg.models import Item
+from rigg.prompt_registry import PromptNotFound
 
 if TYPE_CHECKING:
     from rigg.models import AgentResult
@@ -41,6 +43,75 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 BUNDLED_PROMPTS = Path(__file__).parent / "prompts"
+
+
+@runtime_checkable
+class PromptLoader(Protocol):
+    """The prompt-resolution surface the flow/orchestrator layer depends on.
+
+    Both :class:`rigg.PromptRegistry` and the catalog-aware
+    :class:`AgentPromptRegistry` (below) satisfy it — callers only ever invoke
+    ``load`` / ``load_optional``, so the process/flow config is typed against
+    this Protocol rather than either concrete class.
+    """
+
+    def load(self, name: str) -> str: ...
+
+    def load_optional(self, name: str) -> str | None: ...
+
+
+class AgentPromptRegistry:
+    """Load prompts from the ADR-044 agent catalog (``agents/<name>/<kind>.md``).
+
+    Presents the same ``load`` / ``load_optional`` surface as
+    :class:`rigg.PromptRegistry` so callers (the orchestrator, dispatch-rule
+    builders) are unchanged: they still ask for ``"<agent>-system"`` /
+    ``"<agent>-user"``. Resolution order for ``"<agent>-<kind>"``:
+
+    1. operator override dir, flat legacy name ``<agent>-<kind>.md`` (keeps
+       pre-catalog custom ``--prompts-dir`` layouts and inline-process prompts
+       working);
+    2. operator override dir, catalog layout ``<agent>/<kind>.md``;
+    3. the bundled catalog ``<catalog_dir>/<agent>/<kind>.md``.
+    """
+
+    def __init__(self, override_dir: Path | None, catalog_dir: Path = AGENTS_DIR) -> None:
+        self.override_dir = override_dir
+        self.catalog_dir = catalog_dir
+
+    @staticmethod
+    def _split(name: str) -> tuple[str, str | None]:
+        for suffix in ("-system", "-user"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)], suffix[1:]
+        return name, None
+
+    def _candidates(self, name: str) -> list[Path]:
+        agent, kind = self._split(name)
+        out: list[Path] = []
+        if self.override_dir is not None:
+            out.append(self.override_dir / f"{name}.md")
+            if kind is not None:
+                out.append(self.override_dir / agent / f"{kind}.md")
+        if kind is not None:
+            out.append(self.catalog_dir / agent / f"{kind}.md")
+        out.append(self.catalog_dir / f"{name}.md")
+        return out
+
+    def load(self, name: str) -> str:
+        if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
+            raise PromptNotFound(f"Invalid prompt name {name!r} — must be a plain basename")
+        for candidate in self._candidates(name):
+            if candidate.is_file():
+                return candidate.read_text()
+        raise PromptNotFound(f"Prompt {name!r} not found in override {self.override_dir} or catalog {self.catalog_dir}")
+
+    def load_optional(self, name: str) -> str | None:
+        try:
+            return self.load(name)
+        except PromptNotFound:
+            return None
+
 
 JobType = Literal["agent", "action", "monitor"]
 
@@ -232,7 +303,7 @@ class FlowConfig:
     state_machine: StateMachine
     jobs: list[ResolvedJob]
     bindings: list[FlowBinding]
-    registry: PromptRegistry
+    registry: PromptLoader
     gate_states: set[str] = field(default_factory=set)
 
     @property
@@ -263,7 +334,7 @@ class Process:
     name: str
     jobs: list[ResolvedJob]
     flows: dict[str, FlowConfig]
-    registry: PromptRegistry
+    registry: PromptLoader
     description: str | None = None
     promotion_inputs: list[PromotionInput] = field(default_factory=list)
 
@@ -608,12 +679,12 @@ def _build_state_machine(
 # Leading markdown noise an agent may put before a line-anchored routing
 # marker: a heading prefix (``#``..``######`` + space) and/or tight inline
 # wrappers (inline code, bold, italic, strikethrough). Stripped in
-# ``_match_marker``'s fallback so ``## SPEC_COMPLETE:`` (an internal task),
-# ``\`SPEC_COMPLETE:\``` (an internal task), and ``**REVIEW_PASS**`` all route.
+# ``_match_marker``'s fallback so ``## AGENT_RESULT: PASSED`` (an internal task),
+# ``\`AGENT_RESULT: PASSED\``` (an internal task), and ``**AGENT_RESULT: PASSED**`` all route.
 # Deliberately narrow on the wrapper side: a wrapper run must abut the text
-# with NO space, so a bullet quoting a marker mid-document ("* `SPEC_…` is
+# with NO space, so a bullet quoting a marker mid-document ("* `AGENT_RESULT:` is
 # emitted when …" — ``*`` then a space) cannot false-match. The heading
-# alternative DOES consume its trailing space (``## `` → ``SPEC_…``) because
+# alternative DOES consume its trailing space (``## `` → ``AGENT_RESULT:``) because
 # a ``#``-prefixed line is unambiguously a heading, not a list item.
 _MARKER_WRAPPER_RE = re.compile(r"^(?:#{1,6}[ \t]+|[`*_~]{1,3})+")
 
@@ -700,7 +771,7 @@ def resolve_output_target(
             return rj.queue_state
     # Cross-flow rule targets other than the orchestrator's SKIPPED→monitor
     # short-circuit resolve to ``"blocked"`` here. The drainer's
-    # ``PR_FIX_SKIPPED:`` branch handles the one cross-flow handoff the
+    # ``AGENT_RESULT: SKIPPED`` branch handles the one cross-flow handoff the
     # bundled processes use (sub-flow → host monitor) by short-circuiting
     # the rule resolver and routing back to the parent flow's monitor by
     # name. Any *other* custom rule that names a job belonging to a sibling
@@ -723,29 +794,6 @@ def resolve_output_target(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_prompts_search_paths(
-    flow_name: str,
-    prompts_dir: Path | None,
-) -> list[Path]:
-    paths: list[Path] = []
-    if prompts_dir is not None:
-        paths.append(prompts_dir)
-    if flow_name in PRESET_NAMES:
-        paths.append(BUNDLED_PROMPTS / flow_name)
-    else:
-        paths.append(BUNDLED_PROMPTS / "build")
-    # ``fix`` ships only its distinctive ``coding`` prompt (the "execute this
-    # instruction" framing); its ``review`` / ``pr-fix`` / ``resolve_conflicts``
-    # jobs reuse the generic prompts. Fall back to ``build`` (which carries every
-    # generic diff/PR/git-driven prompt) so those resolve without duplicating the
-    # text (ADR-043 §8 / ADR-027 §3 — the generics are shared across processes;
-    # fix's narrowness comes from the coder prompt). Inline / unknown processes
-    # fall back to ``build`` via the ``else`` branch above for the same reason.
-    if flow_name == "fix":
-        paths.append(BUNDLED_PROMPTS / "build")
-    return paths
-
-
 def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
     """Stitch sub-flow entry/exit edges into each flow's state machine.
 
@@ -760,7 +808,7 @@ def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
       and the task stalls at ``status=working`` until the next restart.
     * sub-flow exit (sub_step.active_state, host_job.queue_state) is missing
       → the drainer's post-rule CAS check rejects the routing (e.g.
-      PR_FIX_SKIPPED → wait_for_pr_signal, PR_FIX_DONE → reviewing).
+      pr-fix SKIPPED → wait_for_pr_signal, pr-fix COMPLETED → reviewing).
 
     The fix is to mutate the underlying ``StateMachine`` after construction:
     register the missing edges and add any newly-referenced states. This is
@@ -835,7 +883,7 @@ def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
                     sm_states.add(target.queue_state)
                     sm_trans[(rj.active_state, target.queue_state)] = TransitionRule()
                     # The other-flow step may also need to terminate at
-                    # blocked from this flow's perspective (PR_FIX_BLOCKED).
+                    # blocked from this flow's perspective (pr-fix FAILED → blocked).
                     sm_trans[(rj.active_state, "blocked")] = TransitionRule()
                     # And needs the self-loop for retry on its own active state.
                     sm_trans[(rj.active_state, rj.active_state)] = TransitionRule()
@@ -891,14 +939,14 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
     Both rule surfaces are checked: the job-level default ``rules:`` AND the
     per-flow binding override ``rules:`` (``{name: review, rules: [...]}``).
     The override rules ARE the "sub-flow rules" R6 names — sub-flow routing
-    (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``) lives in binding overrides,
+    (e.g. ``pr_fix.review`` FAILED → pr-fix) lives in binding overrides,
     not the job defaults, so validating only ``Job.rules`` would let a
     cross-process sub-flow target slip straight through to the runtime
     ``blocked`` fallback.
 
     Recognized non-job keywords: ``next`` (success edge), the terminal states
     ``blocked`` / ``complete`` / ``abandoned``, and ``needs_input`` — the last
-    is special-cased in the completion drainer's PR_FIX_NEEDS_DECISION path
+    is special-cased in the completion drainer's ``AGENT_RESULT: INPUT`` path
     (e.g. the bundled ``build`` process's ``pr-fix`` rule routes to it), so it
     is a legitimate target even though it is not a job.
     """
@@ -1065,8 +1113,7 @@ def build_process(
     else:
         raise ValueError(f"Unknown process: {name!r}. Choose from: {PRESET_NAMES}")
 
-    search_paths = _resolve_prompts_search_paths(name, prompts_dir)
-    registry = PromptRegistry(search_paths=search_paths)
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
 
     flows: dict[str, FlowConfig] = {}
     for flow_name, bindings in flow_bindings.items():
@@ -1262,8 +1309,7 @@ def build_process_from_inline(
     resolved, gate_states = _resolve_jobs(jobs, bindings)
     sm = _build_state_machine(resolved, gate_states)
 
-    search_paths = [prompts_dir, BUNDLED_PROMPTS / "build"]
-    registry = PromptRegistry(search_paths=search_paths)
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
 
     flow = FlowConfig(
         name="main",
