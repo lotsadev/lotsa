@@ -135,13 +135,88 @@ def test_build_plan_is_first_and_ungated():
     assert "planned" not in main.state_machine.states
 
 
-def test_build_commit_posthooks_on_test_code_verify_prfix():
-    """test/code/verify/pr-fix keep posthooks: [commit] (plan §2)."""
+def test_build_commit_posthooks_derived_on_producing_steps():
+    """test/code/pr-fix resolve to posthooks: [commit] — now DERIVED from each
+    agent's ``produces_changes: true`` property (ADR-044 Phase 2), not from a
+    hand-declared ``posthooks: [commit]`` in the YAML.
+
+    Passes both pre- and post-Phase-2 for these three (they carried an explicit
+    commit before, derive it after); the behaviour change is on ``verify``,
+    pinned in ``test_build_verify_no_longer_commits`` below.
+    """
+    import lotsa.posthooks  # noqa: F401 — ensures the built-in ``commit`` exists
+
     process = build_process("build")
     by_name = {j.name: j for j in process.jobs}
-    for step in ("test", "code", "verify", "pr-fix"):
+    for step in ("test", "code", "pr-fix"):
         assert by_name[step].posthooks == ["commit"], (
             f"{step} must run the commit posthook; got {by_name[step].posthooks!r}"
+        )
+
+
+def test_build_verify_no_longer_commits():
+    """``verify`` is a gate (``produces_changes: false``): it observes and, on
+    ``FAILED``, routes to ``code`` which commits. Under ADR-044 Phase 2 the
+    contradictory ``posthooks: [commit]`` comes off it, so it resolves to no
+    posthooks.
+
+    RED pre-Phase-2: build's ``verify`` still declares ``posthooks: [commit]``,
+    so it resolves to ``["commit"]``.
+    """
+    import lotsa.posthooks  # noqa: F401
+
+    process = build_process("build")
+    by_name = {j.name: j for j in process.jobs}
+    assert by_name["verify"].posthooks == [], (
+        f"verify must not run the commit posthook (it observes, does not write); "
+        f"got {by_name['verify'].posthooks!r}"
+    )
+
+
+def test_bundled_effective_posthooks_preserved_except_verify():
+    """Behaviour-preservation pin for the derive-and-drop migration (plan §Tests).
+
+    Every bundled ``build``/``fix`` step resolves to the SAME effective posthook
+    set as before Phase 2 — EXCEPT ``build``'s ``verify``, which loses commit.
+    Encodes the whole migration in one place: producing agents derive
+    ``[commit]``; non-producers / gates / action / monitor steps derive nothing.
+
+    RED pre-Phase-2: ``build``'s ``verify`` resolves to ``["commit"]``, not ``[]``.
+    """
+    import lotsa.posthooks  # noqa: F401
+
+    expected_build = {
+        "plan": [],
+        "test": ["commit"],
+        "code": ["commit"],
+        "review": [],
+        "pr-fix": ["commit"],
+        "verify": [],  # ← the one change
+        "pr_summary": [],
+        "push_pr": [],  # action
+        "resolve_conflicts": ["commit"],
+        "wait_for_pr_signal": [],  # monitor
+    }
+    expected_fix = {
+        "code": ["commit"],
+        "review": [],
+        "pr-fix": ["commit"],
+        "pr_summary": [],
+        "push_pr": [],  # action
+        "resolve_conflicts": ["commit"],
+        "wait_for_pr_signal": [],  # monitor
+    }
+
+    build_jobs = {j.name: j for j in build_process("build").jobs}
+    for name, expected in expected_build.items():
+        assert build_jobs[name].posthooks == expected, (
+            f"build/{name}: expected posthooks {expected!r}, got {build_jobs[name].posthooks!r}"
+        )
+
+    fix_jobs = {j.name: j for j in build_process("fix").jobs}
+    for name, expected in expected_fix.items():
+        assert fix_jobs[name].posthooks == expected, (
+            f"fix/{name}: expected posthooks {expected!r}, got {fix_jobs[name].posthooks!r}"
         )
 
 
