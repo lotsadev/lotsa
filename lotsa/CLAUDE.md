@@ -887,7 +887,7 @@ rules.
   names route to `blocked` on restart (clean break). Supersedes ADR-014's
   catalog; amends ADR-027 (handoff framing), ADR-030 (mark-complete terminal),
   ADR-034 (chat is the entry mode).
-- ADR-044 — Workflows for agents (**Implemented — Phase 1**). Generic
+- ADR-044 — Workflows for agents (**Implemented — Phases 1 & 2**). Generic
   `AGENT_RESULT:` outcome vocabulary (`COMPLETED`/`PASSED`/`FAILED`/`SKIPPED`/
   `INPUT`, with `NEEDS_INPUT:` a retained alias) replaces every bespoke marker;
   routing lives on the flow edge (rules matched against the active step), not the
@@ -898,7 +898,17 @@ rules.
   `lotsa/agents.py` loads + validates the catalog (`class: worker|gate`,
   `outcomes:`, reserved `needs_worktree`/`produces_changes` slots);
   `AgentPromptRegistry` (`lotsa/flows.py`) resolves prompts from the catalog with
-  the operator `--prompts-dir` override still highest priority. Phases 2–6
-  (property-derived hooks, `needs_worktree` prehook, workflow-model cleanup,
-  git-native `.lotsa/` provenance + rails, visual editor) are proposed. Amends
-  ADR-043/039/014.
+  the operator `--prompts-dir` override still highest priority. **Phase 2** wires
+  the `produces_changes` property: `_resolve_jobs` (`lotsa/flows.py`) derives the
+  built-in `commit` posthook onto a `type: agent` step at process-build time when
+  the agent (resolved for `job.prompt` via `AgentPromptRegistry.load_agent_optional`,
+  operator-override-first → bundled-catalog) declares `produces_changes: true` —
+  so `agent.yaml` is the single source of truth and the bundled `build`/`fix`
+  workflows no longer hand-declare `posthooks: [commit]`. The per-binding
+  `posthooks:` override seam is preserved exactly (a binding value, including
+  `[]`, fully replaces the derived base). `_validate_posthook_property_consistency`
+  fails the build loudly if a step explicitly lists `commit` on a
+  `produces_changes: false` agent (drift). `verify` (a gate) no longer commits —
+  it observes and routes `FAILED → code`, which commits. Phases 3–6
+  (`needs_worktree` prehook, workflow-model cleanup, git-native `.lotsa/`
+  provenance + rails, visual editor) remain proposed. Amends ADR-043/039/014.

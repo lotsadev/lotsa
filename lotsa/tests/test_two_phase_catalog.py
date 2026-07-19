@@ -168,8 +168,7 @@ def test_build_verify_no_longer_commits():
     process = build_process("build")
     by_name = {j.name: j for j in process.jobs}
     assert by_name["verify"].posthooks == [], (
-        f"verify must not run the commit posthook (it observes, does not write); "
-        f"got {by_name['verify'].posthooks!r}"
+        f"verify must not run the commit posthook (it observes, does not write); got {by_name['verify'].posthooks!r}"
     )
 
 

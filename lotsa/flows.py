@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
@@ -38,6 +39,7 @@ from rigg.models import Item
 from rigg.prompt_registry import PromptNotFound
 
 if TYPE_CHECKING:
+    from lotsa.agents import Agent
     from rigg.models import AgentResult
 
 logger = logging.getLogger(__name__)
@@ -111,6 +113,33 @@ class AgentPromptRegistry:
             return self.load(name)
         except PromptNotFound:
             return None
+
+    def load_agent_optional(self, name: str) -> Agent | None:
+        """Resolve the agent-catalog properties for prompt/agent *name* (ADR-044 Phase 2).
+
+        Mirrors :meth:`load`'s resolution roots — an operator-supplied
+        ``<override_dir>/<name>/agent.yaml`` wins over the bundled
+        ``<catalog_dir>/<name>/agent.yaml``. Returns ``None`` when neither
+        exists (a non-catalog prompt / inline process step), so the
+        property-derived ``commit`` posthook is simply a no-op there.
+
+        Used by :func:`_resolve_jobs` (to fold ``commit`` in when
+        ``produces_changes`` is true) and by
+        :func:`_validate_posthook_property_consistency` (to reject an explicit
+        ``commit`` on a non-producing agent). A malformed ``agent.yaml`` raises
+        ``ValueError`` via ``_parse_agent`` — fail-loud at build time, matching
+        the rest of the module.
+        """
+        from lotsa.agents import _parse_agent  # local import mirrors the validators' style
+
+        if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
+            return None
+        roots = ([self.override_dir] if self.override_dir is not None else []) + [self.catalog_dir]
+        for root in roots:
+            candidate = root / name / "agent.yaml"
+            if candidate.is_file():
+                return _parse_agent(name, _yaml.safe_load(candidate.read_text()) or {})
+        return None
 
 
 JobType = Literal["agent", "action", "monitor"]
@@ -515,12 +544,24 @@ def _load_yaml_process(path: Path) -> tuple[str, list[Job], dict[str, list[FlowB
 # ---------------------------------------------------------------------------
 
 
-def _resolve_jobs(jobs: list[Job], bindings: list[FlowBinding]) -> tuple[list[ResolvedJob], set[str]]:
+def _resolve_jobs(
+    jobs: list[Job],
+    bindings: list[FlowBinding],
+    resolve_agent: Callable[[str], Agent | None] | None = None,
+) -> tuple[list[ResolvedJob], set[str]]:
     """Resolve job states for a flow's binding order.
 
     success_state derivation only makes sense in the context of a flow's
     ordering (because "next" means "next in this flow"). Each call resolves
     states for one flow's view of the jobs.
+
+    ``resolve_agent`` (ADR-044 Phase 2) maps a job's prompt/agent name to its
+    catalog :class:`~lotsa.agents.Agent` (or ``None``). When supplied, an agent
+    job whose agent declares ``produces_changes: true`` has the built-in
+    ``commit`` posthook folded into its base posthooks — the property is the
+    single source of truth, replacing a hand-declared ``posthooks: [commit]``.
+    A per-binding ``posthooks:`` override still fully replaces the step
+    (derivation only touches the no-override base).
     """
     by_name = {j.name: j for j in jobs}
     binding_names = [b.name for b in bindings]
@@ -560,8 +601,20 @@ def _resolve_jobs(jobs: list[Job], bindings: list[FlowBinding]) -> tuple[list[Re
 
         effective_rules = binding.rules if binding.rules is not None else list(job.rules)
         # Per-binding posthooks override the job's default; ``None`` (unset)
-        # falls back to the job. Same lookup-then-fallback shape as rules.
-        effective_posthooks = binding.posthooks if binding.posthooks is not None else list(job.posthooks)
+        # falls back to the job's base. Same lookup-then-fallback shape as rules.
+        if binding.posthooks is not None:
+            effective_posthooks = list(binding.posthooks)
+        else:
+            # ADR-044 Phase 2: the agent's ``produces_changes`` property is the
+            # single source of truth for "this step's output needs committing".
+            # Fold the built-in ``commit`` into the job's base posthooks when
+            # the resolved agent produces changes. Binding overrides (handled
+            # above) fully replace the step, so derivation never touches them.
+            effective_posthooks = list(job.posthooks)
+            if job.type == "agent" and resolve_agent is not None:
+                agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+                if agent is not None and agent.produces_changes and "commit" not in effective_posthooks:
+                    effective_posthooks.append("commit")
 
         resolved.append(
             ResolvedJob(
@@ -1051,6 +1104,51 @@ def _validate_posthook_references(jobs: list[Job], flow_bindings: dict[str, list
             )
 
 
+def _validate_posthook_property_consistency(
+    jobs: list[Job],
+    flow_bindings: dict[str, list[FlowBinding]],
+    resolve_agent: Callable[[str], Agent | None],
+) -> None:
+    """Fail loud if a step explicitly declares ``commit`` on an agent whose
+    catalog property says it produces no changes (ADR-044 Phase 2).
+
+    ``commit`` is now *derived* from the agent's ``produces_changes`` property,
+    so an explicit ``commit`` on a non-producing agent (e.g. a gate) is drift —
+    the exact duplication Phase 2 removes. This guard turns a future re-drift
+    into a build-time error rather than a silently-contradictory config, the
+    same way ``_validate_posthook_references`` fails an unknown posthook name.
+
+    Only the contradiction direction is checked. A producing agent explicitly
+    listing ``commit`` is redundant-but-consistent (the derivation union dedups
+    it), and a binding ``posthooks: []`` suppressing a producer's commit is the
+    documented override seam — neither is flagged. Non-agent jobs (which never
+    run posthooks) and prompts with no ``agent.yaml`` are skipped.
+    """
+    by_name = {j.name: j for j in jobs}
+
+    def _check(job: Job, posthooks: list[str], where: str) -> None:
+        if job.type != "agent" or "commit" not in posthooks:
+            return
+        agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+        if agent is not None and not agent.produces_changes:
+            raise ValueError(
+                f"{where} explicitly declares the ``commit`` posthook, but its agent "
+                f"({job.prompt or job.name!r}) has ``produces_changes: false``. "
+                "commit is derived from ``produces_changes`` (ADR-044 Phase 2) — drop the "
+                "explicit posthook, or set ``produces_changes: true`` in the agent's "
+                "agent.yaml if it genuinely writes changes."
+            )
+
+    for j in jobs:
+        _check(j, j.posthooks, f"Job {j.name!r}")
+    for flow_name, bindings in flow_bindings.items():
+        for b in bindings:
+            if b.posthooks:
+                job = by_name.get(b.name)
+                if job is not None:
+                    _check(job, b.posthooks, f"Flow {flow_name!r} step {b.name!r}")
+
+
 def _validate_runner_references(jobs: list[Job]) -> None:
     """Raise ``ValueError`` if any job names an unregistered ``runner:``.
 
@@ -1117,7 +1215,7 @@ def build_process(
 
     flows: dict[str, FlowConfig] = {}
     for flow_name, bindings in flow_bindings.items():
-        resolved, gate_states = _resolve_jobs(jobs, bindings)
+        resolved, gate_states = _resolve_jobs(jobs, bindings, resolve_agent=registry.load_agent_optional)
         sm = _build_state_machine(resolved, gate_states)
         flows[flow_name] = FlowConfig(
             name=flow_name,
@@ -1158,6 +1256,11 @@ def build_process(
     # posthook registry so an unknown name fails fast at build time, same as
     # tool/engine references above.
     _validate_posthook_references(jobs, flow_bindings)
+
+    # ADR-044 Phase 2 — reject an explicit ``commit`` posthook on an agent whose
+    # ``produces_changes: false`` property contradicts it (commit is now derived
+    # from the property; an explicit one on a non-producer is drift).
+    _validate_posthook_property_consistency(jobs, flow_bindings, registry.load_agent_optional)
 
     # Validate ``runner:`` job references against the runner registry (ADR-028
     # Phase 3) so a mistyped or missing runner name fails at startup, not at
@@ -1303,13 +1406,18 @@ def build_process_from_inline(
             )
         )
 
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
+
     # Bindings mirror the steps in order (no per-flow rule overrides for the
     # inline form — every rule lives on the job itself).
     bindings = [FlowBinding(name=j.name) for j in jobs]
-    resolved, gate_states = _resolve_jobs(jobs, bindings)
+    resolved, gate_states = _resolve_jobs(jobs, bindings, resolve_agent=registry.load_agent_optional)
     sm = _build_state_machine(resolved, gate_states)
 
-    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
+    # ADR-044 Phase 2 — an inline step referencing a catalog agent by name
+    # derives/guards ``commit`` just like a bundled process; a step whose
+    # prompt has no ``agent.yaml`` resolves to ``None`` and is a no-op.
+    _validate_posthook_property_consistency(jobs, {"main": bindings}, registry.load_agent_optional)
 
     flow = FlowConfig(
         name="main",

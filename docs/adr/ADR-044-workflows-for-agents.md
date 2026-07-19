@@ -1,6 +1,6 @@
 # ADR-044 — Workflows for agents
 
-**Status:** Implemented (Phase 1) — Phases 2–6 Proposed
+**Status:** Implemented (Phases 1 & 2) — Phases 3–6 Proposed
 
 **Scope:** CE (with a shared-catalog concept that later reaches `rigg`)
 
@@ -85,7 +85,10 @@ Agent properties carry **two axes** — *what it does* × *who may set it*:
 - `class` (worker | gate) — defines the emittable-outcome set.
 
 In Phase 1 the property slots are declared and validated but only the outcome
-vocabulary and catalog are wired; the hook derivations land in Phases 2–3.
+vocabulary and catalog are wired; the hook derivations land in Phases 2–3. As of
+Phase 2, `produces_changes` is live: `flows.py` derives the `commit` posthook
+from it at process-build time (see the Phasing note below). `needs_worktree`
+remains inert until Phase 3.
 
 ### Two connection levels
 
@@ -113,8 +116,16 @@ risk call); the pre-merge-branch exposure is noted and accepted.
 1. **Marker vocabulary + agent catalog** (this PR) — closed `AGENT_RESULT:`
    vocab; hoist prompts into the catalog; migrate `rules:` patterns; rekey the
    orchestrator's marker parsing. No behaviour change.
-2. **Agent properties + property-derived hooks** — `produces_changes` → commit/push
-   (keep the per-workflow override seam).
+2. **Agent properties + property-derived hooks** (**Implemented**) — `produces_changes`
+   derives the `commit` posthook at build time in `flows.py` (resolving the
+   agent for each `type: agent` job's prompt via the operator-override-first →
+   bundled-catalog chain), replacing the hand-declared `posthooks: [commit]` in
+   the bundled `build`/`fix` workflows. The per-workflow (binding) override seam
+   is preserved exactly — a binding `posthooks:` (including `[]`) still fully
+   overrides the derived base. A build-time consistency guard rejects an
+   explicit `commit` on a `produces_changes: false` agent. `verify` (a gate)
+   drops its contradictory commit: it observes and routes `FAILED → code`, which
+   commits.
 3. **`needs_worktree` prehook** — move worktree creation off task-start.
 4. **Workflow-model cleanup** — chat as a single-agent workflow; formalize the
    promotion payload (recommended-workflow + spec); optional `edges:` sugar.

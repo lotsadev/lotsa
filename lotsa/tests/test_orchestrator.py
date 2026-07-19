@@ -102,9 +102,15 @@ def service(tmp_path, _loop, run):
     """
     data_dir = tmp_path / "tasks"
     data_dir.mkdir()
-    # Single-step flow with evaluate gate — task waits for human approval after agent runs
+    # Single-step flow with evaluate gate — task waits for human approval after agent runs.
+    # The binding ``posthooks: []`` suppresses ADR-044 Phase 2's derived ``commit``
+    # (``coding`` produces changes); these tests exercise approve/revise/retry/
+    # attachment flow, not commit behaviour, and the work_dir is not a git repo.
     flow_yaml = tmp_path / "test_flow.yaml"
-    flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    evaluate: true\n")
+    flow_yaml.write_text(
+        "name: test\njobs:\n  - name: coding\n    evaluate: true\n"
+        "flows:\n  main:\n    steps:\n      - name: coding\n        posthooks: []\n"
+    )
     config = LotsaConfig(
         data_dir=data_dir,
         work_dir=data_dir.parent,
@@ -1339,6 +1345,9 @@ class TestOutputRuleRouting:
     def rule_service(self, tmp_path, _loop, run):
         """Service with a two-step flow: code → review (with AGENT_RESULT: FAILED → code rule)."""
         flow_yaml = tmp_path / "rule_flow.yaml"
+        # ``posthooks: []`` on ``code`` suppresses ADR-044 Phase 2's derived
+        # ``commit`` (``coding`` produces changes); this fixture exercises
+        # output-rule routing, not commit, against a non-git test work_dir.
         flow_yaml.write_text(
             "name: rule-test\njobs:\n"
             "  - name: code\n    prompt: coding\n    resume: true\n"
@@ -1348,6 +1357,9 @@ class TestOutputRuleRouting:
             "    rules:\n"
             "      - source: stdout\n        pattern: '^AGENT_RESULT: PASSED'\n        target: next\n"
             "      - source: stdout\n        pattern: '^AGENT_RESULT: FAILED'\n        target: code\n"
+            "flows:\n  main:\n    steps:\n"
+            "      - name: code\n        posthooks: []\n"
+            "      - review\n"
         )
         # Create stub prompt files for the custom flow
         prompts_dir = tmp_path / "prompts"
