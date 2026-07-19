@@ -1,6 +1,6 @@
 # ADR-044 — Workflows for agents
 
-**Status:** Implemented (Phases 1 & 2) — Phases 3–6 Proposed
+**Status:** Implemented (Phases 1, 2 & 3) — Phases 4–6 Proposed
 
 **Scope:** CE (with a shared-catalog concept that later reaches `rigg`)
 
@@ -87,8 +87,11 @@ Agent properties carry **two axes** — *what it does* × *who may set it*:
 In Phase 1 the property slots are declared and validated but only the outcome
 vocabulary and catalog are wired; the hook derivations land in Phases 2–3. As of
 Phase 2, `produces_changes` is live: `flows.py` derives the `commit` posthook
-from it at process-build time (see the Phasing note below). `needs_worktree`
-remains inert until Phase 3.
+from it at process-build time (see the Phasing note below). As of Phase 3,
+`needs_worktree` is live too: `flows.py` derives a `worktree` prehook from it at
+process-build time, and the orchestrator runs a step's prehooks instead of
+unconditionally creating a worktree at dispatch — so a `needs_worktree: false`
+agent (only `chat`) stops creating a worktree it never uses.
 
 ### Two connection levels
 
@@ -126,7 +129,22 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    explicit `commit` on a `produces_changes: false` agent. `verify` (a gate)
    drops its contradictory commit: it observes and routes `FAILED → code`, which
    commits.
-3. **`needs_worktree` prehook** — move worktree creation off task-start.
+3. **`needs_worktree` prehook** (**Implemented**) — a prehook registry
+   (`lotsa.registry`, symmetric with posthooks) plus a built-in `worktree`
+   prehook (`lotsa.prehooks`) that invokes the task's `WorktreeManager`.
+   `flows.py._resolve_jobs` derives the `worktree` prehook from each step's
+   `needs_worktree` property, but with the *inverse* polarity to Phase 2's
+   commit derivation: worktree is the pre-existing universal default for every
+   dispatched step (agent + action), and the sole opt-out is an agent declaring
+   `needs_worktree: false` (only `chat`). Monitor steps derive none. The
+   per-binding `prehooks:` override seam (including `[]`) is preserved exactly,
+   and a build-time consistency guard rejects an explicit `worktree` on a
+   `needs_worktree: false` agent. The orchestrator's two dispatch sites
+   (`_dispatch_step`, `_redispatch_current_step`) run the step's prehooks via
+   `_run_step_prehooks` instead of unconditionally calling `.create()`; a
+   prehook failure is non-fatal (falls back to the project work_dir, preserving
+   the pre-Phase-3 best-effort behaviour). Activity-tab work_dir resolution is
+   aligned so a worktree-less chat step's session log is still read.
 4. **Workflow-model cleanup** — chat as a single-agent workflow; formalize the
    promotion payload (recommended-workflow + spec); optional `edges:` sugar.
 5. **In-repo agents *and* workflows** — git-native `.lotsa/` discovery +

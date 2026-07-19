@@ -219,6 +219,71 @@ def test_bundled_effective_posthooks_preserved_except_verify():
         )
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# ADR-044 Phase 3 — the ``worktree`` prehook is DERIVED from each agent's
+# ``needs_worktree`` property (opt-OUT: worktree is the universal default; only
+# a ``needs_worktree: false`` agent opts out).
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_bundled_effective_prehooks_worktree_everywhere_except_monitor():
+    """Every dispatched ``build``/``fix`` step (agent + action) derives the
+    ``worktree`` prehook; monitor steps (which never created a worktree at
+    dispatch) derive none. No bundled agent except ``chat`` sets
+    ``needs_worktree: false``, and ``chat`` isn't in these two processes.
+
+    RED pre-Phase-3: ``ResolvedJob`` has no ``prehooks`` attribute, so every
+    access raises ``AttributeError``.
+    """
+    import lotsa.prehooks  # noqa: F401 — the built-in ``worktree`` must be registered
+
+    expected_build = {
+        "plan": ["worktree"],
+        "test": ["worktree"],
+        "code": ["worktree"],
+        "review": ["worktree"],
+        "pr-fix": ["worktree"],
+        "verify": ["worktree"],
+        "pr_summary": ["worktree"],
+        "push_pr": ["worktree"],  # action — always got a worktree pre-Phase-3
+        "resolve_conflicts": ["worktree"],
+        "wait_for_pr_signal": [],  # monitor — never created one
+    }
+    expected_fix = {
+        "code": ["worktree"],
+        "review": ["worktree"],
+        "pr-fix": ["worktree"],
+        "pr_summary": ["worktree"],
+        "push_pr": ["worktree"],  # action
+        "resolve_conflicts": ["worktree"],
+        "wait_for_pr_signal": [],  # monitor
+    }
+
+    build_jobs = {j.name: j for j in build_process("build").jobs}
+    for name, expected in expected_build.items():
+        assert build_jobs[name].prehooks == expected, (
+            f"build/{name}: expected prehooks {expected!r}, got {build_jobs[name].prehooks!r}"
+        )
+
+    fix_jobs = {j.name: j for j in build_process("fix").jobs}
+    for name, expected in expected_fix.items():
+        assert fix_jobs[name].prehooks == expected, (
+            f"fix/{name}: expected prehooks {expected!r}, got {fix_jobs[name].prehooks!r}"
+        )
+
+
+def test_chat_process_derives_no_worktree_prehook():
+    """The ``chat`` process's sole step opts out of the worktree prehook — chat
+    tasks stop creating a worktree they never use (ADR-044 Phase 3's payoff).
+
+    RED pre-Phase-3: no ``prehooks`` attribute; worktree creation is
+    unconditional for every step including chat.
+    """
+    process = build_process("chat")
+    for j in process.jobs:
+        assert j.prehooks == [], f"chat job {j.name!r} must derive no worktree prehook; got {j.prehooks!r}"
+
+
 def test_build_drops_all_spec_and_plan_inputs():
     """No build job may declare inputs: [spec] / [plan] — the task body/carried
     spec is the source of truth (plan §2)."""

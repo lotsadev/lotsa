@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from lotsa.db import TaskDB
+    from rigg.git import WorktreeManager
 
 
 @dataclass
@@ -36,6 +37,11 @@ class TaskContext:
     flow_name: str  # root flow
     current_flow: str  # may differ during sub-flows
     last_run_step: str
+    # ADR-044 Phase 3 — the task's WorktreeManager, injected by the orchestrator
+    # only when running prehooks (a prehook may need to CREATE the worktree,
+    # which doesn't exist yet). ``None`` for tools/posthooks, which operate on
+    # the already-created ``worktree`` path.
+    worktree_manager: WorktreeManager | None = None
 
     async def get_artifact(self, name: str) -> str | None:
         """Look up the latest named artifact for this task.
