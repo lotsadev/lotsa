@@ -151,7 +151,23 @@ def make_server_config(tmp_path: Path) -> LotsaConfig:
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)
     flow_yaml = tmp_path / "test_flow.yaml"
-    flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    evaluate: true\n")
+    # The generic ``coding`` step is just "an agent step" for these
+    # orchestrator/server tests — not the real coding agent's commit behaviour.
+    # Under ADR-044 Phase 2 ``coding`` (``produces_changes: true``) would derive
+    # a ``commit`` posthook that fails against the non-git test work_dir; the
+    # binding-level ``posthooks: []`` override suppresses it (the documented
+    # seam). Commit-posthook behaviour is covered by test_commit_posthook_*.
+    flow_yaml.write_text(
+        "name: test\n"
+        "jobs:\n"
+        "  - name: coding\n"
+        "    evaluate: true\n"
+        "flows:\n"
+        "  main:\n"
+        "    steps:\n"
+        "      - name: coding\n"
+        "        posthooks: []\n"
+    )
     return LotsaConfig(
         data_dir=data_dir,
         work_dir=tmp_path,

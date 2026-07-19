@@ -28,7 +28,6 @@ jobs:
     resume: true
     queue_state: testing
     active_state: testing
-    posthooks: [commit]
 
   - name: code
     type: agent
@@ -36,7 +35,6 @@ jobs:
     resume: true
     queue_state: coding
     active_state: coding
-    posthooks: [commit]
 
   - name: review
     type: agent
@@ -57,7 +55,6 @@ jobs:
     resume: true
     queue_state: pr-fixing
     active_state: pr-fixing
-    posthooks: [commit]
     rules:
       - source: stdout
         pattern: "^AGENT_RESULT: COMPLETED"
@@ -76,7 +73,6 @@ jobs:
     type: agent
     prompt: verify
     conversational: true
-    posthooks: [commit]
     rules:
       - source: stdout
         pattern: "^AGENT_RESULT: PASSED"
@@ -102,7 +98,6 @@ jobs:
     resume: true
     queue_state: resolving_conflicts
     active_state: resolving_conflicts
-    posthooks: [commit]
     rules:
       - source: stdout
         pattern: "^AGENT_RESULT: COMPLETED"

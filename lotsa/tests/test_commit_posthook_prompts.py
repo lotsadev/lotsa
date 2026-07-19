@@ -1,17 +1,21 @@
-"""Prompt, preamble, and process.yaml content checks for ADR-024.
+"""Prompt, preamble, and process.yaml content checks for ADR-024 / ADR-044.
 
 Commit moves out of agent-prompt prose and into the orchestrator-run
-``commit`` posthook. These tests pin the textual consequences:
+``commit`` posthook (ADR-024). Under ADR-044 Phase 2 the posthook is no longer
+hand-declared per job in the YAML — it is *derived* from each agent's
+``produces_changes`` property. These tests pin the consequences:
 
-* ``full/process.yaml`` declares ``posthooks: [commit]`` on the four
-  code-producing jobs (``test``/``code``/``verify``/``pr-fix``) and on none
-  of the non-producers (``spec``/``plan``/``review``).
-* The four producer prompts no longer carry a ``git commit`` instruction and
-  each gains the "you do not commit" line.
+* The bundled ``build`` process *resolves* ``commit`` onto the producing
+  agent steps (``test``/``code``/``pr-fix``) and onto none of the
+  non-producers (``plan``/``review``/``verify``). ``verify`` is a gate that
+  observes; it no longer commits.
+* The producer prompts no longer carry a ``git commit`` instruction and each
+  gains the "you do not commit" line.
 * ``OPERATIONAL_PREAMBLE`` states that commit is orchestrator-owned.
 
-These read the real bundled files; they fail against pre-fix content (which
-still tells agents to commit) and pass once R5/R6 land.
+The posthook-declaration tests assert on the *resolved* ``FlowStep.posthooks``
+(``build_process``) rather than the raw YAML, because Phase 2 drops the literal
+``posthooks: [commit]`` lines and derives them instead.
 """
 
 from __future__ import annotations
@@ -19,7 +23,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 
 _FULL = Path(__file__).resolve().parents[1] / "prompts" / "build"
 # ADR-044 — prompt bodies live in the shared agent catalog; process.yaml stays
@@ -33,32 +36,34 @@ def _catalog_system(prompt_base: str) -> str:
     return (_CATALOG / agent / "system.md").read_text().lower()
 
 
-_PRODUCERS = ("test", "code", "verify", "pr-fix")
-# ADR-043 dissolved the ``spec`` step; ``plan``/``review`` remain non-producers.
-_NON_PRODUCERS = ("plan", "review")
+# ADR-044 Phase 2: producers derive ``commit`` from ``produces_changes: true``;
+# non-producers (incl. the ``verify`` gate, which observes) derive nothing.
+_PRODUCERS = ("test", "code", "pr-fix")
+_NON_PRODUCERS = ("plan", "review", "verify")
 
 
-def _load_jobs() -> dict[str, dict]:
-    data = yaml.safe_load((_FULL / "process.yaml").read_text())
-    return {j["name"]: j for j in data["jobs"]}
+def _resolved_posthooks() -> dict[str, list[str]]:
+    """Effective posthooks per job in the bundled ``build`` process."""
+    import lotsa.posthooks  # noqa: F401 — ensures the built-in ``commit`` exists
+    from lotsa.flows import build_process
+
+    return {j.name: list(j.posthooks) for j in build_process("build").jobs}
 
 
 # ---------------------------------------------------------------------------
-# process.yaml — posthook declarations
+# process.yaml — commit posthook is DERIVED onto producers (ADR-044 Phase 2)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("job_name", _PRODUCERS)
-def test_producer_job_declares_commit_posthook(job_name: str):
-    jobs = _load_jobs()
-    posthooks = jobs[job_name].get("posthooks") or []
-    assert "commit" in posthooks, f"{job_name!r} must declare posthooks: [commit]"
+def test_producer_job_resolves_commit_posthook(job_name: str):
+    posthooks = _resolved_posthooks()[job_name]
+    assert "commit" in posthooks, f"{job_name!r} must resolve posthooks: [commit] (derived)"
 
 
 @pytest.mark.parametrize("job_name", _NON_PRODUCERS)
 def test_non_producer_job_has_no_commit_posthook(job_name: str):
-    jobs = _load_jobs()
-    posthooks = jobs[job_name].get("posthooks") or []
+    posthooks = _resolved_posthooks()[job_name]
     assert "commit" not in posthooks, f"{job_name!r} must not run the commit posthook"
 
 

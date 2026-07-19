@@ -15,7 +15,6 @@ jobs:
     prompt: fix_coding
     queue_state: coding
     active_state: coding
-    posthooks: [commit]
 
   # ``review``/``pr-fix``/``resolve_conflicts`` reference the shared, process-
   # independent agents in the catalog (``lotsa/prompts/agents/<name>/``),
@@ -35,7 +34,6 @@ jobs:
     resume: true
     queue_state: pr-fixing
     active_state: pr-fixing
-    posthooks: [commit]
     rules:
       - source: stdout
         pattern: "^AGENT_RESULT: COMPLETED"
@@ -75,7 +73,6 @@ jobs:
     resume: true
     queue_state: resolving_conflicts
     active_state: resolving_conflicts
-    posthooks: [commit]
     rules:
       - source: stdout
         pattern: "^AGENT_RESULT: COMPLETED"

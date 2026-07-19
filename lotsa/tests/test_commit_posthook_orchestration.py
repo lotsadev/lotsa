@@ -155,12 +155,16 @@ def _drain(svc: OrchestratorService, run, task_id: str, timeout: float = 3.0) ->
         run(asyncio.sleep(0.05))
 
 
+# These fixtures probe posthook *wiring* (record_hook / no-hook), so the step
+# must run exactly its declared posthooks. They use a NON-producing catalog
+# agent (``review`` — ``produces_changes: false``) so ADR-044 Phase 2's commit
+# derivation is a no-op and can't fold a stray ``commit`` into these steps.
 _AGENT_ONLY_PROCESS = """
 process: posthook_wiring
 jobs:
   - name: code
     type: agent
-    prompt: coding
+    prompt: review
     queue_state: coding
     active_state: coding
     posthooks: [record_hook]
@@ -175,7 +179,7 @@ process: posthook_absent
 jobs:
   - name: code
     type: agent
-    prompt: coding
+    prompt: review
     queue_state: coding
     active_state: coding
 flows:
