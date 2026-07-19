@@ -714,3 +714,41 @@ def test_needs_worktree_agent_still_creates_a_worktree(prehook_service, run, mon
 
     task = run(svc.create_task("Do the code", message="change a thing"))
     assert task.id in created
+
+
+def test_run_step_prehooks_degrades_when_project_unresolvable(prehook_service, run, monkeypatch):
+    """Regression (review): ``_run_step_prehooks`` must never let a
+    ``ProjectNotFound`` escape when the task's WorktreeManager can't be resolved.
+
+    ``_worktree_manager_for_task`` raises ``ProjectNotFound`` for an
+    ADR-029 edge case — a legacy row or a task whose project was removed from
+    ``lotsa.yaml``. This resolution now sits INSIDE the method's resilience:
+    like the pre-Phase-3 code (which wrapped both the manager lookup and
+    ``.create()`` in one ``try/except``), an unresolvable project must degrade
+    to the project work_dir, not propagate. It matters because
+    ``_run_step_prehooks`` runs AFTER ``_dispatch_step``'s CAS to ``working``
+    has committed — a propagating exception would strand the task in
+    ``working`` with no in-flight agent until the next restart's resume sweep.
+
+    RED against the pre-fix code, where ``wtm = self._worktree_manager_for_task(item)``
+    sat OUTSIDE the ``try`` block: this call raises ``ProjectNotFound`` instead
+    of returning the fallback work_dir.
+    """
+    from lotsa.orchestrator import ProjectNotFound
+    from rigg.models import Item
+
+    svc = prehook_service
+    item = Item(id="orphan-task", state="backlog", title="t", body="b", metadata={})
+    step = next(s for s in svc._root_flow_for(item).jobs if s.name == "coding")
+    # Precondition: the ``coding`` step derives the ``worktree`` prehook, so the
+    # method actually reaches the manager resolution under test.
+    assert "worktree" in step.prehooks
+
+    def boom(_item):
+        raise ProjectNotFound("task references unknown project")
+
+    monkeypatch.setattr(svc, "_worktree_manager_for_task", boom)
+
+    # Must NOT raise — degrades to the project work_dir.
+    work_dir = run(svc._run_step_prehooks(item, step))
+    assert work_dir == svc._fallback_work_dir(item)

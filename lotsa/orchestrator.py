@@ -5142,12 +5142,28 @@ class OrchestratorService:
 
         A prehook failure is **non-fatal** — it degrades to the project work_dir
         with a warning, preserving the pre-Phase-3 best-effort behaviour (it
-        does NOT block, unlike a posthook failure).
+        does NOT block, unlike a posthook failure). This resilience covers the
+        WorktreeManager *resolution* too, not only the hook body: resolving the
+        manager can raise ``ProjectNotFound`` for a task on an unregistered
+        project (ADR-029 legacy rows / a project removed from ``lotsa.yaml``),
+        and the pre-Phase-3 code degraded that case to the project work_dir. It
+        must never propagate — this runs after ``_dispatch_step``'s CAS to
+        ``working`` has committed, so an escaping exception would strand the
+        task in ``working`` with no in-flight agent until the next restart.
         """
         from lotsa.registry import get_prehook
         from lotsa.tools import TaskContext
 
-        wtm = self._worktree_manager_for_task(item)
+        try:
+            wtm = self._worktree_manager_for_task(item)
+        except Exception:  # noqa: BLE001 — an unresolvable project degrades to the project work_dir
+            logger.warning(
+                "Worktree manager resolution failed for task %s, using project work_dir",
+                item.id,
+                exc_info=True,
+            )
+            return self._fallback_work_dir(item)
+
         created_path: Path | None = None
         for name in step.prehooks:
             try:
