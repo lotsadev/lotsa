@@ -4918,14 +4918,16 @@ class TestPromote:
         assert after.state == before.state
         assert after.status == before.status
 
-    def test_unknown_destination_error_omits_chat_from_available(self, service, run):
-        """The "unknown process" suggestion list must not include ``chat``:
-        even though ``chat`` is loaded, the no-demotion guard rejects it, so
-        listing it here would invite a second confusing rejection.
+    def test_unknown_destination_error_lists_chat_as_available(self, service, run):
+        """ADR-044 Phase 4 — the hard "can't promote into chat" rule is gone, so
+        ``chat`` is now a listable destination in the unknown-process suggestion
+        list like any other loaded process (advertising is property-driven, not
+        name-blocked).
 
-        Regression: pre-fix the list was ``sorted(self._processes.keys())``,
-        which includes ``chat`` whenever it is loaded — this assertion fails
-        against that code with ``'chat' in "... Available: ['chat', 'full']"``.
+        Regression: pre-Phase-4 the list was
+        ``sorted(p for p in self._processes if p != "chat")``, which filtered
+        ``chat`` out — this assertion fails against that code because ``chat``
+        is absent from the ``Available: [...]`` list.
         """
         from lotsa.orchestrator import PromoteNotAllowed
 
@@ -4938,34 +4940,34 @@ class TestPromote:
             run(service.promote_task(task.id, "no_such_process"))
 
         msg = str(excinfo.value)
-        assert "chat" not in msg, f"chat must not be offered as a promotion destination: {msg!r}"
+        assert "chat" in msg, f"chat is a loaded process and must be listed as available: {msg!r}"
         # A genuinely valid destination is still surfaced.
         assert "build" in msg
 
-    def test_promote_to_chat_rejected_and_unmutated(self, service, run):
-        """ADR-027 §7 — no demotion. Even with ``chat`` loaded as a valid
-        process, promoting *into* it is refused server-side (the dashboard
-        filters it from the picker, but the CLI / raw API must enforce it too).
+    def test_promote_into_chat_no_longer_hard_blocked(self, service, run):
+        """ADR-044 Phase 4 amends ADR-027 §7 — the hard "cannot promote into
+        chat" rule is dropped (an operator may have a reason). With ``chat``
+        loaded, promoting *into* it now succeeds and lands the process switch;
+        ``invocable`` only gates *advertising* (the picker / suggest-catalog),
+        not enforcement.
 
-        Regression: pre-fix there was no destination guard, so with ``chat``
-        in the catalog this promotion would *succeed* and mutate the row to
-        ``process_name='chat'`` — the test would fail to raise.
+        Regression: pre-Phase-4 ``promote_task`` raised ``PromoteNotAllowed``
+        at the hard chat guard, so this call raises against the pre-fix tree
+        rather than switching the process.
         """
-        from lotsa.orchestrator import PromoteNotAllowed
-
         _load_chat_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
-        before = run(service.db.get_task(task.id))
 
-        with pytest.raises(PromoteNotAllowed):
-            run(service.promote_task(task.id, "chat"))
+        # Must NOT raise — the hard block is gone.
+        run(service.promote_task(task.id, "chat"))
+        run(asyncio.sleep(0.1))
 
         after = run(service.db.get_task(task.id))
-        assert after.metadata.get("process_name") == before.metadata.get("process_name")
-        assert after.metadata.get("process_name") != "chat"
-        assert after.state == before.state
-        assert after.status == before.status
+        assert after is not None
+        assert after.metadata.get("process_name") == "chat", (
+            "promoting into chat must now land the process switch (ADR-044 Phase 4)"
+        )
 
     def test_terminal_source_rejected_and_unmutated(self, service, run):
         from lotsa.orchestrator import PromoteNotAllowed
@@ -5078,20 +5080,56 @@ class TestAvailableProcessesRendering:
         # of its own.
         assert "- build:" not in rendered
 
-    def test_excludes_the_chat_process_itself(self, service, run, tmp_path):
-        from lotsa.flows import build_process_from_inline
+    def test_excludes_the_chat_process_itself(self, service, run):
+        """ADR-044 Phase 4 — chat still isn't offered as a hand-off target, but
+        the exclusion is now driven by the declared ``invocable`` property
+        (``chat`` is ``invocable: [start]``, no ``hand-off``), not the literal
+        name ``"chat"``. Build the real bundled chat process so the property
+        path is exercised."""
+        from lotsa.flows import build_process
 
-        chat = build_process_from_inline(
-            "chat",
-            {"steps": [{"name": "chat", "conversational": True}]},
-            base_dir=tmp_path,
-        )
-        chat.description = "Exploration and triage."
+        chat = build_process("chat")
         service._processes["chat"] = chat
 
         rendered = service._render_available_processes()
         # The chat agent should not be offered the option of promoting to chat.
-        assert "Exploration and triage" not in rendered
+        assert chat.description is None or chat.description.strip() not in rendered
+        assert "- chat:" not in rendered
+
+    def test_excludes_non_handoff_process_by_property(self, service, run, tmp_path):
+        """ADR-044 Phase 4 (option ii) — a workflow that is not ``hand-off``
+        invocable is excluded from the suggest-catalog *regardless of its name*.
+
+        This discriminates the property-driven rule from the old name-based one:
+        a process named ``explore`` (not ``chat``) with a description but
+        ``invocable: [start]`` is EXCLUDED under the new rule. Pre-Phase-4 the
+        filter was ``if name == "chat"``, so ``explore`` — with a name != "chat"
+        and a description — is *included*, and this assertion fails against the
+        pre-fix tree.
+        """
+        from lotsa.flows import build_process_from_inline
+
+        explore = build_process_from_inline(
+            "explore",
+            {"invocable": ["start"], "steps": [{"name": "explore", "conversational": True}]},
+            base_dir=tmp_path,
+        )
+        explore.description = "A non-hand-off exploration workflow."
+        service._processes["explore"] = explore
+
+        rendered = service._render_available_processes()
+        assert "A non-hand-off exploration workflow." not in rendered
+        assert "- explore:" not in rendered
+
+    def test_includes_handoff_process_with_description(self, service, run):
+        """Positive control: a ``hand-off``-invocable process with a description
+        IS surfaced to the chat agent's triage block."""
+        full = _load_build_destination(service)
+        full.description = "Full SDLC: plan, test, code, review, verify, push."
+
+        rendered = service._render_available_processes()
+        assert "- build:" in rendered
+        assert "Full SDLC" in rendered
 
 
 class TestListProcessesSummaryPromotionFields:
@@ -5118,6 +5156,32 @@ class TestListProcessesSummaryPromotionFields:
         assert full_summary["promotion_inputs"] == [
             {"name": "draft_spec", "description": "A spec to verify rather than re-elicit."}
         ]
+
+
+class TestListProcessesSummaryInvocable:
+    """ADR-044 Phase 4 — ``list_processes_summary`` carries the ``invocable``
+    property so the new-task picker and the hand-off dialog can filter on it
+    instead of hardcoding the name ``"chat"``.
+
+    Fails pre-Phase-4: the summary dict has no ``invocable`` key (``KeyError``).
+    """
+
+    def test_summary_includes_invocable(self, service, run):
+        _load_build_destination(service)
+        _load_chat_destination(service)
+
+        summaries = service.list_processes_summary()
+        by_name = {s["name"]: s for s in summaries}
+
+        # Every entry carries the property as a list of options.
+        for s in summaries:
+            assert isinstance(s["invocable"], list)
+            assert all(isinstance(opt, str) for opt in s["invocable"])
+
+        # chat advertises only for start; build advertises as a hand-off target.
+        assert "hand-off" not in by_name["chat"]["invocable"]
+        assert "start" in by_name["chat"]["invocable"]
+        assert "hand-off" in by_name["build"]["invocable"]
 
 
 # ---------------------------------------------------------------------------
