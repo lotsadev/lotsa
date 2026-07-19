@@ -587,9 +587,12 @@ Common `lotsa serve` flags:
 
 Tasks get an isolated git worktree at
 `{data_dir}/worktrees/{project_id}/{task_id}/` (namespaced per project since
-ADR-029). Created lazily on first dispatch by `WorktreeManager`
-(`rigg.git.WorktreeManager`). The orchestrator switches into it for
-agent dispatch, push, and rebase operations.
+ADR-029). Created lazily by `WorktreeManager` (`rigg.git.WorktreeManager`) via
+the `worktree` **prehook** the orchestrator runs before dispatching a step
+(ADR-044 Phase 3) — every step derives it EXCEPT an agent declaring
+`needs_worktree: false` (only `chat`), which runs in the project work_dir
+instead. The orchestrator switches into the worktree for agent dispatch, push,
+and rebase operations.
 
 ### Restart is resumptive, not destructive (ADR-040)
 
@@ -909,6 +912,22 @@ rules.
   `[]`, fully replaces the derived base). `_validate_posthook_property_consistency`
   fails the build loudly if a step explicitly lists `commit` on a
   `produces_changes: false` agent (drift). `verify` (a gate) no longer commits —
-  it observes and routes `FAILED → code`, which commits. Phases 3–6
-  (`needs_worktree` prehook, workflow-model cleanup, git-native `.lotsa/`
-  provenance + rails, visual editor) remain proposed. Amends ADR-043/039/014.
+  it observes and routes `FAILED → code`, which commits. **Phase 3** wires the
+  `needs_worktree` property: a prehook registry in `lotsa/registry.py` (symmetric
+  with posthooks) + a built-in `worktree` prehook (`lotsa/prehooks/`) that invokes
+  the task's `WorktreeManager` (injected via `TaskContext.worktree_manager`).
+  `_resolve_jobs` (`lotsa/flows.py`) derives the `worktree` prehook onto every
+  dispatched step (`agent` + `action`) EXCEPT the one opt-out — an agent whose
+  `agent.yaml` sets `needs_worktree: false` (only `chat`); monitor steps derive
+  none. This is the *inverse* polarity to Phase 2's opt-in commit derivation
+  (worktree is the pre-existing universal default; deriving it opt-in would strip
+  it from `push_pr`/`resolve_conflicts`/inline steps). The per-binding `prehooks:`
+  override seam (incl. `[]`) is preserved, and `_validate_prehook_property_consistency`
+  rejects an explicit `worktree` on a `needs_worktree: false` agent. The
+  orchestrator's two dispatch sites (`_dispatch_step`, `_redispatch_current_step`)
+  run `_run_step_prehooks(item, step)` instead of an unconditional `.create()`; a
+  prehook failure is **non-fatal** (falls back to the project work_dir, unlike a
+  blocking posthook failure), and `get_activity`'s work_dir resolution is aligned
+  so a worktree-less chat step's Activity tab still populates. Phases 4–6
+  (workflow-model cleanup, git-native `.lotsa/` provenance + rails, visual editor)
+  remain proposed. Amends ADR-043/039/014.

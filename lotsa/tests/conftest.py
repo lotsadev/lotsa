@@ -39,6 +39,7 @@ def _isolated_registry():
     import lotsa.engines  # noqa: F401 — registers built-ins
     import lotsa.overrides  # noqa: F401 — registers built-in override handlers (ADR-019)
     import lotsa.posthooks  # noqa: F401 — registers built-in posthooks (commit)
+    import lotsa.prehooks  # noqa: F401 — registers built-in prehooks (worktree, ADR-044 P3)
     import lotsa.tools  # noqa: F401 — registers built-ins
     from lotsa import overrides as ovr
     from lotsa import registry as reg

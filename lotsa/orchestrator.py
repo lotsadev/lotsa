@@ -1444,11 +1444,16 @@ class OrchestratorService:
             return None, ActivityResult(events=[], supported=True)
 
         # ADR-029 — resolve the worktree against the task's project (best-effort:
-        # this method must never 500, so fall back to the namespaced on-disk path
-        # without raising when the project is unknown).
+        # this method must never 500, so fall back without raising when the
+        # project is unknown).
+        # ADR-044 Phase 3 — a worktree-less step (chat) runs in the project
+        # work_dir, so its session JSONL is keyed there, not under a namespaced
+        # worktree path. Mirror the dispatch-time work_dir resolution
+        # (``get_path`` → ``_fallback_work_dir``) so the Activity tab reads the
+        # right directory for such steps instead of a nonexistent worktree path.
         project = self._projects.get(row.project_id)
         wt_path = self._worktree_manager_for(project).get_path(task_id) if project else None
-        work_dir = wt_path or (self.config.data_dir / "worktrees" / row.project_id / task_id)
+        work_dir = wt_path or self._fallback_work_dir(row)
         try:
             result = await read(session_id, work_dir, since_index, limit)
         except Exception:
@@ -4586,12 +4591,10 @@ class OrchestratorService:
         if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
             await self._clear_interruption_markers(item)
 
-        # Create or reuse a git worktree for this task (under the task's project)
-        try:
-            wt_path = await self._worktree_manager_for_task(item).create(item.id)
-        except Exception:
-            logger.warning("Worktree creation failed for %s, using project work_dir", item.id)
-            wt_path = self._fallback_work_dir(item)
+        # Run the step's prehooks (ADR-044 Phase 3) — the built-in ``worktree``
+        # prehook creates/reuses the task's git worktree; a step that opts out
+        # (chat) runs in the project work_dir. Resolves this step's work_dir.
+        wt_path = await self._run_step_prehooks(item, step)
 
         # ADR-040 graceful drain — refuse new dispatches once shutdown has begun
         # so no fresh agent enters ``_in_flight`` while in-flight work drains.
@@ -4726,11 +4729,10 @@ class OrchestratorService:
             )
             return
 
-        try:
-            wt_path = await self._worktree_manager_for_task(item).create(item.id)
-        except Exception:
-            logger.warning("Worktree creation failed for %s during resume, using project work_dir", item.id)
-            wt_path = self._fallback_work_dir(item)
+        # Run the step's prehooks (ADR-044 Phase 3) — same as ``_dispatch_step``.
+        # A resumed chat step also skips the worktree; a needs_worktree step
+        # re-creates it idempotently.
+        wt_path = await self._run_step_prehooks(item, step)
 
         # ADR-040 graceful drain — check ``_accepting`` immediately before the
         # synchronous ``_in_flight`` mutation (after the last await), matching
@@ -5123,6 +5125,62 @@ class OrchestratorService:
         if next_step is None or next_step.type != "monitor":
             await self._dispatch_next_step(item)
             await self._cleanup_worktree_if_done(item)
+
+    async def _run_step_prehooks(self, item: Item, step: FlowStep) -> Path:
+        """Run *step*'s resolved prehooks, then resolve its work_dir (ADR-044 P3).
+
+        Replaces the former unconditional ``WorktreeManager.create`` at the two
+        dispatch sites. A step with no ``worktree`` prehook (today: only
+        ``chat``) never creates a worktree and runs in the project work_dir.
+
+        The work_dir is the path the ``worktree`` prehook reports it created
+        (``metadata['worktree']`` — authoritative, and the value ``create``
+        returned), falling back to ``get_path(item.id)`` then
+        ``_fallback_work_dir(item)``. So chat (no worktree prehook, nothing
+        created) runs in the project root, and every other step runs in its
+        freshly-created worktree.
+
+        A prehook failure is **non-fatal** — it degrades to the project work_dir
+        with a warning, preserving the pre-Phase-3 best-effort behaviour (it
+        does NOT block, unlike a posthook failure).
+        """
+        from lotsa.registry import get_prehook
+        from lotsa.tools import TaskContext
+
+        wtm = self._worktree_manager_for_task(item)
+        created_path: Path | None = None
+        for name in step.prehooks:
+            try:
+                hook = get_prehook(name)
+                # ``worktree`` (fallback) placeholder: the real worktree doesn't
+                # exist yet — the prehook creates it via ``worktree_manager``.
+                ctx = TaskContext(
+                    task_id=item.id,
+                    worktree=self._fallback_work_dir(item),
+                    metadata=dict(item.metadata),
+                    db=self.db,
+                    process_name=self._process_for(item).name,
+                    flow_name=self._root_flow_for(item).name,
+                    current_flow=item.metadata.get("current_flow") or self._root_flow_for(item).name,
+                    last_run_step=step.name,
+                    worktree_manager=wtm,
+                )
+                result = await hook(ctx, {})
+                if not result.success:
+                    logger.warning(
+                        "Prehook %r for task %s did not succeed (%s) — using project work_dir",
+                        name,
+                        item.id,
+                        result.output,
+                    )
+                    continue
+                reported = result.metadata.get("worktree") if result.metadata else None
+                if reported:
+                    created_path = Path(reported)
+            except Exception:  # noqa: BLE001 — a prehook crash degrades to the project work_dir
+                logger.warning("Prehook %r crashed for task %s, using project work_dir", name, item.id, exc_info=True)
+
+        return created_path or wtm.get_path(item.id) or self._fallback_work_dir(item)
 
     async def _run_step_posthooks(self, item: Item, step: FlowStep, work_dir: Path) -> ToolResult | None:
         """Run *step*'s resolved posthooks in order (ADR-024).

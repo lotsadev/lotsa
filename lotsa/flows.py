@@ -208,6 +208,17 @@ class Job:
         commit_prefix:  Conventional-Commits prefix for the ``commit`` posthook's
                         deterministic message (default ``chore``).
 
+    ADR-044 Phase 3 step prehooks (applies to ``agent``/``action`` steps):
+        prehooks:       names of prehooks (registered via
+                        ``lotsa.registry.register_prehook``) the orchestrator
+                        runs before this step dispatches. ``[worktree]`` is the
+                        built-in. Usually left unset — ``worktree`` is *derived*
+                        from the agent's ``needs_worktree`` property at
+                        process-build time (opt-out: worktree is the universal
+                        default; only a ``needs_worktree: false`` agent, e.g.
+                        ``chat``, drops it). A per-binding ``prehooks:`` value
+                        (including ``[]``) fully replaces the derived base.
+
     ADR-016 schema slots (parser only; write path deferred):
         output_file:  worktree-relative path to persist agent stdout to
         commit:       whether to commit ``output_file`` after the step
@@ -236,6 +247,7 @@ class Job:
     output_file: str | None = None
     commit: bool = False
     posthooks: list[str] = field(default_factory=list)
+    prehooks: list[str] = field(default_factory=list)
     commit_prefix: str | None = None
     model: str | None = None
     runner: str | None = None
@@ -268,6 +280,7 @@ class ResolvedJob:
     output_file: str | None = None
     commit: bool = False
     posthooks: list[str] = field(default_factory=list)
+    prehooks: list[str] = field(default_factory=list)
     commit_prefix: str | None = None
     model: str | None = None
     runner: str | None = None
@@ -322,6 +335,7 @@ class FlowBinding:
     rules: list[OutputRule] | None = None
     config: dict[str, Any] = field(default_factory=dict)
     posthooks: list[str] | None = None
+    prehooks: list[str] | None = None
 
 
 @dataclass
@@ -439,6 +453,11 @@ def _parse_job(jd: dict) -> Job:
     if isinstance(raw_posthooks, str):
         raw_posthooks = [raw_posthooks]
 
+    # ``prehooks`` accepts the same list-or-bare-string shape (ADR-044 Phase 3).
+    raw_prehooks = jd.get("prehooks", []) or []
+    if isinstance(raw_prehooks, str):
+        raw_prehooks = [raw_prehooks]
+
     parsed_rules = _parse_rules(jd.get("rules"))
 
     return Job(
@@ -460,6 +479,7 @@ def _parse_job(jd: dict) -> Job:
         output_file=output_file,
         commit=commit,
         posthooks=list(raw_posthooks),
+        prehooks=list(raw_prehooks),
         commit_prefix=jd.get("commit_prefix"),
         model=jd.get("model"),
         runner=jd.get("runner"),
@@ -479,11 +499,19 @@ def _parse_flow_step(raw: Any) -> FlowBinding:
         raw_posthooks = raw.get("posthooks")
         if isinstance(raw_posthooks, str):
             raw_posthooks = [raw_posthooks]
+        # ``prehooks`` mirrors ``posthooks``: default None (= "use the job's
+        # derived prehooks") so a binding-level empty list is distinguishable
+        # from "unset" and can override the step to run no prehooks. A bare
+        # string is sugar for a one-prehook list.
+        raw_prehooks = raw.get("prehooks")
+        if isinstance(raw_prehooks, str):
+            raw_prehooks = [raw_prehooks]
         return FlowBinding(
             name=raw["name"],
             rules=_parse_rules(raw.get("rules")),
             config=dict(raw.get("config", {})),
             posthooks=list(raw_posthooks) if raw_posthooks is not None else None,
+            prehooks=list(raw_prehooks) if raw_prehooks is not None else None,
         )
     raise ValueError(f"Bad flow step: {raw!r}")
 
@@ -562,6 +590,16 @@ def _resolve_jobs(
     single source of truth, replacing a hand-declared ``posthooks: [commit]``.
     A per-binding ``posthooks:`` override still fully replaces the step
     (derivation only touches the no-override base).
+
+    ``resolve_agent`` also drives the ADR-044 Phase 3 ``worktree`` prehook
+    derivation, but with the *inverse* polarity to commit: worktree is the
+    pre-existing universal default for every dispatched step, so it is derived
+    onto every agent/action step EXCEPT the one opt-out — an agent whose
+    ``needs_worktree`` is false (today: only ``chat``). Monitor jobs never
+    created a worktree at dispatch, so they derive none. Deriving worktree
+    opt-in (like commit) would strip it from ``push_pr`` (action),
+    ``resolve_conflicts``, and inline agent steps with no ``agent.yaml`` — a
+    regression. A per-binding ``prehooks:`` override fully replaces the step.
     """
     by_name = {j.name: j for j in jobs}
     binding_names = [b.name for b in bindings]
@@ -616,6 +654,28 @@ def _resolve_jobs(
                 if agent is not None and agent.produces_changes and "commit" not in effective_posthooks:
                     effective_posthooks.append("commit")
 
+        # Per-binding prehooks override the job's default; ``None`` (unset)
+        # falls back to the derived base. Same lookup-then-fallback shape.
+        if binding.prehooks is not None:
+            effective_prehooks = list(binding.prehooks)
+        else:
+            # ADR-044 Phase 3: worktree creation is the pre-existing universal
+            # default for every dispatched step (agent + action). The SOLE
+            # opt-out is an agent step whose agent declares ``needs_worktree:
+            # false`` (today: only ``chat``). Monitor jobs never dispatch a
+            # worktree — they are excluded (and never reach the orchestrator's
+            # prehook site). This is deliberately the INVERSE of the opt-in
+            # commit derivation above (see the method docstring).
+            effective_prehooks = list(job.prehooks)
+            if job.type != "monitor" and "worktree" not in effective_prehooks:
+                opts_out = False
+                if job.type == "agent" and resolve_agent is not None:
+                    agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+                    if agent is not None and not agent.needs_worktree:
+                        opts_out = True
+                if not opts_out:
+                    effective_prehooks.append("worktree")
+
         resolved.append(
             ResolvedJob(
                 name=job.name,
@@ -636,6 +696,7 @@ def _resolve_jobs(
                 output_file=job.output_file,
                 commit=job.commit,
                 posthooks=list(effective_posthooks),
+                prehooks=list(effective_prehooks),
                 commit_prefix=job.commit_prefix,
                 model=job.model,
                 runner=job.runner,
@@ -1149,6 +1210,83 @@ def _validate_posthook_property_consistency(
                     _check(job, b.posthooks, f"Flow {flow_name!r} step {b.name!r}")
 
 
+def _validate_prehook_references(jobs: list[Job], flow_bindings: dict[str, list[FlowBinding]]) -> None:
+    """Raise ``ValueError`` if any job/binding references an unregistered prehook.
+
+    Mirrors ``_validate_posthook_references``: imports ``lotsa.prehooks`` for
+    its self-registration side-effect so direct ``build_process`` callers
+    (tests, custom entry points) see the same built-in registry (``worktree``)
+    the runtime path sees, then checks every referenced prehook name — across
+    both per-job ``prehooks:`` and per-binding ``prehooks:`` overrides — against
+    the registry. An unknown name is unambiguously a typo, so failing here at
+    build time beats failing at dispatch time.
+    """
+    import lotsa.prehooks  # noqa: F401 — import side-effect registers built-ins
+    from lotsa.registry import is_prehook_registered, list_prehooks
+
+    referenced: set[str] = set()
+    for j in jobs:
+        referenced.update(j.prehooks)
+    for bindings in flow_bindings.values():
+        for b in bindings:
+            if b.prehooks:
+                referenced.update(b.prehooks)
+
+    for name in sorted(referenced):
+        if not is_prehook_registered(name):
+            raise ValueError(
+                f"Process references unknown prehook {name!r}. "
+                f"Registered prehooks: {list_prehooks()}. "
+                "Register the prehook via ``lotsa.registry.register_prehook``, "
+                "or check for a typo."
+            )
+
+
+def _validate_prehook_property_consistency(
+    jobs: list[Job],
+    flow_bindings: dict[str, list[FlowBinding]],
+    resolve_agent: Callable[[str], Agent | None],
+) -> None:
+    """Fail loud if a step explicitly declares ``worktree`` on an agent whose
+    catalog property says it needs no worktree (ADR-044 Phase 3).
+
+    ``worktree`` is *derived* from the agent's ``needs_worktree`` property, so an
+    explicit ``worktree`` on a ``needs_worktree: false`` agent (e.g. ``chat``) is
+    drift — the exact contradiction the derivation removes. This guard turns a
+    future re-drift into a build-time error, mirroring
+    ``_validate_posthook_property_consistency``.
+
+    Only the contradiction direction is checked. A ``needs_worktree: true`` agent
+    explicitly listing ``worktree`` is redundant-but-consistent (the derivation
+    union dedups it), and a binding ``prehooks: []`` suppressing the derived
+    worktree is the documented override seam — neither is flagged. Non-agent jobs
+    and prompts with no ``agent.yaml`` are skipped.
+    """
+    by_name = {j.name: j for j in jobs}
+
+    def _check(job: Job, prehooks: list[str], where: str) -> None:
+        if job.type != "agent" or "worktree" not in prehooks:
+            return
+        agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+        if agent is not None and not agent.needs_worktree:
+            raise ValueError(
+                f"{where} explicitly declares the ``worktree`` prehook, but its agent "
+                f"({job.prompt or job.name!r}) has ``needs_worktree: false``. "
+                "worktree is derived from ``needs_worktree`` (ADR-044 Phase 3) — drop the "
+                "explicit prehook, or set ``needs_worktree: true`` in the agent's "
+                "agent.yaml if it genuinely needs a worktree."
+            )
+
+    for j in jobs:
+        _check(j, j.prehooks, f"Job {j.name!r}")
+    for flow_name, bindings in flow_bindings.items():
+        for b in bindings:
+            if b.prehooks:
+                job = by_name.get(b.name)
+                if job is not None:
+                    _check(job, b.prehooks, f"Flow {flow_name!r} step {b.name!r}")
+
+
 def _validate_runner_references(jobs: list[Job]) -> None:
     """Raise ``ValueError`` if any job names an unregistered ``runner:``.
 
@@ -1262,6 +1400,13 @@ def build_process(
     # from the property; an explicit one on a non-producer is drift).
     _validate_posthook_property_consistency(jobs, flow_bindings, registry.load_agent_optional)
 
+    # ADR-044 Phase 3 — validate ``prehooks:`` references (per-job and
+    # per-binding) against the prehook registry, and reject an explicit
+    # ``worktree`` on a ``needs_worktree: false`` agent (worktree is now derived
+    # from the property; an explicit one on an opt-out agent is drift).
+    _validate_prehook_references(jobs, flow_bindings)
+    _validate_prehook_property_consistency(jobs, flow_bindings, registry.load_agent_optional)
+
     # Validate ``runner:`` job references against the runner registry (ADR-028
     # Phase 3) so a mistyped or missing runner name fails at startup, not at
     # dispatch time. The registry is populated by ``start()`` before processes
@@ -1300,6 +1445,7 @@ def build_process(
                 output_file=j.output_file,
                 commit=j.commit,
                 posthooks=list(j.posthooks),
+                prehooks=list(j.prehooks),
                 commit_prefix=j.commit_prefix,
                 model=j.model,
                 runner=j.runner,
@@ -1418,6 +1564,12 @@ def build_process_from_inline(
     # derives/guards ``commit`` just like a bundled process; a step whose
     # prompt has no ``agent.yaml`` resolves to ``None`` and is a no-op.
     _validate_posthook_property_consistency(jobs, {"main": bindings}, registry.load_agent_optional)
+
+    # ADR-044 Phase 3 — same guard for the derived ``worktree`` prehook. Inline
+    # steps carry no explicit ``prehooks:`` (the inline schema doesn't parse
+    # them), so reference validation is unnecessary here; only the property
+    # consistency guard is relevant for a step referencing an opt-out agent.
+    _validate_prehook_property_consistency(jobs, {"main": bindings}, registry.load_agent_optional)
 
     flow = FlowConfig(
         name="main",
