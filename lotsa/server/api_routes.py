@@ -104,6 +104,11 @@ class ProcessSummary(BaseModel):
     # empty/None so processes without them serialise cleanly.
     description: str | None = None
     promotion_inputs: list[PromotionInputResponse] = []
+    # ADR-044 Phase 4 — where the workflow may be selected (``start`` /
+    # ``hand-off``). The new-task picker and the hand-off dialog filter on this
+    # instead of hardcoding the name ``"chat"``. Defaults to both so older
+    # serialised shapes stay valid.
+    invocable: list[str] = ["start", "hand-off"]
 
 
 # Attachment filenames uploaded for this send, stamped onto the message the

@@ -45,10 +45,16 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
   const { data: processes } = useProcesses()
   const [destination, setDestination] = useState<string>('')
 
-  // Don't offer the chat process as a destination — promotion never targets
-  // chat (no demotion; ADR-027 §7).
+  // ADR-044 Phase 4 — offer only workflows that advertise themselves as a
+  // hand-off destination (``invocable`` includes 'hand-off'), driving the
+  // filter off the declared property instead of the hardcoded name 'chat'.
+  // chat is ``invocable: [start]`` so it excludes itself; a payload missing the
+  // field (older server) defaults to offerable, preserving prior behaviour.
   const options = useMemo(
-    () => (processes ?? []).filter((p) => p.name !== 'chat'),
+    () =>
+      (processes ?? []).filter(
+        (p) => p.invocable === undefined || p.invocable.includes('hand-off')
+      ),
     [processes]
   )
 

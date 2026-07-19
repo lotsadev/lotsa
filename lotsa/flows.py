@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import yaml as _yaml
 
-from lotsa.agents import AGENTS_DIR
+from lotsa.agents import AGENT_OUTCOMES, AGENTS_DIR
 from rigg import DispatchRule, StateMachine, TransitionRule
 from rigg.models import Item
 from rigg.prompt_registry import PromptNotFound
@@ -186,7 +186,12 @@ class Job:
         prompt:         prompt file prefix (defaults to ``name``). None = no agent
         resume:         --resume from stored session_id
         evaluate:       human evaluates output before advancing
-        rules:          automatic output-based routing
+        rules:          automatic output-based routing. May be declared directly
+                        (``rules:`` — the escape hatch for file-source / raw-regex
+                        patterns) OR via the ``routes:`` sugar (ADR-044 Phase 4),
+                        a ``{OUTCOME: target}`` map that desugars into
+                        ``^AGENT_RESULT: <OUTCOME>`` stdout rules at parse time.
+                        A step declares one or the other, never both.
         conversational: chat-style step with iterative messages
         output:         artifact name this step produces
         inputs:         artifact names required before dispatch
@@ -372,6 +377,17 @@ class Process:
         promotion_inputs:  artifact inputs the destination's first step reads on
                            promotion; the dashboard renders a form field each.
     Processes that omit them load unchanged (``None`` / empty list).
+
+    ADR-044 Phase 4 — ``invocable`` declares *where* a workflow may be selected,
+    driving the chat de-special-casing (option ii): a declared property replaces
+    the hardcoded ``name == "chat"`` checks. Each entry is one of ``"start"``
+    (offerable at task creation) / ``"hand-off"`` (offerable as a promotion
+    destination). Omitting it defaults to both, so existing processes advertise
+    everywhere unchanged; the bundled ``chat`` declares ``[start]`` only (a
+    Think-phase entry point, never a hand-off target). This gates *advertising*
+    (the picker + the chat agent's suggest-catalog), NOT enforcement — the
+    hard "cannot promote into chat" rule was dropped (an operator may have a
+    reason), amending ADR-027 §7.
     """
 
     name: str
@@ -380,6 +396,7 @@ class Process:
     registry: PromptLoader
     description: str | None = None
     promotion_inputs: list[PromotionInput] = field(default_factory=list)
+    invocable: tuple[str, ...] = ("start", "hand-off")
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +432,25 @@ def _parse_promotion_inputs(raw: Any) -> list[PromotionInput]:
     return inputs
 
 
+def _parse_invocable(raw: Any) -> tuple[str, ...]:
+    """Parse the root-level ``invocable:`` block (ADR-044 Phase 4).
+
+    ``None`` (the field omitted) defaults to both options so existing processes
+    are selectable everywhere unchanged. Otherwise it must be a list whose
+    entries are each ``"start"`` or ``"hand-off"``; anything else fails loudly at
+    build time, matching the field-level validators elsewhere in this module.
+    """
+    if raw is None:
+        return ("start", "hand-off")
+    if not isinstance(raw, list):
+        raise ValueError(f"invocable must be a list, got {type(raw).__name__}")
+    allowed = {"start", "hand-off"}
+    for entry in raw:
+        if entry not in allowed:
+            raise ValueError(f"invocable entry {entry!r} must be one of {sorted(allowed)}")
+    return tuple(raw)
+
+
 def _parse_rules(raw: list[dict] | None) -> list[OutputRule] | None:
     if raw is None:
         return None
@@ -426,6 +462,68 @@ def _parse_rules(raw: list[dict] | None) -> list[OutputRule] | None:
         )
         for r in raw
     ]
+
+
+# ADR-044 Phase 4 — the canonical desugared pattern for an ``AGENT_RESULT:``
+# outcome edge. ``routes: {FAILED: code}`` compiles to
+# ``OutputRule("stdout", "^AGENT_RESULT: FAILED", "code")``; the gate-only
+# derived ``FAILED → blocked`` default (in ``_resolve_jobs``) recognises an
+# already-routed outcome by matching this exact pattern.
+def _agent_result_pattern(outcome: str) -> str:
+    return f"^AGENT_RESULT: {outcome}"
+
+
+def _parse_routes(raw: Any, *, where: str) -> list[OutputRule] | None:
+    """Desugar a ``routes:`` map (outcome → target) into stdout AGENT_RESULT rules.
+
+    ``{PASSED: next, FAILED: code}`` becomes two ``OutputRule``s with the
+    canonical ``^AGENT_RESULT: <OUTCOME>`` stdout patterns, preserving the
+    declared (dict insertion) order. ``None`` (the key omitted) returns ``None``
+    — distinct from ``[]`` — mirroring ``_parse_rules`` so "no routes declared"
+    stays distinguishable from "declared empty". Keys must be in the closed
+    :data:`~lotsa.agents.AGENT_OUTCOMES` vocabulary; an unknown key fails loudly
+    at build time (naming ``where`` and the bad key), never silently dropping a
+    routing edge.
+
+    ``routes:`` is the concise sugar for the common stdout-``AGENT_RESULT`` case
+    (ADR-044 Phase 4 — routing lives on the edge); ``rules:`` remains for the
+    rare file-source / raw-regex case. A step declares one or the other, never
+    both (guarded by the callers).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: 'routes:' must be a mapping of outcome → target, got {type(raw).__name__}")
+    rules: list[OutputRule] = []
+    for outcome, target in raw.items():
+        if outcome not in AGENT_OUTCOMES:
+            raise ValueError(
+                f"{where}: 'routes:' key {outcome!r} is not a valid AGENT_RESULT outcome; "
+                f"allowed: {list(AGENT_OUTCOMES)}"
+            )
+        rules.append(OutputRule(source="stdout", pattern=_agent_result_pattern(outcome), target=str(target)))
+    return rules
+
+
+def _combine_routes_and_rules(
+    routes: list[OutputRule] | None,
+    rules: list[OutputRule] | None,
+    *,
+    where: str,
+) -> list[OutputRule] | None:
+    """Resolve a step's ``routes:`` / ``rules:`` into a single rule list.
+
+    A step declares ``routes:`` OR ``rules:``, not both — the both-declared
+    contradiction fails loudly at build time (the coexistence rule). Returns the
+    desugared routes when present, else the parsed rules (which may itself be
+    ``None`` = "unset", preserving the job-default fallback semantics that
+    ``_resolve_jobs`` / the binding lookup rely on).
+    """
+    if routes is not None and rules is not None:
+        raise ValueError(f"{where}: declare 'routes:' OR 'rules:', not both (routes is the sugar for the common case)")
+    if routes is not None:
+        return routes
+    return rules
 
 
 def _parse_job(jd: dict) -> Job:
@@ -458,7 +556,14 @@ def _parse_job(jd: dict) -> Job:
     if isinstance(raw_prehooks, str):
         raw_prehooks = [raw_prehooks]
 
-    parsed_rules = _parse_rules(jd.get("rules"))
+    # ADR-044 Phase 4 — ``routes:`` is the concise sugar for the common
+    # stdout-``AGENT_RESULT`` routing case; it desugars into the same
+    # ``OutputRule`` list as ``rules:``. A step declares one or the other.
+    parsed_rules = _combine_routes_and_rules(
+        _parse_routes(jd.get("routes"), where=f"Job {jd.get('name')!r}"),
+        _parse_rules(jd.get("rules")),
+        where=f"Job {jd.get('name')!r}",
+    )
 
     return Job(
         name=jd["name"],
@@ -506,9 +611,17 @@ def _parse_flow_step(raw: Any) -> FlowBinding:
         raw_prehooks = raw.get("prehooks")
         if isinstance(raw_prehooks, str):
             raw_prehooks = [raw_prehooks]
+        # ADR-044 Phase 4 — a per-flow binding may override routing with the
+        # ``routes:`` sugar too (same one-or-the-other rule as the job level).
+        # ``None`` still means "use the job's rules" (lookup-then-fallback).
+        binding_rules = _combine_routes_and_rules(
+            _parse_routes(raw.get("routes"), where=f"Flow step {raw['name']!r}"),
+            _parse_rules(raw.get("rules")),
+            where=f"Flow step {raw['name']!r}",
+        )
         return FlowBinding(
             name=raw["name"],
-            rules=_parse_rules(raw.get("rules")),
+            rules=binding_rules,
             config=dict(raw.get("config", {})),
             posthooks=list(raw_posthooks) if raw_posthooks is not None else None,
             prehooks=list(raw_prehooks) if raw_prehooks is not None else None,
@@ -638,6 +751,44 @@ def _resolve_jobs(
             success = next_queue
 
         effective_rules = binding.rules if binding.rules is not None else list(job.rules)
+        # ADR-044 Phase 4 — derived ``FAILED → blocked`` default, scoped to
+        # AUTO-ROUTING GATE steps. A gate that renders a ``FAILED`` verdict with
+        # no rule for it would otherwise auto-advance (the drainer's implicit "no
+        # match → next"), silently passing a failed gate. The ADR default-route
+        # table says ``FAILED → blocked``; fold it in when the resolved agent is
+        # a gate declaring ``FAILED`` and nothing already routes that outcome.
+        # Purely additive: every bundled gate routes ``FAILED`` explicitly, so
+        # this changes no current behaviour — it is a safety net for a future
+        # bare gate. Keyed on the canonical desugared pattern so a raw custom
+        # ``FAILED`` pattern (the ``rules:`` escape hatch) still counts as
+        # routed. Same lookup-then-fallback shape as the commit/worktree
+        # derivations below; a per-binding override fully replaces the step, so
+        # the derivation only touches the effective (already-resolved) set.
+        #
+        # Two exclusions keep the default *additive* — it only completes a
+        # partial marker-routing table, never imposes routing on a step that
+        # opted out of markers:
+        #   * ``evaluate`` gates park for human approval and never auto-route, so
+        #     a derived routing rule is both moot and harmful.
+        #   * a step with NO effective rules opted out of marker routing entirely
+        #     (it auto-advances on any output); leave it alone. Deriving here
+        #     would make the step rule-bearing, so the drainer's "no recognized
+        #     marker → block" guard would flip a previously auto-advancing gate
+        #     to ``blocked`` on non-marker output — a behaviour change, not a
+        #     safety net. The default therefore only fires for a gate that
+        #     already routes at least one outcome (e.g. ``PASSED``) but is
+        #     missing ``FAILED`` — the "forgot a rule" case the ADR guards.
+        if job.type == "agent" and not job.evaluate and effective_rules and resolve_agent is not None:
+            agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+            if agent is not None and agent.is_gate and "FAILED" in agent.outcomes:
+                routed_failed = any(
+                    r.source == "stdout" and r.pattern == _agent_result_pattern("FAILED") for r in effective_rules
+                )
+                if not routed_failed:
+                    effective_rules = [
+                        *effective_rules,
+                        OutputRule(source="stdout", pattern=_agent_result_pattern("FAILED"), target="blocked"),
+                    ]
         # Per-binding posthooks override the job's default; ``None`` (unset)
         # falls back to the job's base. Same lookup-then-fallback shape as rules.
         if binding.posthooks is not None:
@@ -1461,6 +1612,7 @@ def build_process(
         registry=registry,
         description=_raw.get("description"),
         promotion_inputs=_parse_promotion_inputs(_raw.get("promotion_inputs")),
+        invocable=_parse_invocable(_raw.get("invocable")),
     )
 
 
@@ -1590,6 +1742,7 @@ def build_process_from_inline(
         registry=registry,
         description=raw.get("description"),
         promotion_inputs=_parse_promotion_inputs(raw.get("promotion_inputs")),
+        invocable=_parse_invocable(raw.get("invocable")),
     )
 
 

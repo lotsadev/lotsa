@@ -322,30 +322,58 @@ not regenerate.
 
 ### Output rules
 
-Each step can declare `OutputRule`s for automatic routing:
+Each step can declare routing. The concise, preferred form is `routes:`
+(ADR-044 Phase 4) — a `{OUTCOME: target}` map over the closed `AGENT_RESULT:`
+vocabulary that desugars into `OutputRule`s at process-build time:
+
+```yaml
+- name: review
+  prompt: review
+  routes: { PASSED: next, FAILED: code }   # → ^AGENT_RESULT: PASSED / FAILED
+```
+
+`routes:` is the whole "routing lives on the edge" thesis in syntax: each key
+is an outcome, each value a target. It desugars to
+`OutputRule(source="stdout", pattern="^AGENT_RESULT: <OUTCOME>", target=...)`,
+so the drainer / state-machine / validators are untouched. Keys must be in
+`AGENT_OUTCOMES` (`lotsa/agents.py`); an unknown key fails the build.
+
+The verbose `rules:` form remains the escape hatch for the file-artifact
+`source:` and raw-regex patterns:
 
 ```yaml
 - name: test
   prompt: testing
-  resume: true
   rules:
     - source: stdout
       pattern: "FAILED"
       target: code
-    - source: stdout
+    - source: .lotsa/test.md
       pattern: "passed"
       target: next
 ```
 
-Rules are evaluated in order, first-match wins. `target` can be `next`
-(default success), `blocked`, or a sibling job name.
+A step declares **`routes:` OR `rules:`, not both** (build-time error). Rules
+are evaluated in order, first-match wins. `target` can be `next` (default
+success), `blocked`, `needs_input`, or a sibling job name.
+
+**Derived `FAILED → blocked` default (gate steps).** When a *gate* agent
+(`class: gate`) step already routes at least one outcome but omits `FAILED`,
+the build folds in `FAILED → blocked` — the ADR-044 default-route table's
+safety net against a gate silently auto-advancing past a failed verdict. It is
+scoped to *non-evaluate, already-routing* gates: an `evaluate` gate (human-
+approval) and a gate with no rules at all are left untouched (deriving there
+would flip auto-advance to block via the drainer's "no recognized marker →
+block" guard). Purely additive today — every bundled gate routes `FAILED`
+explicitly.
 
 ### Per-flow rule overrides
 
 When the same job appears in two flows with different routing (e.g.
-`review` in `main` vs. `pr_fix`), the `FlowStep` carries per-flow rule
-overrides that take precedence over the job's defaults. Implemented as
-lookup-then-fallback at evaluation time — not a YAML merge at load time.
+`review` in `main` vs. `pr_fix`), the `FlowStep` carries per-flow routing
+overrides (`routes:` or `rules:`) that take precedence over the job's defaults.
+Implemented as lookup-then-fallback at evaluation time — not a YAML merge at
+load time. A binding override fully replaces the job's rules (it does not merge).
 
 ---
 
@@ -928,6 +956,16 @@ rules.
   run `_run_step_prehooks(item, step)` instead of an unconditional `.create()`; a
   prehook failure is **non-fatal** (falls back to the project work_dir, unlike a
   blocking posthook failure), and `get_activity`'s work_dir resolution is aligned
-  so a worktree-less chat step's Activity tab still populates. Phases 4–6
-  (workflow-model cleanup, git-native `.lotsa/` provenance + rails, visual editor)
-  remain proposed. Amends ADR-043/039/014.
+  so a worktree-less chat step's Activity tab still populates. **Phase 4**
+  (partial) ships the `routes:` routing sugar (`{OUTCOME: target}` desugared into
+  `^AGENT_RESULT: <OUTCOME>` `OutputRule`s in `flows.py` — job-level and per-flow
+  binding, `routes:`-XOR-`rules:`, unknown-outcome build error; the bundled
+  `build`/`fix` are migrated behaviour-identically) plus the gate-only derived
+  `FAILED → blocked` default, and the `chat` de-special-casing (option ii): a
+  declared `invocable: [start | hand-off]` workflow property replaces the
+  hardcoded `name == "chat"` checks (the chat-agent suggest-catalog and the
+  frontend hand-off picker filter on `hand-off`; `chat` is `invocable: [start]`).
+  The hard "cannot promote into chat" rule is **dropped** (amends ADR-027 §7 —
+  `invocable` gates advertising, not enforcement). Phase 4's promotion-payload
+  formalization is deferred to its own task; Phases 5–6 (git-native `.lotsa/`
+  provenance + rails, visual editor) remain proposed. Amends ADR-043/039/014/027.

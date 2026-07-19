@@ -36,18 +36,15 @@ jobs:
     queue_state: coding
     active_state: coding
 
+  # ADR-044 Phase 4 — routing declared with the ``routes:`` sugar
+  # (``{OUTCOME: target}``), desugared into ``^AGENT_RESULT: <OUTCOME>`` stdout
+  # rules at build time. Behaviour-identical to the prior verbose ``rules:``.
   - name: review
     type: agent
     prompt: review
     queue_state: reviewing
     active_state: reviewing
-    rules:
-      - source: stdout
-        pattern: "^AGENT_RESULT: PASSED"
-        target: next
-      - source: stdout
-        pattern: "^AGENT_RESULT: FAILED"
-        target: blocked
+    routes: { PASSED: next, FAILED: blocked }
 
   - name: pr-fix
     type: agent
@@ -55,31 +52,15 @@ jobs:
     resume: true
     queue_state: pr-fixing
     active_state: pr-fixing
-    rules:
-      - source: stdout
-        pattern: "^AGENT_RESULT: COMPLETED"
-        target: review
-      - source: stdout
-        pattern: "^AGENT_RESULT: INPUT"
-        target: needs_input
-      - source: stdout
-        pattern: "^AGENT_RESULT: FAILED"
-        target: blocked
-      - source: stdout
-        pattern: "^AGENT_RESULT: SKIPPED"
-        target: wait_for_pr_signal
+    # All four outcomes stay explicit (pr-fix is a worker; INPUT/FAILED are
+    # driven by explicit rules + the drainer's needs_input branch — keep 1:1).
+    routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
 
   - name: verify
     type: agent
     prompt: verify
     conversational: true
-    rules:
-      - source: stdout
-        pattern: "^AGENT_RESULT: PASSED"
-        target: next
-      - source: stdout
-        pattern: "^AGENT_RESULT: FAILED"
-        target: code
+    routes: { PASSED: next, FAILED: code }
 
   - name: pr_summary
     type: agent
@@ -98,10 +79,7 @@ jobs:
     resume: true
     queue_state: resolving_conflicts
     active_state: resolving_conflicts
-    rules:
-      - source: stdout
-        pattern: "^AGENT_RESULT: COMPLETED"
-        target: pr-fix
+    routes: { COMPLETED: pr-fix }
 
   - name: wait_for_pr_signal
     type: monitor
@@ -120,13 +98,7 @@ flows:
       - test
       - code
       - name: review
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: PASSED"
-            target: next
-          - source: stdout
-            pattern: "^AGENT_RESULT: FAILED"
-            target: code
+        routes: { PASSED: next, FAILED: code }
       - verify
       - pr_summary
       - push_pr
@@ -135,30 +107,9 @@ flows:
   pr_fix:
     steps:
       - name: pr-fix
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: COMPLETED"
-            target: review
-          - source: stdout
-            pattern: "^AGENT_RESULT: INPUT"
-            target: needs_input
-          - source: stdout
-            pattern: "^AGENT_RESULT: FAILED"
-            target: blocked
-          - source: stdout
-            pattern: "^AGENT_RESULT: SKIPPED"
-            target: wait_for_pr_signal
+        routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
       - name: resolve_conflicts
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: COMPLETED"
-            target: pr-fix
+        routes: { COMPLETED: pr-fix }
       - name: review
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: PASSED"
-            target: next
-          - source: stdout
-            pattern: "^AGENT_RESULT: FAILED"
-            target: pr-fix
+        routes: { PASSED: next, FAILED: pr-fix }
       - push_pr

@@ -106,6 +106,10 @@ export interface Process {
   step_names: string[]
   description: string | null
   promotion_inputs: PromotionInput[]
+  // ADR-044 Phase 4 — where the workflow may be selected ('start' | 'hand-off').
+  // The hand-off dialog filters destinations on 'hand-off' instead of the name
+  // 'chat'. Optional so older payloads without the field still typecheck.
+  invocable?: string[]
 }
 
 // One entry from GET /api/projects — a registered project (repo) offered on
