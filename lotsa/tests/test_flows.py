@@ -1488,6 +1488,58 @@ def test_worker_step_gets_no_derived_failed_blocked(tmp_path):
     )
 
 
+def test_evaluate_gate_step_gets_no_derived_failed_blocked(tmp_path):
+    """The derived default excludes ``evaluate`` gates (human-approval): they
+    park for the operator and never auto-route, so a folded-in ``FAILED →
+    blocked`` would be both moot and wrong. Guards the ``not job.evaluate``
+    exclusion — without it this gate would gain the derived ``blocked`` rule."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: gated_evaluate\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: review\n"  # bundled gate agent (class: gate, outcomes [PASSED, FAILED])
+        "    evaluate: true\n"
+        "    routes: { PASSED: next }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("gated_evaluate", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    tuples = _rule_tuples(gate.rules)
+    assert ("stdout", "^AGENT_RESULT: PASSED", "next") in tuples
+    assert all(t != "blocked" for (_s, _p, t) in tuples), (
+        f"an evaluate gate must not derive a FAILED→blocked default; got {tuples}"
+    )
+
+
+def test_gate_step_with_no_rules_gets_no_derived_failed_blocked(tmp_path):
+    """The derived default excludes a gate that routes *nothing* — a step with
+    no effective rules opted out of marker routing entirely (it auto-advances on
+    any output). Deriving a lone ``FAILED → blocked`` would make it rule-bearing,
+    flipping the drainer's "no recognized marker → block" guard on non-marker
+    output. Guards the ``effective_rules`` truthiness exclusion — the default
+    only completes a *partial* routing table, never imposes one."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: gated_bare\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: review\n"  # bundled gate agent, but declares no routes/rules
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("gated_bare", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    assert _rule_tuples(gate.rules) == [], (
+        f"a gate with no declared routes/rules must stay unrouted; got {_rule_tuples(gate.rules)}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # ADR-044 Phase 4 — ``invocable`` workflow property (chat de-special-casing)
 #
