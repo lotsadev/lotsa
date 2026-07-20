@@ -473,7 +473,7 @@ async def get_agent_activity(
 
 
 @router.get("/processes")
-async def list_processes(request: Request) -> list[ProcessSummary]:
+async def list_processes(request: Request, project: str | None = None) -> list[ProcessSummary]:
     """List every loaded process — bundled + any defined inline in lotsa.yaml.
 
     Surfaces the catalog the new-task UI picker renders. Each entry carries an
@@ -482,9 +482,13 @@ async def list_processes(request: Request) -> list[ProcessSummary]:
     picker is a real selector: ``POST /api/tasks`` accepts ``process: <name>``
     for ANY loaded process and dispatches it against that process's flow with
     no restart.
+
+    When ``?project=<id>`` is supplied, that project's repo-shipped workflows
+    (ADR-044 Phase 5) are merged in — they are pickable only within their owning
+    project.
     """
     service = _get_service(request)
-    return [ProcessSummary(**s) for s in service.list_processes_summary()]
+    return [ProcessSummary(**s) for s in service.list_processes_summary(project_id=project)]
 
 
 @router.get("/projects")

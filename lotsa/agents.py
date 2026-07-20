@@ -103,6 +103,21 @@ def _parse_agent(name: str, data: dict) -> Agent:
     )
 
 
+def _parse_repo_agent(name: str, data: dict) -> Agent:
+    """Validate + build an :class:`Agent` from a **repo-shipped** ``agent.yaml``
+    (ADR-044 Phase 5).
+
+    Repo agents declare the same schema as bundled ones, so this reuses
+    :func:`_parse_agent` — it is the single seam where a future tightening of
+    the operator-owned property axis (e.g. rejecting a repo that sets
+    ``produces_changes`` without an operator grant) would live. Today repo
+    ``produces_changes`` / ``needs_worktree`` are honoured: they only opt work
+    *into* orchestrator-owned deterministic hooks (commit / worktree), never out
+    of the push/review structure.
+    """
+    return _parse_agent(name, data)
+
+
 def load_agent(name: str, agents_dir: Path | None = None) -> Agent:
     """Load a single agent definition by name from *agents_dir* (default bundled)."""
     base = agents_dir if agents_dir is not None else AGENTS_DIR
@@ -132,6 +147,7 @@ __all__ = [
     "AGENT_OUTCOMES",
     "AGENTS_DIR",
     "Agent",
+    "_parse_repo_agent",
     "load_agent",
     "load_agent_catalog",
 ]

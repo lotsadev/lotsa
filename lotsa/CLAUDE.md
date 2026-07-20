@@ -918,7 +918,7 @@ rules.
   names route to `blocked` on restart (clean break). Supersedes ADR-014's
   catalog; amends ADR-027 (handoff framing), ADR-030 (mark-complete terminal),
   ADR-034 (chat is the entry mode).
-- ADR-044 — Workflows for agents (**Implemented — Phases 1 & 2**). Generic
+- ADR-044 — Workflows for agents (**Implemented — Phases 1, 2, 3, partial 4 & 5**). Generic
   `AGENT_RESULT:` outcome vocabulary (`COMPLETED`/`PASSED`/`FAILED`/`SKIPPED`/
   `INPUT`, with `NEEDS_INPUT:` a retained alias) replaces every bespoke marker;
   routing lives on the flow edge (rules matched against the active step), not the
@@ -967,5 +967,32 @@ rules.
   frontend hand-off picker filter on `hand-off`; `chat` is `invocable: [start]`).
   The hard "cannot promote into chat" rule is **dropped** (amends ADR-027 §7 —
   `invocable` gates advertising, not enforcement). Phase 4's promotion-payload
-  formalization is deferred to its own task; Phases 5–6 (git-native `.lotsa/`
-  provenance + rails, visual editor) remain proposed. Amends ADR-043/039/014/027.
+  formalization is deferred to its own task. **Phase 5** lands git-native
+  `.lotsa/` provenance: a project's repo may ship agents
+  (`<repo>/.lotsa/agents/<name>/`) and workflows
+  (`<repo>/.lotsa/workflows/<name>/process.yaml`), discovered from the **project
+  root** by `lotsa/provenance.py` (project-scoped, build-time — the ADR's
+  "worktree under operation" is narrowed to the project root for v1, deferring
+  branch-sensitivity) with hardened rails (name charset `[a-z0-9_-]{1,64}`,
+  real-dir-only `.lotsa`, `.lotsa`-containment / symlink-escape guard).
+  `AgentPromptRegistry` (`flows.py`) gains a `repo_agents_dir` and is
+  namespace-aware: unqualified names resolve **operator-override → `lotsa:`
+  (bundled) → `repo:` (repo-local)** (repo lowest-trust, shadows neither);
+  `lotsa:`/`repo:` qualifiers bind explicitly. `build_process` takes a
+  `repo_agents_dir`; the orchestrator builds each project's workflows into
+  `self._project_processes` (keyed `project_id → {name → Process}`) after
+  `_sync_projects`, deriving each one's PR-phase plumbing via the extracted
+  `_register_process_plumbing`. Repo workflows are **project-isolated** (a task
+  resolves them via project-aware `_process_name_for`/`_process_for`,
+  `create_task` validation, and `list_processes_summary(project_id=...)`),
+  **fail-soft** (one malformed `process.yaml` is logged + skipped, never aborting
+  `start()`), and **cannot shadow a bundled name** (skipped with a warning).
+  Rails are structural: the operational preamble is always injected, push stays a
+  deterministic orchestrator step, and a repo definition can reference only
+  *bundled* tools/hooks (the existing build validators reject anything else). Repo
+  agent `produces_changes`/`needs_worktree` are honoured — they only opt work
+  *into* orchestrator-owned deterministic hooks; `agents._parse_repo_agent` is
+  the seam for any future operator-owned-property tightening. Deferred:
+  task-scoped/branch-sensitive resolution, build-time review-before-push graph
+  validation, cross-repo sharing (ADR-035). Phase 6 (visual editor) remains
+  proposed. Amends ADR-043/039/014/027.
