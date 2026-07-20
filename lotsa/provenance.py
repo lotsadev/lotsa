@@ -36,6 +36,18 @@ REPO_LOTSA_DIRNAME = ".lotsa"
 _REPO_NAME_RE = re.compile(r"[a-z0-9_-]{1,64}")
 
 
+def is_valid_repo_name(name: str) -> bool:
+    """Return whether *name* is a safe repo agent/workflow name (charset rail).
+
+    The single home for the ``[a-z0-9_-]{1,64}`` rail: both eager discovery
+    (:func:`_discover`) and the lazy, by-name resolution path
+    (``AgentPromptRegistry`` in :mod:`lotsa.flows`) gate on it, so the documented
+    charset rail is enforced wherever repo content is read — not just where a
+    directory is enumerated.
+    """
+    return bool(_REPO_NAME_RE.fullmatch(name))
+
+
 def is_contained(path: Path, root: Path) -> bool:
     """Return whether *path* resolves to *root* or a descendant of it.
 
@@ -83,7 +95,7 @@ def _discover(project_path: Path | str, subdir: str, manifest: str) -> dict[str,
     for child in sorted(base.iterdir()):
         if not child.is_dir():
             continue
-        if not _REPO_NAME_RE.fullmatch(child.name):
+        if not is_valid_repo_name(child.name):
             continue  # rail: name charset
         if not (child / manifest).is_file():
             continue
@@ -114,5 +126,6 @@ __all__ = [
     "discover_repo_agents",
     "discover_repo_workflows",
     "is_contained",
+    "is_valid_repo_name",
     "repo_lotsa_root",
 ]

@@ -83,11 +83,15 @@ class AgentPromptRegistry:
     2. operator override dir, catalog layout ``<agent>/<kind>.md``;
     3. the bundled catalog ``<catalog_dir>/<agent>/<kind>.md``;
     4. the repo catalog ``<repo_agents_dir>/<agent>/<kind>.md`` (dir-layout
-       only; only for unqualified or explicit ``repo:`` names).
+       only; only for unqualified or explicit ``repo:`` names, and only for a
+       name passing the ``[a-z0-9_-]{1,64}`` charset rail —
+       :func:`lotsa.provenance.is_valid_repo_name`).
 
-    Every repo-dir candidate passes the ``.lotsa`` containment guard
-    (:func:`lotsa.provenance.is_contained`) before it is read, so a symlinked
-    ``system.md`` pointing outside the repo tree is never injected.
+    Every repo-dir candidate passes the containment guard (:meth:`_repo_candidate_ok`)
+    before it is read: the ``repo_agents_dir`` root must be a *real directory*
+    (never a symlink) and the candidate must resolve inside it, so neither a
+    symlinked ``agents`` dir nor a symlinked ``system.md`` pointing outside the
+    repo tree is ever injected.
     """
 
     def __init__(
@@ -144,8 +148,12 @@ class AgentPromptRegistry:
             return out
 
         def repo() -> list[tuple[Path, bool]]:
+            from lotsa.provenance import is_valid_repo_name
+
             if self.repo_agents_dir is None or kind is None:
                 return []  # repo catalog is dir-layout only
+            if not is_valid_repo_name(agent):
+                return []  # rail: repo name charset — enforced on the real read path
             return [(self.repo_agents_dir / agent / f"{kind}.md", True)]
 
         if namespace == "lotsa":
@@ -155,10 +163,25 @@ class AgentPromptRegistry:
         return override() + bundled() + repo()
 
     def _repo_candidate_ok(self, candidate: Path) -> bool:
-        """A repo candidate must stay inside the repo ``.lotsa/agents`` tree."""
+        """A repo candidate must stay inside a *verified* repo ``.lotsa/agents`` tree.
+
+        The tree root must be a **real directory, not a symlink**, before the
+        containment check means anything: if ``repo_agents_dir`` is itself a
+        symlink (e.g. ``.lotsa/agents -> ~/.ssh``), both ``candidate`` and the
+        root ``.resolve()`` *through the same symlink prefix*, so
+        :func:`~lotsa.provenance.is_contained` would be tautologically true and a
+        symlinked ``agents`` dir would leak operator content into a prompt.
+        Verifying the root is a real dir first is exactly what
+        :func:`~lotsa.provenance.repo_lotsa_root` does for ``.lotsa`` and
+        :func:`~lotsa.provenance._discover` relies on for workflows — the check
+        must be rooted at a verified directory, never a mutable/unverified one.
+        """
         from lotsa.provenance import is_contained
 
-        return self.repo_agents_dir is not None and is_contained(candidate, self.repo_agents_dir)
+        root = self.repo_agents_dir
+        if root is None or root.is_symlink() or not root.is_dir():
+            return False
+        return is_contained(candidate, root)
 
     def load(self, name: str) -> str:
         if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
@@ -179,10 +202,16 @@ class AgentPromptRegistry:
 
     def _agent_yaml_candidates(self, name: str) -> list[tuple[Path, bool]]:
         """Ordered ``(agent.yaml path, is_repo)`` candidates for agent *name*."""
+        from lotsa.provenance import is_valid_repo_name
+
         namespace, agent = self._split_namespace(name)
 
         def at(root: Path | None, is_repo: bool) -> list[tuple[Path, bool]]:
-            return [] if root is None else [(root / agent / "agent.yaml", is_repo)]
+            if root is None:
+                return []
+            if is_repo and not is_valid_repo_name(agent):
+                return []  # rail: repo name charset — enforced on the real read path
+            return [(root / agent / "agent.yaml", is_repo)]
 
         if namespace == "lotsa":
             return at(self.override_dir, False) + at(self.catalog_dir, False)

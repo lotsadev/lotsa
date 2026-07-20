@@ -224,6 +224,57 @@ class TestNamespacedRegistry:
         assert agent is not None
         assert agent.produces_changes is True
 
+    def test_symlinked_agents_dir_does_not_leak_operator_content(self, tmp_path):
+        """Rail (HIGH): a symlinked ``.lotsa/agents`` dir must NOT defeat the
+        containment guard.
+
+        The guard resolves both ``candidate`` and ``repo_agents_dir``; if the
+        root is itself a symlink pointing outside the repo, both resolve through
+        the same prefix and a naive ``is_contained(candidate, repo_agents_dir)``
+        is tautologically true — leaking e.g. an operator secret laid out as
+        ``system.md``. ``_repo_candidate_ok`` must reject a symlinked root.
+
+        Pre-fix (containment rooted at the unverified ``repo_agents_dir``), the
+        read succeeds and the sentinel leaks — ``reg.load`` returns
+        ``SECRET-OUTSIDE-REPO``; post-fix it raises ``PromptNotFound``.
+        """
+        from lotsa.agents import AGENTS_DIR
+        from lotsa.flows import AgentPromptRegistry, PromptNotFound
+
+        # Operator content that lives OUTSIDE the repo's ``.lotsa`` tree, shaped
+        # like an agent catalog so the symlinked root would resolve it.
+        outside = tmp_path / "operator_secrets"
+        (outside / "mycoder").mkdir(parents=True)
+        (outside / "mycoder" / "system.md").write_text("SECRET-OUTSIDE-REPO\n")
+
+        lotsa_root = tmp_path / "repo" / ".lotsa"
+        lotsa_root.mkdir(parents=True)
+        # ``.lotsa/agents`` is a symlink to the operator-secrets tree.
+        (lotsa_root / "agents").symlink_to(outside, target_is_directory=True)
+
+        reg = AgentPromptRegistry(None, AGENTS_DIR, repo_agents_dir=lotsa_root / "agents")
+        with pytest.raises(PromptNotFound):
+            reg.load("mycoder-system")
+
+    def test_repo_agent_name_must_pass_the_charset_rail(self, tmp_path):
+        """Rail (MEDIUM): the ``[a-z0-9_-]{1,64}`` name charset is enforced on the
+        *real* by-name resolution path, not only in eager discovery.
+
+        A repo agent whose on-disk dir name has an unsafe charset (uppercase)
+        must not resolve through the registry. Pre-fix (no charset gate on the
+        registry path), ``reg.load("BadName-system")`` returns the repo body;
+        post-fix it raises ``PromptNotFound`` and ``load_agent_optional`` is
+        ``None``.
+        """
+        from lotsa.agents import AGENTS_DIR
+        from lotsa.flows import AgentPromptRegistry, PromptNotFound
+
+        _write_repo_agent(tmp_path, "BadName", system_text="UNSAFE-CHARSET-SENTINEL\n")
+        reg = AgentPromptRegistry(None, AGENTS_DIR, repo_agents_dir=_repo_agents_dir(tmp_path))
+        with pytest.raises(PromptNotFound):
+            reg.load("BadName-system")
+        assert reg.load_agent_optional("BadName") is None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # B. build_process with repo definitions (Decision 3 rails + hook derivation)
