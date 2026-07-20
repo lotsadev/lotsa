@@ -12,7 +12,9 @@ Discovery is deliberately conservative:
 * ``discover_repo_agents`` / ``discover_repo_workflows`` return only direct-child
   subdirectories whose names match ``[a-z0-9_-]{1,64}`` (a safe filesystem /
   registry key), that carry the required manifest (``agent.yaml`` /
-  ``process.yaml``), and that do not resolve outside the ``.lotsa`` tree.
+  ``process.yaml``), and where **both the child directory and the manifest file
+  inside it** resolve inside the ``.lotsa`` tree — so a symlinked manifest in an
+  otherwise-real dir can't escape either.
 * ``is_contained`` / ``assert_contained`` are the containment guard every read
   of repo content passes through, so a symlinked ``system.md`` pointing at an
   operator secret never lands in an agent prompt.
@@ -100,7 +102,15 @@ def _discover(project_path: Path | str, subdir: str, manifest: str) -> dict[str,
         if not (child / manifest).is_file():
             continue
         if not is_contained(child, root):
-            continue  # rail: symlink escape
+            continue  # rail: symlink escape (the child directory itself)
+        if not is_contained(child / manifest, root):
+            # rail: symlink escape (the manifest FILE inside a real, contained
+            # dir). A ``process.yaml`` / ``agent.yaml`` symlinked at an
+            # operator secret outside the repo (``.lotsa/workflows/x/process.yaml
+            # -> ~/.ssh/id_rsa``) resolves outside ``.lotsa`` and is rejected
+            # here — otherwise the workflow builder would ``read_text`` it with
+            # no second gate (agents get one via ``_repo_candidate_ok``).
+            continue
         out[child.name] = child
     return out
 

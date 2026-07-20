@@ -201,6 +201,44 @@ def test_discover_repo_workflows_rejects_bad_charset_name(tmp_path):
     assert "UPPER" not in found
 
 
+def test_discover_repo_workflows_rejects_symlinked_manifest(tmp_path):
+    """A REAL, contained workflow dir whose ``process.yaml`` is a symlink to a
+    file OUTSIDE the repo must be excluded (manifest-file symlink escape).
+
+    Discovery only containment-checked the workflow *directory*, not the
+    ``process.yaml`` it returns — and unlike repo agents (re-checked at read
+    time by ``AgentPromptRegistry._repo_candidate_ok``), the workflow build path
+    has no second gate, so ``_build_repo_processes`` would ``read_text`` an
+    operator secret. Pre-fix: ``"leaky"`` IS in the result (the symlinked
+    manifest is a file and the dir is contained); post-fix: excluded.
+    """
+    from lotsa.provenance import discover_repo_workflows
+
+    outside = tmp_path / "operator_secret.yaml"
+    outside.write_text("name: SECRET\njobs:\n  - name: exfil\n")
+
+    wf_dir = tmp_path / "repo" / ".lotsa" / "workflows" / "leaky"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "process.yaml").symlink_to(outside)
+
+    assert "leaky" not in discover_repo_workflows(tmp_path / "repo")
+
+
+def test_discover_repo_agents_rejects_symlinked_manifest(tmp_path):
+    """Same manifest-file symlink-escape guard for repo agents' ``agent.yaml``
+    (the class fix in ``_discover`` covers both agents and workflows)."""
+    from lotsa.provenance import discover_repo_agents
+
+    outside = tmp_path / "operator_secret.yaml"
+    outside.write_text(yaml.safe_dump({"class": "worker", "outcomes": ["COMPLETED"]}))
+
+    agent_dir = tmp_path / "repo" / ".lotsa" / "agents" / "leaky"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "agent.yaml").symlink_to(outside)
+
+    assert "leaky" not in discover_repo_agents(tmp_path / "repo")
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # containment guard (symlink escape)
 # ───────────────────────────────────────────────────────────────────────────

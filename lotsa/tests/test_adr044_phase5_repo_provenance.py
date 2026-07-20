@@ -105,6 +105,35 @@ _MYFLOW_YAML = (
 )
 
 
+def _release_yaml(base_branch: str) -> str:
+    """A repo workflow named ``release`` carrying a pr_monitor whose config is
+    distinguishable per project via ``base_branch`` (for the plumbing-isolation
+    regression). Poll interval is large so the started poller stays asleep for
+    the test's lifetime."""
+    return (
+        "name: release\n"
+        "description: repo release flow\n"
+        "jobs:\n"
+        "  - name: work\n"
+        "    type: agent\n"
+        "    prompt: mycoder\n"
+        "    queue_state: working\n"
+        "    active_state: working\n"
+        "  - name: wait_for_pr_signal\n"
+        "    type: monitor\n"
+        "    engine: pr_monitor\n"
+        "    queue_state: waiting_for_pr\n"
+        "    config:\n"
+        f"      base_branch: {base_branch}\n"
+        "      poll_interval_seconds: 3600\n"
+        "flows:\n"
+        "  main:\n"
+        "    steps:\n"
+        "      - work\n"
+        "      - wait_for_pr_signal\n"
+    )
+
+
 def _alpha_beta_yaml(repo_a: Path, repo_b: Path) -> str:
     return yaml.dump(
         {
@@ -471,6 +500,44 @@ class TestPerProjectRepoCatalog:
             assert "broken" not in catalog  # the bad one was skipped
             # Startup still succeeded — the bundled catalog is intact.
             assert {"chat", "build", "fix"}.issubset(set(svc._processes))
+        finally:
+            _stop(run, svc, db)
+
+    def test_same_named_repo_workflows_have_isolated_monitor_plumbing(self, tmp_path, run):
+        """Two projects shipping an identically-named repo workflow with
+        different monitor configs must NOT overwrite each other's plumbing.
+
+        Pre-fix the four plumbing dicts (``_pr_monitor_configs_by_process`` et
+        al.) are keyed by workflow NAME only, so ``_build_repo_processes``
+        iterating projects registers alpha's ``release`` then beta's ``release``
+        under the same key — beta (synced last) wins for BOTH projects, and
+        ``_pr_monitor_config_for`` returns beta's ``base_branch`` for an alpha
+        task. Post-fix the dicts key by ``(project_id, name)`` so each task
+        resolves its own project's config.
+        """
+        repo_a = _init_git_repo(tmp_path / "repo_a")
+        repo_b = _init_git_repo(tmp_path / "repo_b")
+        _write_repo_agent(repo_a, "mycoder")
+        _write_repo_agent(repo_b, "mycoder")
+        _write_repo_workflow(repo_a, "release", _release_yaml("alpha-base"))
+        _write_repo_workflow(repo_b, "release", _release_yaml("beta-base"))
+        svc, db = _build_and_start(run, tmp_path / "data", _alpha_beta_yaml(repo_a, repo_b))
+        try:
+            # Both projects registered the same workflow name under DISTINCT
+            # plumbing keys (the class-level assertion).
+            assert ("alpha", "release") in svc._pr_monitor_configs_by_process
+            assert ("beta", "release") in svc._pr_monitor_configs_by_process
+
+            task_a = run(svc.create_task("a", process_name="release", project_id="alpha", defer_dispatch=True))
+            task_b = run(svc.create_task("b", process_name="release", project_id="beta", defer_dispatch=True))
+            row_a = run(db.get_task(task_a.id))
+            row_b = run(db.get_task(task_b.id))
+            cfg_a = svc._pr_monitor_config_for(row_a)
+            cfg_b = svc._pr_monitor_config_for(row_b)
+            assert cfg_a is not None and cfg_b is not None
+            # Each task sees ITS OWN project's config, not the last-synced one.
+            assert cfg_a.base_branch == "alpha-base"
+            assert cfg_b.base_branch == "beta-base"
         finally:
             _stop(run, svc, db)
 
