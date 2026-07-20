@@ -28,25 +28,15 @@ jobs:
     queue_state: reviewing
     active_state: reviewing
 
+  # ADR-044 Phase 4 — routing declared with the ``routes:`` sugar; all four
+  # pr-fix outcomes stay explicit (mirrors ``build``).
   - name: pr-fix
     type: agent
     prompt: pr_fix
     resume: true
     queue_state: pr-fixing
     active_state: pr-fixing
-    rules:
-      - source: stdout
-        pattern: "^AGENT_RESULT: COMPLETED"
-        target: review
-      - source: stdout
-        pattern: "^AGENT_RESULT: INPUT"
-        target: needs_input
-      - source: stdout
-        pattern: "^AGENT_RESULT: FAILED"
-        target: blocked
-      - source: stdout
-        pattern: "^AGENT_RESULT: SKIPPED"
-        target: wait_for_pr_signal
+    routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
 
   # ``pr_summary`` references the shared ``pr_summary`` agent in the catalog
   # (``lotsa/prompts/agents/pr_summary/``) via ``AgentPromptRegistry`` (ADR-044)
@@ -73,10 +63,7 @@ jobs:
     resume: true
     queue_state: resolving_conflicts
     active_state: resolving_conflicts
-    rules:
-      - source: stdout
-        pattern: "^AGENT_RESULT: COMPLETED"
-        target: pr-fix
+    routes: { COMPLETED: pr-fix }
 
   - name: wait_for_pr_signal
     type: monitor
@@ -93,13 +80,7 @@ flows:
     steps:
       - code
       - name: review
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: PASSED"
-            target: next
-          - source: stdout
-            pattern: "^AGENT_RESULT: FAILED"
-            target: code
+        routes: { PASSED: next, FAILED: code }
       - pr_summary
       - push_pr
       - wait_for_pr_signal
@@ -107,30 +88,9 @@ flows:
   pr_fix:
     steps:
       - name: pr-fix
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: COMPLETED"
-            target: review
-          - source: stdout
-            pattern: "^AGENT_RESULT: INPUT"
-            target: needs_input
-          - source: stdout
-            pattern: "^AGENT_RESULT: FAILED"
-            target: blocked
-          - source: stdout
-            pattern: "^AGENT_RESULT: SKIPPED"
-            target: wait_for_pr_signal
+        routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
       - name: resolve_conflicts
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: COMPLETED"
-            target: pr-fix
+        routes: { COMPLETED: pr-fix }
       - name: review
-        rules:
-          - source: stdout
-            pattern: "^AGENT_RESULT: PASSED"
-            target: next
-          - source: stdout
-            pattern: "^AGENT_RESULT: FAILED"
-            target: pr-fix
+        routes: { PASSED: next, FAILED: pr-fix }
       - push_pr

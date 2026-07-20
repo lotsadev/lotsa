@@ -1245,3 +1245,359 @@ def test_is_approval_gate():
     assert _gate_job(conversational=False, rules=[nxt]).is_approval_gate is False
     # conversational step whose only rule routes backward → no forward accept
     assert _gate_job(conversational=True, rules=[back]).is_approval_gate is False
+
+
+# ---------------------------------------------------------------------------
+# ADR-044 Phase 4 — ``routes:`` routing sugar
+#
+# ``routes:`` is a concise map from an ``AGENT_RESULT:`` outcome to a target,
+# desugared at process-build time into the existing ``OutputRule`` list so the
+# drainer / state-machine / validators are untouched. These tests fail against
+# pre-Phase-4 code because ``_parse_job`` / ``_parse_flow_step`` ignore an
+# unknown ``routes:`` key entirely: a ``routes:``-only step builds with an empty
+# ``rules`` list, so every "desugared rule present" assertion fails, and every
+# "malformed routes must raise" test fails as DID-NOT-RAISE.
+# ---------------------------------------------------------------------------
+
+
+def _rule_tuples(rules):
+    """Compact (source, pattern, target) view of a step's OutputRules."""
+    return [(r.source, r.pattern, r.target) for r in rules]
+
+
+def test_routes_desugars_to_agent_result_rules(tmp_path):
+    """A job-level ``routes:`` map desugars to ordered stdout AGENT_RESULT rules.
+
+    ``{PASSED: next, FAILED: code}`` → two OutputRules with the canonical
+    ``^AGENT_RESULT: <OUTCOME>`` stdout patterns, in declared order."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: routed\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: analyze\n"  # no agent.yaml → no property derivation interferes
+        "    routes: { PASSED: next, FAILED: code }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("routed", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    assert _rule_tuples(gate.rules) == [
+        ("stdout", "^AGENT_RESULT: PASSED", "next"),
+        ("stdout", "^AGENT_RESULT: FAILED", "code"),
+    ]
+
+
+def test_routes_binding_override_desugars_and_replaces_job_rules(tmp_path):
+    """A per-flow binding ``routes:`` override desugars AND fully replaces the
+    job's default rules (lookup-then-fallback parity with ``rules:``)."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: routed_binding\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: analyze\n"
+        "    routes: { PASSED: next }\n"  # job default
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main:\n"
+        "    steps:\n"
+        "      - name: gate\n"
+        "        routes: { FAILED: code }\n"  # binding override REPLACES the job default
+        "      - code\n"
+    )
+    main = build_process("routed_binding", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    # The override replaces (not merges): only FAILED→code survives, PASSED→next
+    # from the job default is gone.
+    assert _rule_tuples(gate.rules) == [("stdout", "^AGENT_RESULT: FAILED", "code")]
+
+
+def test_routes_and_rules_on_same_job_raises(tmp_path):
+    """A step may declare ``routes:`` OR ``rules:``, not both (build error)."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: both\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: analyze\n"
+        "    routes: { PASSED: next }\n"
+        "    rules:\n"
+        "      - { source: stdout, pattern: 'X', target: next }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    with pytest.raises(ValueError, match="(?i)routes.*rules|rules.*routes"):
+        build_process("both", process_file=process_file)
+
+
+def test_routes_and_rules_on_same_binding_raises(tmp_path):
+    """The both-declared guard also fires on a per-flow binding override."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: both_binding\n"
+        "jobs:\n"
+        "  - { name: gate, type: agent, prompt: analyze }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main:\n"
+        "    steps:\n"
+        "      - name: gate\n"
+        "        routes: { PASSED: next }\n"
+        "        rules:\n"
+        "          - { source: stdout, pattern: 'X', target: next }\n"
+        "      - code\n"
+    )
+    with pytest.raises(ValueError, match="(?i)routes.*rules|rules.*routes"):
+        build_process("both_binding", process_file=process_file)
+
+
+def test_routes_unknown_outcome_key_raises(tmp_path):
+    """A ``routes:`` key outside the closed AGENT_OUTCOMES vocabulary is a
+    build-time error naming the bad key."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: badkey\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: analyze\n"
+        "    routes: { NOPE: next }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    with pytest.raises(ValueError, match="NOPE"):
+        build_process("badkey", process_file=process_file)
+
+
+def test_routes_desugars_identically_to_equivalent_rules(tmp_path):
+    """Golden equivalence: a step written with ``routes:`` produces the exact
+    same resolved rules AND state-machine transitions as the same step written
+    with the verbose ``rules:`` form. Uses a non-catalog prompt so no
+    property-derived rule (the gate FAILED→blocked default) interferes."""
+    old_file = tmp_path / "old.yaml"
+    old_file.write_text(
+        "process: oldform\n"
+        "jobs:\n"
+        "  - name: a\n"
+        "    type: agent\n"
+        "    prompt: analyze\n"
+        "    rules:\n"
+        "      - { source: stdout, pattern: '^AGENT_RESULT: COMPLETED', target: b }\n"
+        "  - { name: b, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [a, b] }\n"
+    )
+    new_file = tmp_path / "new.yaml"
+    new_file.write_text(
+        "process: newform\n"
+        "jobs:\n"
+        "  - name: a\n"
+        "    type: agent\n"
+        "    prompt: analyze\n"
+        "    routes: { COMPLETED: b }\n"
+        "  - { name: b, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [a, b] }\n"
+    )
+    old_main = build_process("oldform", process_file=old_file).flows["main"]
+    new_main = build_process("newform", process_file=new_file).flows["main"]
+
+    old_a = next(rj for rj in old_main.jobs if rj.name == "a")
+    new_a = next(rj for rj in new_main.jobs if rj.name == "a")
+    assert _rule_tuples(new_a.rules) == _rule_tuples(old_a.rules)
+    assert new_main.state_machine.transitions == old_main.state_machine.transitions
+
+
+def test_gate_step_derives_failed_blocked_when_unrouted(tmp_path):
+    """A gate step (agent ``class: gate``) that routes no ``FAILED`` gains the
+    derived ``FAILED → blocked`` default (ADR-044 default-route table).
+
+    ``review`` is the bundled gate agent — resolved via the catalog, so the
+    build-time derivation fires."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: gated\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: review\n"  # bundled gate agent (class: gate, outcomes [PASSED, FAILED])
+        "    routes: { PASSED: next }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("gated", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    tuples = _rule_tuples(gate.rules)
+    assert ("stdout", "^AGENT_RESULT: PASSED", "next") in tuples
+    assert ("stdout", "^AGENT_RESULT: FAILED", "blocked") in tuples
+
+
+def test_gate_step_derived_default_absent_when_failed_overridden(tmp_path):
+    """The derived ``FAILED → blocked`` is a safety net only — an explicit
+    ``FAILED`` route wins and no ``blocked`` rule is folded in."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: gated_override\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: review\n"
+        "    routes: { PASSED: next, FAILED: code }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("gated_override", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    tuples = _rule_tuples(gate.rules)
+    assert ("stdout", "^AGENT_RESULT: FAILED", "code") in tuples
+    assert all(t != "blocked" for (_s, _p, t) in tuples), (
+        f"an explicitly-routed gate must not also derive FAILED→blocked; got {tuples}"
+    )
+
+
+def test_worker_step_gets_no_derived_failed_blocked(tmp_path):
+    """The derived default is scoped to gates — a worker step (``class:
+    worker``) that routes only ``COMPLETED`` gets no ``FAILED → blocked``."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: worker_routed\n"
+        "jobs:\n"
+        "  - name: work\n"
+        "    type: agent\n"
+        "    prompt: coding\n"  # bundled worker agent (class: worker)
+        "    routes: { COMPLETED: next }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [work, code] }\n"
+    )
+    main = build_process("worker_routed", process_file=process_file).flows["main"]
+    work = next(rj for rj in main.jobs if rj.name == "work")
+    tuples = _rule_tuples(work.rules)
+    assert ("stdout", "^AGENT_RESULT: COMPLETED", "next") in tuples
+    assert all(t != "blocked" for (_s, _p, t) in tuples), (
+        f"a worker must not derive a FAILED→blocked default; got {tuples}"
+    )
+
+
+def test_evaluate_gate_step_gets_no_derived_failed_blocked(tmp_path):
+    """The derived default excludes ``evaluate`` gates (human-approval): they
+    park for the operator and never auto-route, so a folded-in ``FAILED →
+    blocked`` would be both moot and wrong. Guards the ``not job.evaluate``
+    exclusion — without it this gate would gain the derived ``blocked`` rule."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: gated_evaluate\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: review\n"  # bundled gate agent (class: gate, outcomes [PASSED, FAILED])
+        "    evaluate: true\n"
+        "    routes: { PASSED: next }\n"
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("gated_evaluate", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    tuples = _rule_tuples(gate.rules)
+    assert ("stdout", "^AGENT_RESULT: PASSED", "next") in tuples
+    assert all(t != "blocked" for (_s, _p, t) in tuples), (
+        f"an evaluate gate must not derive a FAILED→blocked default; got {tuples}"
+    )
+
+
+def test_gate_step_with_no_rules_gets_no_derived_failed_blocked(tmp_path):
+    """The derived default excludes a gate that routes *nothing* — a step with
+    no effective rules opted out of marker routing entirely (it auto-advances on
+    any output). Deriving a lone ``FAILED → blocked`` would make it rule-bearing,
+    flipping the drainer's "no recognized marker → block" guard on non-marker
+    output. Guards the ``effective_rules`` truthiness exclusion — the default
+    only completes a *partial* routing table, never imposes one."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        "process: gated_bare\n"
+        "jobs:\n"
+        "  - name: gate\n"
+        "    type: agent\n"
+        "    prompt: review\n"  # bundled gate agent, but declares no routes/rules
+        "  - { name: code, type: agent, prompt: implement }\n"
+        "flows:\n"
+        "  main: { steps: [gate, code] }\n"
+    )
+    main = build_process("gated_bare", process_file=process_file).flows["main"]
+    gate = next(rj for rj in main.jobs if rj.name == "gate")
+    assert _rule_tuples(gate.rules) == [], (
+        f"a gate with no declared routes/rules must stay unrouted; got {_rule_tuples(gate.rules)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADR-044 Phase 4 — ``invocable`` workflow property (chat de-special-casing)
+#
+# ``invocable: [start, hand-off]`` declares whether a workflow is selectable at
+# task start and/or offered as a promotion (hand-off) destination. ``chat``
+# declares ``[start]`` (Think phase: never a hand-off target). These tests fail
+# pre-Phase-4 because ``Process`` has no ``invocable`` attribute (AttributeError)
+# and the bundled ``chat`` process.yaml doesn't declare it; the malformed-value
+# test fails as DID-NOT-RAISE (an unknown ``invocable:`` key is ignored today).
+# ---------------------------------------------------------------------------
+
+
+def test_invocable_defaults_to_start_and_handoff(tmp_path):
+    """A process that omits ``invocable:`` defaults to selectable everywhere —
+    backward-compatible for existing processes."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        yaml.dump(
+            {
+                "process": "plainflow",
+                "jobs": [{"name": "code", "type": "agent", "prompt": "code"}],
+                "flows": {"main": {"steps": ["code"]}},
+            }
+        )
+    )
+    _write_min_prompts(tmp_path / "prompts", ["code"])
+    process = build_process("plainflow", prompts_dir=tmp_path / "prompts", process_file=process_file)
+    assert set(process.invocable) == {"start", "hand-off"}
+
+
+def test_chat_process_declares_invocable_start_only():
+    """The bundled ``chat`` workflow is a Think-phase entry point: selectable at
+    start, but never a hand-off (promotion) destination."""
+    process = build_process("chat")
+    assert "start" in process.invocable
+    assert "hand-off" not in process.invocable
+
+
+def test_build_process_declares_invocable_handoff():
+    """The bundled Execute workflows advertise themselves as hand-off targets."""
+    process = build_process("build")
+    assert "hand-off" in process.invocable
+    assert "start" in process.invocable
+
+
+def test_invocable_rejects_unknown_option(tmp_path):
+    """An ``invocable:`` entry outside {start, hand-off} is a build-time error."""
+    process_file = tmp_path / "p.yaml"
+    process_file.write_text(
+        yaml.dump(
+            {
+                "process": "badinvocable",
+                "invocable": ["bogus"],
+                "jobs": [{"name": "code", "type": "agent", "prompt": "code"}],
+                "flows": {"main": {"steps": ["code"]}},
+            }
+        )
+    )
+    _write_min_prompts(tmp_path / "prompts", ["code"])
+    with pytest.raises(ValueError):
+        build_process("badinvocable", prompts_dir=tmp_path / "prompts", process_file=process_file)

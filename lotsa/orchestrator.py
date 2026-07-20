@@ -1289,6 +1289,9 @@ class OrchestratorService:
           ``default: true``. Note that ``is_active`` and ``is_default`` can
           diverge — ``--flow``/``--process`` at startup can pick a non-default.
         - ``step_names``: the ordered job names of the process's main flow.
+        - ``invocable``: ADR-044 Phase 4 — the ``start`` / ``hand-off`` options
+          the frontend picker (start) and hand-off dialog (hand-off) filter on
+          instead of hardcoding the name ``"chat"``.
 
         Ordering is stable: the active entry first, then alphabetical. This
         means the new-task dropdown's first item is the default selection
@@ -1316,6 +1319,10 @@ class OrchestratorService:
                     "promotion_inputs": [
                         {"name": pi.name, "description": pi.description} for pi in process.promotion_inputs
                     ],
+                    # ADR-044 Phase 4 — the ``invocable`` property (start /
+                    # hand-off) so the new-task picker and the hand-off dialog
+                    # filter on it instead of hardcoding the name ``"chat"``.
+                    "invocable": list(process.invocable),
                 }
             )
         summaries.sort(key=lambda s: (not s["is_active"], s["name"]))
@@ -1887,23 +1894,16 @@ class OrchestratorService:
         row = await self.db.get_task(task_id)
         if row is None:
             raise PromoteNotAllowed(f"Task {task_id} not found")
-        # ADR-027 §7 — no demotion. Promotion flows OUT of ``chat`` into a
-        # concrete process; a task is never promoted back INTO ``chat`` (it
-        # would muddy what the task represents). The dashboard filters ``chat``
-        # from the destination picker, but the CLI / raw API must enforce it
-        # server-side too — otherwise ``lotsa promote <id> chat`` slips through.
-        if to_process == "chat":
-            raise PromoteNotAllowed(
-                "Cannot promote to the chat process (ADR-027 §7): promotion "
-                "flows out of chat, not into it. For a fresh conversation on "
-                "related work, create a new task."
-            )
+        # ADR-044 Phase 4 (amends ADR-027 §7) — the hard "cannot promote INTO
+        # chat" rule is dropped: an operator may have a reason, so promotion is
+        # no longer name-blocked here. The ``invocable`` workflow property gates
+        # *advertising* only (the chat agent's suggest-catalog and the frontend
+        # hand-off picker filter on ``"hand-off"``, so chat — ``invocable:
+        # [start]`` — never advertises itself), not enforcement. A raw
+        # ``lotsa promote <id> chat`` therefore now proceeds like any other
+        # loaded destination, so every loaded process is listed as available.
         if to_process not in self._processes:
-            # Exclude ``chat`` from the suggested destinations: it is loaded
-            # like any other process but is never a valid promotion target (the
-            # no-demotion guard above rejects it). Listing it here would invite
-            # the operator to retry into a second confusing rejection.
-            available = sorted(p for p in self._processes if p != "chat")
+            available = sorted(self._processes)
             raise PromoteNotAllowed(
                 f"Unknown process {to_process!r}. Available: {available}. "
                 f"Promotion destinations must be loaded (active process or a "
@@ -2037,12 +2037,16 @@ class OrchestratorService:
 
         Data-driven, not a hardcoded taxonomy: each loaded process that carries
         a ``description`` contributes one line. Processes without a description
-        are skipped (they opt out of triage), and the ``chat`` process excludes
-        itself — the chat agent never suggests promoting to chat.
+        are skipped (they opt out of triage), and — ADR-044 Phase 4 — a process
+        that is not ``hand-off``-invocable excludes itself. This drives the
+        exclusion off the declared ``invocable`` property rather than the literal
+        name ``"chat"``: chat (``invocable: [start]``) has no ``hand-off``, so it
+        never suggests promoting to itself, and the same rule generalises to any
+        Think-phase / non-promotable workflow.
         """
         lines: list[str] = []
         for name, process in self._processes.items():
-            if name == "chat" or not process.description:
+            if "hand-off" not in process.invocable or not process.description:
                 continue
             desc = " ".join(process.description.split())
             lines.append(f"- {name}: {desc}")

@@ -145,8 +145,23 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    prehook failure is non-fatal (falls back to the project work_dir, preserving
    the pre-Phase-3 best-effort behaviour). Activity-tab work_dir resolution is
    aligned so a worktree-less chat step's session log is still read.
-4. **Workflow-model cleanup** — chat as a single-agent workflow; formalize the
-   promotion payload (recommended-workflow + spec); optional `edges:` sugar.
+4. **Workflow-model cleanup** (**Partially implemented**) — two of three
+   sub-parts shipped. (a) The routing sugar, renamed `edges:` → **`routes:`**
+   (the name says what it is — a `{OUTCOME: target}` map): `flows.py` desugars it
+   into `^AGENT_RESULT: <OUTCOME>` `OutputRule`s at build time (job-level and
+   per-flow binding, `routes:`-XOR-`rules:`, unknown-outcome build error), so the
+   drainer / state-machine / validators are untouched; the bundled `build`/`fix`
+   are migrated behaviour-identically, and a gate-only derived `FAILED → blocked`
+   default (non-evaluate, already-routing gates) completes the ADR default-route
+   table. (b) "chat as a single-agent workflow" cleanup (option ii): a declared
+   `invocable: [start | hand-off]` workflow property replaces the hardcoded
+   `name == "chat"` checks — the chat-agent suggest-catalog and the frontend
+   hand-off picker filter on `hand-off`, and `chat` (`invocable: [start]`) never
+   self-refers; the hard "cannot promote into chat" rule is **dropped**
+   (`invocable` gates advertising, not enforcement — amends §"Two connection
+   levels"/ADR-027 §7). (c) Formalizing the promotion payload
+   (recommended-workflow + distilled spec) is **deferred** to its own task —
+   today's prose recommendation + hand-off button stay.
 5. **In-repo agents *and* workflows** — git-native `.lotsa/` discovery +
    namespaces + rails (one mechanism serves both).
 6. **(Post-launch)** — visual graph editor.
