@@ -1094,6 +1094,165 @@ def check_conversational_rules(step: ResolvedJob, stdout: str) -> str | None:
     return None
 
 
+# ADR-044 Phase 6 — synthetic terminal targets. ``routes:`` may point an
+# outcome at a non-step sink (``blocked``/``needs_input``) or the ``next``-on-
+# last-step ``complete`` state; the graph materializes each referenced one as a
+# node so the read-only canvas can draw the edge to it.
+_TERMINAL_TARGETS: tuple[str, ...] = ("complete", "blocked", "needs_input")
+
+
+def _outcome_from_pattern(pattern: str) -> str | None:
+    """Reverse :func:`_agent_result_pattern` — the outcome word, or ``None``.
+
+    A ``routes:`` edge compiles to ``^AGENT_RESULT: <OUTCOME>``; the graph
+    serializer reads the outcome back off the pattern for its edge label. A raw
+    ``rules:`` pattern (file source / custom regex) has no outcome — return
+    ``None`` and let the caller fall back to the raw pattern as a label.
+    """
+    prefix = "^AGENT_RESULT: "
+    if pattern.startswith(prefix):
+        return pattern[len(prefix) :].strip() or None
+    return None
+
+
+def _default_success_outcome(agent: Agent | None) -> str | None:
+    """The outcome a step emits on its implicit forward (success) edge.
+
+    A gate advances on ``PASSED``; a worker on ``COMPLETED``. Non-agent steps
+    (action/monitor) have no agent, so no outcome word — return ``None``.
+    """
+    if agent is None:
+        return None
+    return "PASSED" if agent.agent_class == "gate" else "COMPLETED"
+
+
+def serialize_process_graph(process: Process) -> dict[str, Any]:
+    """Serialize a *resolved* ``Process`` into a read-only graph payload (ADR-044 Phase 6).
+
+    Source-agnostic by construction — it reads only the built ``Process`` (jobs,
+    flows, registry), so a bundled, inline, or repo-shipped (Phase 5) workflow
+    all render through this one path, and a future DB-sourced workflow would too.
+    Returns a plain dict (the service/HTTP layer wraps it in Pydantic), mirroring
+    :meth:`OrchestratorService.list_processes_summary`'s "domain layer stays
+    HTTP-agnostic" convention.
+
+    Shape::
+
+        {"flows": [{"name", "nodes": [...], "edges": [...]}, ...]}
+
+    One entry per flow (``build``/``fix`` ship ``main`` + ``pr_fix``) because a
+    job shared across flows (``review``, ``pr-fix``, ``push_pr``) routes
+    differently per flow — merging would produce ambiguous edges. Each flow's
+    edges are resolved from the *per-binding effective rules* (binding override
+    then job default — mirroring ``_resolve_jobs``/``evaluate`` at runtime).
+    """
+    return {"flows": [_serialize_flow(process, flow) for flow in process.flows.values()]}
+
+
+def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
+    steps = flow.steps  # ResolvedJobs in flow (binding) order
+    order = [s.name for s in steps]
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    node_ids: set[str] = set(order)
+    referenced_terminals: list[str] = []
+
+    def _resolve_target(target: str, idx: int) -> str:
+        if target == "next":
+            return order[idx + 1] if idx + 1 < len(order) else "complete"
+        return target
+
+    for idx, job in enumerate(steps):
+        binding = flow.binding_for(job.name)
+        agent = process.registry.load_agent_optional(job.prompt_name) if job.type == "agent" else None
+
+        prehooks = binding.prehooks if binding and binding.prehooks is not None else list(job.prehooks)
+        posthooks = binding.posthooks if binding and binding.posthooks is not None else list(job.posthooks)
+
+        nodes.append(
+            {
+                "id": job.name,
+                "type": job.type,
+                "prompt_name": job.prompt_name if job.type == "agent" else None,
+                "agent": (
+                    {
+                        "name": agent.name,
+                        "agent_class": agent.agent_class,
+                        "outcomes": list(agent.outcomes),
+                        "needs_worktree": agent.needs_worktree,
+                        "produces_changes": agent.produces_changes,
+                    }
+                    if agent is not None
+                    else None
+                ),
+                "is_gate": agent is not None and agent.agent_class == "gate",
+                "conversational": job.conversational,
+                "evaluate": job.evaluate,
+                "output": job.output,
+                "inputs": list(job.inputs),
+                "prehooks": list(prehooks),
+                "posthooks": list(posthooks),
+            }
+        )
+
+        # Effective routing for THIS flow (binding override wins, else job's).
+        effective_rules = binding.rules if binding and binding.rules is not None else list(job.rules)
+        routes_next = False
+        for rule in effective_rules:
+            target = _resolve_target(rule.target, idx)
+            outcome = _outcome_from_pattern(rule.pattern)
+            edges.append(
+                {
+                    "source": job.name,
+                    "target": target,
+                    "outcome": outcome,
+                    "kind": "route",
+                    "label": None if outcome is not None else rule.pattern,
+                }
+            )
+            if rule.target == "next":
+                routes_next = True
+            if target in _TERMINAL_TARGETS and target not in node_ids:
+                referenced_terminals.append(target)
+
+        # Implicit forward (success) edge: an unmatched marker falls through to
+        # the next step at runtime. Draw it so the happy path is visible —
+        # unless the step already routes ``next`` explicitly, is the last step,
+        # or is a monitor (which exits the flow via an external engine, e.g.
+        # pr_monitor dispatching pr_fix — not a sequential advance).
+        if not routes_next and idx + 1 < len(order) and job.type != "monitor":
+            edges.append(
+                {
+                    "source": job.name,
+                    "target": order[idx + 1],
+                    "outcome": _default_success_outcome(agent),
+                    "kind": "implicit",
+                    "label": None,
+                }
+            )
+
+    # Materialize any referenced terminal sink as a node (dedup, stable order).
+    for terminal in dict.fromkeys(referenced_terminals):
+        nodes.append(
+            {
+                "id": terminal,
+                "type": "terminal",
+                "prompt_name": None,
+                "agent": None,
+                "is_gate": False,
+                "conversational": False,
+                "evaluate": False,
+                "output": None,
+                "inputs": [],
+                "prehooks": [],
+                "posthooks": [],
+            }
+        )
+
+    return {"name": flow.name, "nodes": nodes, "edges": edges}
+
+
 def evaluate_output_rules(
     rules: list[OutputRule],
     result: AgentResult,

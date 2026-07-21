@@ -8,6 +8,8 @@ import type {
   Project,
   AgentActivity,
   Attachment,
+  WorkflowGraph,
+  AgentDetail,
 } from './types'
 
 export const fetchTasks = () => apiFetch<TaskSummary[]>('/api/tasks')
@@ -38,9 +40,29 @@ export const fetchDiff = (taskId: string) =>
 
 export const fetchFlow = () => apiFetch<Flow>('/api/flow')
 
-export const fetchProcesses = () => apiFetch<Process[]>('/api/processes')
+// When `project` is given, that project's repo-shipped workflows (ADR-044
+// Phase 5) are merged in and every entry carries its provenance `source`.
+export const fetchProcesses = (project?: string) =>
+  apiFetch<Process[]>(project ? `/api/processes?project=${encodeURIComponent(project)}` : '/api/processes')
 
 export const fetchProjects = () => apiFetch<Project[]>('/api/projects')
+
+// ADR-044 Phase 6 — a workflow's read-only agent graph. Project-scoped so a
+// repo workflow resolves (and is tagged source: 'repo').
+export const fetchWorkflowGraph = (name: string, project?: string) =>
+  apiFetch<WorkflowGraph>(
+    project
+      ? `/api/workflows/${encodeURIComponent(name)}/graph?project=${encodeURIComponent(project)}`
+      : `/api/workflows/${encodeURIComponent(name)}/graph`,
+  )
+
+// One agent's declared properties + prompt bodies — the node-detail inspector.
+export const fetchAgentDetail = (workflow: string, promptName: string, project?: string) =>
+  apiFetch<AgentDetail>(
+    project
+      ? `/api/workflows/${encodeURIComponent(workflow)}/agents/${encodeURIComponent(promptName)}?project=${encodeURIComponent(project)}`
+      : `/api/workflows/${encodeURIComponent(workflow)}/agents/${encodeURIComponent(promptName)}`,
+  )
 
 export const createTask = (data: {
   message?: string

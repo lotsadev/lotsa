@@ -142,3 +142,22 @@
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
 }
+
+/* ADR-044 Phase 6 — workflow graph edge styling. Token-based (ADR-012): a
+   declared route uses the border tone, an implicit fall-through edge is muted +
+   dashed, and a FAILED verdict edge takes the destructive accent. */
+.react-flow__edge.wf-edge-route .react-flow__edge-path {
+  stroke: hsl(var(--border));
+}
+.react-flow__edge.wf-edge-implicit .react-flow__edge-path {
+  stroke: hsl(var(--muted-foreground));
+  stroke-dasharray: 4 3;
+  opacity: 0.7;
+}
+.react-flow__edge.wf-edge-failed .react-flow__edge-path {
+  stroke: hsl(var(--destructive));
+}
+.react-flow__edge .react-flow__edge-text {
+  fill: hsl(var(--muted-foreground));
+  font-size: 10px;
+}

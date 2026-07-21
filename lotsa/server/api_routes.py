@@ -38,10 +38,12 @@ from lotsa.orchestrator import (
     RetryNotAllowed,
     ReviseNotAllowed,
     StopNotAllowed,
+    WorkflowNotFound,
 )
 from lotsa.server.schemas import (
     AgentActivityEventResponse,
     AgentActivityResponse,
+    AgentDetailResponse,
     AttachmentResponse,
     AvailableOverride,
     DiffResponse,
@@ -52,6 +54,7 @@ from lotsa.server.schemas import (
     TaskDetailResponse,
     TaskSummaryResponse,
     TotalsResponse,
+    WorkflowGraphResponse,
 )
 
 router = APIRouter(prefix="/api")
@@ -109,6 +112,11 @@ class ProcessSummary(BaseModel):
     # instead of hardcoding the name ``"chat"``. Defaults to both so older
     # serialised shapes stay valid.
     invocable: list[str] = ["start", "hand-off"]
+    # ADR-044 Phase 6 — provenance for the workflow viewer badge. ``bundled``
+    # (in-wheel / inline) vs ``repo`` (a project's ``.lotsa/workflows``); repo
+    # entries carry their owning ``project``. Defaulted so older shapes stay valid.
+    source: str = "bundled"
+    project: str | None = None
 
 
 # Attachment filenames uploaded for this send, stamped onto the message the
@@ -524,6 +532,39 @@ async def get_flow(request: Request) -> FlowResponse:
         ],
         gate_states=list(flow.gate_states),
     )
+
+
+@router.get("/workflows/{name}/graph")
+async def get_workflow_graph(request: Request, name: str, project: str | None = None) -> WorkflowGraphResponse:
+    """Serialize a workflow's read-only agent graph (ADR-044 Phase 6).
+
+    Source-agnostic: bundled / inline / repo-shipped (Phase 5) workflows all
+    render through one path. ``?project=<id>`` scopes the lookup so a project's
+    repo workflows are resolvable (and tagged ``source: "repo"``). An unknown
+    workflow is a 404 ``WORKFLOW_NOT_FOUND``.
+    """
+    service = _get_service(request)
+    try:
+        return WorkflowGraphResponse(**service.workflow_graph(name, project_id=project))
+    except WorkflowNotFound as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc), "code": "WORKFLOW_NOT_FOUND"}) from None
+
+
+@router.get("/workflows/{name}/agents/{prompt_name}")
+async def get_workflow_agent(
+    request: Request, name: str, prompt_name: str, project: str | None = None
+) -> AgentDetailResponse:
+    """One agent's declared properties + prompt bodies (ADR-044 Phase 6).
+
+    Feeds the viewer's node-detail inspector. Resolved through the workflow's own
+    registry so a repo-shipped agent resolves like its workflow does. An unknown
+    workflow or unresolvable agent is a 404 ``WORKFLOW_NOT_FOUND``.
+    """
+    service = _get_service(request)
+    try:
+        return AgentDetailResponse(**service.agent_detail(name, prompt_name, project_id=project))
+    except WorkflowNotFound as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc), "code": "WORKFLOW_NOT_FOUND"}) from None
 
 
 # ── POST endpoints ────────────────────────────────────────────────
