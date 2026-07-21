@@ -1,6 +1,6 @@
 # ADR-044 — Workflows for agents
 
-**Status:** Implemented (Phases 1, 2, 3 & 5; Phase 4 partial) — Phase 6 Proposed
+**Status:** Implemented (Phases 1, 2, 3, 5 & 6-viewer; Phase 4 partial) — Phase 6 editor deferred
 
 **Scope:** CE (with a shared-catalog concept that later reaches `rigg`)
 
@@ -185,7 +185,34 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    sensitive resolution, build-time review-before-push graph validation (the
    `_parse_repo_agent` seam is where a future operator-owned-property tightening
    would land), cross-repo sharing (stays ADR-035), and the acknowledgment gate.
-6. **(Post-launch)** — visual graph editor.
+6. **Visual graph viewer** (**Implemented — viewer; editor deferred**) — a
+   read-only React Flow (`@xyflow/react`) + Dagre (`@dagrejs/dagre`) visualization
+   of a workflow's agent graph, architected as the substrate for a later editor
+   (viewer→editor is a props flip on `<ReactFlow>`, not a rewrite). The substance
+   is backend: `flows.serialize_process_graph(process)` serializes a *resolved*
+   `Process` into per-flow nodes (jobs → resolved agent + `class`/`outcomes`/
+   hooks) and edges (the desugared `routes:`/`rules:` targets resolved against the
+   *per-flow binding*, an implicit forward edge for the happy path, and
+   materialized `blocked`/`needs_input`/`complete` terminal sinks) — source-
+   agnostic, so bundled/inline/repo-shipped (Phase 5) workflows all render through
+   one path (a future DB-sourced workflow would too). `OrchestratorService`
+   exposes `workflow_graph(name, project_id=…)` and `agent_detail(name,
+   prompt_name, project_id=…)`, deriving provenance (`source`: `repo` vs
+   `bundled`) from the `_processes` vs `_project_processes` split rather than
+   threading it onto `Process`; `list_processes_summary` carries the same
+   `source`/`project`. Routes: `GET /api/workflows/{name}/graph` and
+   `GET /api/workflows/{name}/agents/{prompt_name}` (both project-scoped).
+   Frontend: a header-launched viewer surface (workflow list with a provenance
+   badge — `Repo · <project>` vs bundled — + a Dagre-laid-out board of shadcn-
+   styled custom nodes) whose node-click opens a read-only agent inspector
+   (declared properties + prompts), and a main/pr_fix flow selector. Two new
+   MIT/self-hostable frontend deps (`@xyflow/react`, `@dagrejs/dagre`) — no ADR
+   triggered. **Deferred (editor phase):** any editing/creating, DB-backed
+   workflow storage (a 4th provenance source needing a precedence decision
+   against Phase 5's `lotsa:` > `repo:` namespaces — bundled stays unshadowable),
+   and the separate-but-linked agent authoring surface. The read-only
+   `nodesDraggable`/`nodesConnectable`/`elementsSelectable` props + hidden node
+   handles are the documented editor seam.
 
 ## Consequences
 

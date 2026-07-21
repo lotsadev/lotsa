@@ -26,6 +26,7 @@ import { AppSidebar } from '@/components/sidebar/sidebar'
 import { EmptyState } from '@/components/empty-state'
 import { ChatPanel } from '@/components/chat/chat-panel'
 import { RightPanel } from '@/components/right-panel/right-panel'
+import { WorkflowsButton } from '@/components/workflows/workflows-button'
 import { ThemeToggle } from './theme-toggle'
 
 interface AppLayoutProps {
@@ -108,6 +109,7 @@ function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
               <PanelRightClose className="size-4" />
             )}
           </Button>
+          <WorkflowsButton />
           <ThemeToggle />
         </div>
       </header>
@@ -217,6 +219,7 @@ function MobileShellInner({
           >
             <PanelRight className="size-4" />
           </Button>
+          <WorkflowsButton />
           <ThemeToggle />
         </div>
       </header>

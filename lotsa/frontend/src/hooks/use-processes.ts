@@ -7,7 +7,9 @@ import { fetchProcesses } from '@/api/tasks'
 export function useProcesses() {
   return useQuery({
     queryKey: ['processes'],
-    queryFn: fetchProcesses,
+    // Wrap so react-query's query-context arg isn't passed as the (now
+    // optional) project param — the picker is unscoped, always the default list.
+    queryFn: () => fetchProcesses(),
     staleTime: Infinity,
   })
 }
