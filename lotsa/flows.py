@@ -68,18 +68,43 @@ class AgentPromptRegistry:
     Presents the same ``load`` / ``load_optional`` surface as
     :class:`rigg.PromptRegistry` so callers (the orchestrator, dispatch-rule
     builders) are unchanged: they still ask for ``"<agent>-system"`` /
-    ``"<agent>-user"``. Resolution order for ``"<agent>-<kind>"``:
+    ``"<agent>-user"``.
+
+    **Namespaces (ADR-044 Phase 5).** A name's agent part may carry a
+    ``lotsa:`` (bundled) or ``repo:`` (repo-local) qualifier. Unqualified names
+    resolve through the whole chain; a qualifier binds one namespace. The
+    resolution precedence is **operator override → ``lotsa:`` (bundled) →
+    ``repo:`` (repo-local)** — repo is lowest-trust and can shadow neither the
+    operator override nor a bundled name. Concretely, for ``"<agent>-<kind>"``:
 
     1. operator override dir, flat legacy name ``<agent>-<kind>.md`` (keeps
        pre-catalog custom ``--prompts-dir`` layouts and inline-process prompts
        working);
     2. operator override dir, catalog layout ``<agent>/<kind>.md``;
-    3. the bundled catalog ``<catalog_dir>/<agent>/<kind>.md``.
+    3. the bundled catalog ``<catalog_dir>/<agent>/<kind>.md``;
+    4. the repo catalog ``<repo_agents_dir>/<agent>/<kind>.md`` (dir-layout
+       only; only for unqualified or explicit ``repo:`` names, and only for a
+       name passing the ``[a-z0-9_-]{1,64}`` charset rail —
+       :func:`lotsa.provenance.is_valid_repo_name`).
+
+    Every repo-dir candidate passes the containment guard (:meth:`_repo_candidate_ok`)
+    before it is read: the ``repo_agents_dir`` root must be a *real directory*
+    (never a symlink) and the candidate must resolve inside it, so neither a
+    symlinked ``agents`` dir nor a symlinked ``system.md`` pointing outside the
+    repo tree is ever injected.
     """
 
-    def __init__(self, override_dir: Path | None, catalog_dir: Path = AGENTS_DIR) -> None:
+    def __init__(
+        self,
+        override_dir: Path | None,
+        catalog_dir: Path = AGENTS_DIR,
+        repo_agents_dir: Path | None = None,
+    ) -> None:
         self.override_dir = override_dir
         self.catalog_dir = catalog_dir
+        # The owning project's ``.lotsa/agents`` dir, or ``None`` for a bundled/
+        # inline process that ships no repo-local agents (ADR-044 Phase 5).
+        self.repo_agents_dir = repo_agents_dir
 
     @staticmethod
     def _split(name: str) -> tuple[str, str | None]:
@@ -88,24 +113,85 @@ class AgentPromptRegistry:
                 return name[: -len(suffix)], suffix[1:]
         return name, None
 
-    def _candidates(self, name: str) -> list[Path]:
-        agent, kind = self._split(name)
-        out: list[Path] = []
-        if self.override_dir is not None:
-            out.append(self.override_dir / f"{name}.md")
+    @staticmethod
+    def _split_namespace(agent: str) -> tuple[str | None, str]:
+        """Peel a ``lotsa:`` / ``repo:`` qualifier off an agent name."""
+        for namespace in ("lotsa", "repo"):
+            prefix = f"{namespace}:"
+            if agent.startswith(prefix):
+                return namespace, agent[len(prefix) :]
+        return None, agent
+
+    def _candidates(self, name: str) -> list[tuple[Path, bool]]:
+        """Ordered ``(path, is_repo)`` prompt-file candidates for *name*.
+
+        ``is_repo`` flags a repo-catalog candidate so :meth:`load` can apply the
+        containment guard only where the trust boundary requires it.
+        """
+        agent_ns, kind = self._split(name)
+        namespace, agent = self._split_namespace(agent_ns)
+        flat = f"{agent}-{kind}" if kind is not None else agent
+
+        def override() -> list[tuple[Path, bool]]:
+            if self.override_dir is None:
+                return []
+            out: list[tuple[Path, bool]] = [(self.override_dir / f"{flat}.md", False)]
             if kind is not None:
-                out.append(self.override_dir / agent / f"{kind}.md")
-        if kind is not None:
-            out.append(self.catalog_dir / agent / f"{kind}.md")
-        out.append(self.catalog_dir / f"{name}.md")
-        return out
+                out.append((self.override_dir / agent / f"{kind}.md", False))
+            return out
+
+        def bundled() -> list[tuple[Path, bool]]:
+            out: list[tuple[Path, bool]] = []
+            if kind is not None:
+                out.append((self.catalog_dir / agent / f"{kind}.md", False))
+            out.append((self.catalog_dir / f"{flat}.md", False))
+            return out
+
+        def repo() -> list[tuple[Path, bool]]:
+            from lotsa.provenance import is_valid_repo_name
+
+            if self.repo_agents_dir is None or kind is None:
+                return []  # repo catalog is dir-layout only
+            if not is_valid_repo_name(agent):
+                return []  # rail: repo name charset — enforced on the real read path
+            return [(self.repo_agents_dir / agent / f"{kind}.md", True)]
+
+        if namespace == "lotsa":
+            return override() + bundled()  # override still outranks the bundled namespace
+        if namespace == "repo":
+            return repo()
+        return override() + bundled() + repo()
+
+    def _repo_candidate_ok(self, candidate: Path) -> bool:
+        """A repo candidate must stay inside a *verified* repo ``.lotsa/agents`` tree.
+
+        The tree root must be a **real directory, not a symlink**, before the
+        containment check means anything: if ``repo_agents_dir`` is itself a
+        symlink (e.g. ``.lotsa/agents -> ~/.ssh``), both ``candidate`` and the
+        root ``.resolve()`` *through the same symlink prefix*, so
+        :func:`~lotsa.provenance.is_contained` would be tautologically true and a
+        symlinked ``agents`` dir would leak operator content into a prompt.
+        Verifying the root is a real dir first is exactly what
+        :func:`~lotsa.provenance.repo_lotsa_root` does for ``.lotsa`` and
+        :func:`~lotsa.provenance._discover` relies on for workflows — the check
+        must be rooted at a verified directory, never a mutable/unverified one.
+        """
+        from lotsa.provenance import is_contained
+
+        root = self.repo_agents_dir
+        if root is None or root.is_symlink() or not root.is_dir():
+            return False
+        return is_contained(candidate, root)
 
     def load(self, name: str) -> str:
         if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
             raise PromptNotFound(f"Invalid prompt name {name!r} — must be a plain basename")
-        for candidate in self._candidates(name):
-            if candidate.is_file():
-                return candidate.read_text()
+        for candidate, is_repo in self._candidates(name):
+            if not candidate.is_file():
+                continue
+            if is_repo and not self._repo_candidate_ok(candidate):
+                continue  # symlink-escape guard — never read outside the .lotsa tree
+            return candidate.read_text()
         raise PromptNotFound(f"Prompt {name!r} not found in override {self.override_dir} or catalog {self.catalog_dir}")
 
     def load_optional(self, name: str) -> str | None:
@@ -114,31 +200,52 @@ class AgentPromptRegistry:
         except PromptNotFound:
             return None
 
-    def load_agent_optional(self, name: str) -> Agent | None:
-        """Resolve the agent-catalog properties for prompt/agent *name* (ADR-044 Phase 2).
+    def _agent_yaml_candidates(self, name: str) -> list[tuple[Path, bool]]:
+        """Ordered ``(agent.yaml path, is_repo)`` candidates for agent *name*."""
+        from lotsa.provenance import is_valid_repo_name
 
-        Mirrors :meth:`load`'s resolution roots — an operator-supplied
-        ``<override_dir>/<name>/agent.yaml`` wins over the bundled
-        ``<catalog_dir>/<name>/agent.yaml``. Returns ``None`` when neither
-        exists (a non-catalog prompt / inline process step), so the
-        property-derived ``commit`` posthook is simply a no-op there.
+        namespace, agent = self._split_namespace(name)
+
+        def at(root: Path | None, is_repo: bool) -> list[tuple[Path, bool]]:
+            if root is None:
+                return []
+            if is_repo and not is_valid_repo_name(agent):
+                return []  # rail: repo name charset — enforced on the real read path
+            return [(root / agent / "agent.yaml", is_repo)]
+
+        if namespace == "lotsa":
+            return at(self.override_dir, False) + at(self.catalog_dir, False)
+        if namespace == "repo":
+            return at(self.repo_agents_dir, True)
+        return at(self.override_dir, False) + at(self.catalog_dir, False) + at(self.repo_agents_dir, True)
+
+    def load_agent_optional(self, name: str) -> Agent | None:
+        """Resolve the agent-catalog properties for prompt/agent *name* (ADR-044 Phase 2/5).
+
+        Mirrors :meth:`load`'s namespaced resolution roots — an operator-supplied
+        override wins over the bundled catalog, which wins over a repo-local
+        agent (ADR-044 Phase 5). Returns ``None`` when none exists (a non-catalog
+        prompt / inline process step), so the property-derived ``commit`` posthook
+        is simply a no-op there.
 
         Used by :func:`_resolve_jobs` (to fold ``commit`` in when
         ``produces_changes`` is true) and by
         :func:`_validate_posthook_property_consistency` (to reject an explicit
         ``commit`` on a non-producing agent). A malformed ``agent.yaml`` raises
-        ``ValueError`` via ``_parse_agent`` — fail-loud at build time, matching
-        the rest of the module.
+        ``ValueError`` — fail-loud at build time, matching the rest of the module.
         """
-        from lotsa.agents import _parse_agent  # local import mirrors the validators' style
+        from lotsa.agents import _parse_agent, _parse_repo_agent  # local import mirrors the validators' style
 
         if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
             return None
-        roots = ([self.override_dir] if self.override_dir is not None else []) + [self.catalog_dir]
-        for root in roots:
-            candidate = root / name / "agent.yaml"
-            if candidate.is_file():
-                return _parse_agent(name, _yaml.safe_load(candidate.read_text()) or {})
+        _namespace, agent = self._split_namespace(name)
+        for candidate, is_repo in self._agent_yaml_candidates(name):
+            if not candidate.is_file():
+                continue
+            if is_repo and not self._repo_candidate_ok(candidate):
+                continue  # symlink-escape guard
+            data = _yaml.safe_load(candidate.read_text()) or {}
+            return _parse_repo_agent(agent, data) if is_repo else _parse_agent(agent, data)
         return None
 
 
@@ -1484,8 +1591,16 @@ def build_process(
     name: str,
     prompts_dir: Path | None = None,
     process_file: Path | None = None,
+    repo_agents_dir: Path | None = None,
 ) -> Process:
-    """Build a Process by preset name or from a YAML file."""
+    """Build a Process by preset name or from a YAML file.
+
+    ``repo_agents_dir`` (ADR-044 Phase 5) is the owning project's
+    ``.lotsa/agents`` directory — supplied only when building a repo-shipped
+    workflow, so its ``prompt:`` references can resolve ``repo:``/unqualified
+    repo agents alongside the bundled catalog. Bundled/inline processes pass
+    ``None`` and are unaffected.
+    """
     if process_file is not None:
         loaded_name, jobs, flow_bindings, _raw = _load_yaml_process(process_file)
     elif name in PRESET_NAMES:
@@ -1500,7 +1615,7 @@ def build_process(
     else:
         raise ValueError(f"Unknown process: {name!r}. Choose from: {PRESET_NAMES}")
 
-    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR, repo_agents_dir=repo_agents_dir)
 
     flows: dict[str, FlowConfig] = {}
     for flow_name, bindings in flow_bindings.items():

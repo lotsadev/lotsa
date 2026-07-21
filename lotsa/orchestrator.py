@@ -43,6 +43,7 @@ from lotsa.flows import (
     FlowStep,
     Job,
     Process,
+    PromptNotFound,
     build_process,
     build_process_from_inline,
     check_conversational_rules,
@@ -674,6 +675,14 @@ class OrchestratorService:
         # and so ``GET /api/processes`` / the new-task UI can surface what's
         # available without re-parsing YAML.
         self._processes: dict[str, Process] = {}
+        # ADR-044 Phase 5 — per-project repo-shipped workflows, keyed
+        # ``project_id → {workflow_name → Process}``. Built at ``start()`` from
+        # each project's ``<repo>/.lotsa/workflows`` (project-scoped, not
+        # global): a repo workflow is dispatchable/listable/promotable only
+        # within its owning project. Kept separate from ``_processes`` so the
+        # bundled catalog stays project-independent and repo names cannot leak
+        # across projects.
+        self._project_processes: dict[str, dict[str, Process]] = {}
         # Externally-visible name of the active process (the key in
         # ``_processes`` whose value is ``self.process``). For inline
         # processes this matches both the dict key and the process's
@@ -724,11 +733,15 @@ class OrchestratorService:
         # ADR-021 — the derived per-process state below replaces the former
         # singletons (``_pr_monitor`` / ``_pr_monitor_config`` /
         # ``_action_states`` / ``_monitor_state``). Each is keyed by the
-        # *catalog name* (the key in ``_processes`` / the value of a task's
-        # ``metadata['process_name']``). Since ADR-043 each bundled preset's
+        # *plumbing key* (:meth:`_plumbing_key`): a bundled/inline global process
+        # keeps its plain ``catalog_name`` (project-less, unchanged from before
+        # Phase 5), while a repo-shipped workflow (ADR-044 Phase 5) keys under the
+        # ``(project_id, catalog_name)`` tuple so two projects shipping an
+        # identically named repo workflow never overwrite each other's plumbing
+        # (str vs. tuple keys never collide). Since ADR-043 each bundled preset's
         # ``Process.name`` equals its catalog name (``build``/``fix``/``chat``);
         # inline processes may still diverge, so route every per-process lookup
-        # through ``_process_name_for(task)`` so the keying never diverges.
+        # through ``_plumbing_key_for(task)`` so the keying never diverges.
         #
         # ``_pr_monitors_by_process`` holds one engine instance per
         # monitor-bearing process (the engine declared via the ``engine:`` field
@@ -740,13 +753,13 @@ class OrchestratorService:
         # pr-fix flows) ``gather_pending_feedback``. ``_pr_monitor_tasks_by_process``
         # holds each engine's running ``run()`` poll task so shutdown can cancel
         # them all.
-        self._pr_monitors_by_process: dict[str, Any] = {}
-        self._pr_monitor_tasks_by_process: dict[str, asyncio.Task] = {}
+        self._pr_monitors_by_process: dict[str | tuple[str, str], Any] = {}
+        self._pr_monitor_tasks_by_process: dict[str | tuple[str, str], asyncio.Task] = {}
         # ``_pr_monitor_configs_by_process`` is the parsed config of each
         # process's monitor job using engine=pr_monitor (absent for processes
         # with no monitor, or whose monitor uses a different engine — the cap
         # logic is pr-fix-specific and only triggers for the built-in engine).
-        self._pr_monitor_configs_by_process: dict[str, PrMonitorConfig] = {}
+        self._pr_monitor_configs_by_process: dict[str | tuple[str, str], PrMonitorConfig] = {}
         # ``_push_tasks`` and ``_dispatching_push`` are NOT deprecated — they
         # remain load-bearing for ``_execute_push`` (the legacy ``state="pushing"``
         # dispatch path) and for surfacing / re-driving tasks persisted with
@@ -757,15 +770,15 @@ class OrchestratorService:
         # before the action task is created), which is sufficient because actions
         # are not re-entrant via user-initiated entry points the way pr-fix is.
         #
-        # ``_action_states_by_process`` maps each process's catalog name to the
-        # SET of every action job's queue_state in that process — a custom
+        # ``_action_states_by_process`` maps each plumbing key to the SET of
+        # every action job's queue_state in that process — a custom
         # ``process.yaml`` can declare more than one action job, and the
         # restart-recovery sweep must flip any of them to ``blocked``, looked up
         # against the row's OWN process (ADR-021), not a global active-process
-        # set. ``_monitor_states_by_process`` maps each process to its monitor
-        # job's queue_state (or None when the process has no monitor).
-        self._action_states_by_process: dict[str, set[str]] = {}
-        self._monitor_states_by_process: dict[str, str | None] = {}
+        # set. ``_monitor_states_by_process`` maps each plumbing key to its
+        # monitor job's queue_state (or None when the process has no monitor).
+        self._action_states_by_process: dict[str | tuple[str, str], set[str]] = {}
+        self._monitor_states_by_process: dict[str | tuple[str, str], str | None] = {}
         self._push_tasks: dict[str, asyncio.Task] = {}
         self._dispatching_pr_fix: set[str] = set()
         self._dispatching_push: set[str] = set()
@@ -1015,71 +1028,20 @@ class OrchestratorService:
         # ``push_pr`` and their monitor job ``wait_for_pr_signal`` — replaces
         # the hardcoded ``pushing``/
         # ``waiting_for_pr`` synthetic states from the pre-ADR-014 model.
-        from lotsa.registry import get_engine
-
         for proc_name, process in self._processes.items():
-            action_states: set[str] = set()
-            monitor_state: str | None = None
-            for job in process.jobs:
-                if job.type == "action":
-                    action_states.add(job.queue_state)
-                if job.type == "monitor":
-                    # Engine via registry — the engine class is looked up by
-                    # name (the ``engine:`` field on the monitor job) and
-                    # instantiated with ``(orchestrator, monitor_state, config)``.
-                    # Any engine registered via ``lotsa.yaml``'s ``engines:``
-                    # block (or a built-in like ``pr_monitor``) works the same
-                    # way. The registered-name check that
-                    # ``_validate_registry_references`` ran at process-build time
-                    # guarantees ``get_engine`` resolves; we wrap defensively
-                    # anyway so a race between process load and engine teardown
-                    # surfaces a clear error here rather than an opaque
-                    # ``KeyError``.
-                    try:
-                        engine_cls = get_engine(job.engine or "")
-                    except KeyError as exc:
-                        raise RuntimeError(
-                            f"Monitor job {job.name!r} declares engine {job.engine!r} "
-                            f"which is not registered. This should have been caught at "
-                            f"process-build time by _validate_registry_references; if you "
-                            f"see this in production, the registry was mutated after build."
-                        ) from exc
-                    # Each monitor-bearing process gets its own engine instance,
-                    # scoped to its own monitor state. Processes that happen to
-                    # share a monitor_state string still dispatch correctly:
-                    # every monitor→orchestrator callback resolves the task's own
-                    # process per-task, and re-entrant dispatch is deduped by
-                    # ``_dispatching_pr_fix`` + ``_in_flight`` (each process has
-                    # at most one monitor job, so the last one wins per process).
-                    monitor_state = job.queue_state
-                    engine = engine_cls(self, job.queue_state, dict(job.config))
-                    self._pr_monitors_by_process[proc_name] = engine
-                    # The orchestrator's pr-fix cap logic
-                    # (``_completion_drainer``'s SKIPPED branch,
-                    # ``_pr_fix_round_cap_blocked``) reads
-                    # ``max_consecutive_skipped`` / ``max_pr_fix_rounds`` /
-                    # ``base_branch`` directly. These are pr_monitor-specific
-                    # fields, so we only populate the config map when the engine
-                    # is the built-in pr_monitor (the cap logic itself is
-                    # pr-fix-specific and only triggers for that engine's tasks).
-                    # A custom engine wouldn't surface here and the cap logic
-                    # short-circuits because no pr-fix sub-flow gets dispatched.
-                    #
-                    # Reach into the engine's already-parsed config rather than
-                    # calling ``parse_config`` a second time:
-                    # ``PrMonitorEngine.__init__`` ran the parser when the
-                    # instance was constructed above, so the typed dataclass
-                    # already exists. The ``pr_monitor`` branch guards the type
-                    # narrowing.
-                    if job.engine == "pr_monitor":
-                        self._pr_monitor_configs_by_process[proc_name] = engine.config
-            self._action_states_by_process[proc_name] = action_states
-            self._monitor_states_by_process[proc_name] = monitor_state
+            self._register_process_plumbing(proc_name, process)
 
         # ADR-029 — seed/sync projects (and run path-change resets + legacy
         # worktree cleanup) BEFORE the restart recovery sweep, so projects exist
         # for per-task worktree resolution and any relocation reset lands first.
         await self._sync_projects()
+
+        # ADR-044 Phase 5 — with projects synced, discover + build each
+        # project's repo-shipped workflows (``<repo>/.lotsa/workflows``) into
+        # ``self._project_processes`` and derive their PR-phase plumbing. Runs
+        # after ``_sync_projects`` (needs ``self._projects``) and before the
+        # restart sweep (so a resumed repo-workflow task resolves its process).
+        self._build_repo_processes()
 
         rows = await self.db.list_tasks()
         # Legacy synthetic states (pre-ADR-014) — pinned here so an upgrade
@@ -1116,8 +1078,7 @@ class OrchestratorService:
                 # recorded against a non-default process is checked against that
                 # process's action states (not a global active-process set, which
                 # would mis-route it).
-                row_process = self._process_name_for(row)
-                row_actions = self._action_states_by_process.get(row_process, set())
+                row_actions = self._action_states_by_process.get(self._plumbing_key_for(row), set())
                 push_state = row.state in row_actions or row.state in _legacy_push_states
                 # ``blocked`` is already terminal-for-restart (avoids duplicate
                 # recovery messages); ``archived`` is terminal full-stop and must
@@ -1136,9 +1097,13 @@ class OrchestratorService:
                 # We do NOT alias legacy names to the new catalog. Read the RAW
                 # recorded name here, not ``_process_name_for`` — that resolver
                 # silently falls back to the active process for unknown names,
-                # which would mask exactly the rows this branch must catch.
+                # which would mask exactly the rows this branch must catch. A
+                # repo-shipped workflow (ADR-044 Phase 5) lives in the row's
+                # project catalog, not ``_processes``, so consult both — else a
+                # resumed repo-workflow task would be wrongly blocked as removed.
                 recorded_process = (row.metadata or {}).get("process_name")
-                if recorded_process is not None and recorded_process not in self._processes:
+                known = recorded_process in self._processes or recorded_process in self._project_process_catalog(row)
+                if recorded_process is not None and not known:
                     await self._set_status(row.id, "blocked", row.current_step or row.state)
                     await self.db.add_message(
                         row.id,
@@ -1186,8 +1151,8 @@ class OrchestratorService:
         # job-iteration loop above (via the registry); here we just spawn each
         # ``run()`` task. Done after the recovery sweep so legacy rows are
         # already routed to ``blocked`` before any poller could see them.
-        for proc_name, engine in self._pr_monitors_by_process.items():
-            self._pr_monitor_tasks_by_process[proc_name] = asyncio.create_task(engine.run())
+        for plumbing_key, engine in self._pr_monitors_by_process.items():
+            self._pr_monitor_tasks_by_process[plumbing_key] = asyncio.create_task(engine.run())
 
     async def shutdown(self) -> None:
         """Graceful drain then cancel all background work and clean up (ADR-040 R5).
@@ -1272,7 +1237,7 @@ class OrchestratorService:
         tasks = await self.db.list_tasks()
         return self._enrich_summaries(tasks)
 
-    def list_processes_summary(self) -> list[dict[str, Any]]:
+    def list_processes_summary(self, project_id: str | None = None) -> list[dict[str, Any]]:
         """Return a summary of every loaded process for the API / UI dropdown.
 
         Each entry is a plain dict (intentionally not a Pydantic model — the
@@ -1280,7 +1245,9 @@ class OrchestratorService:
         Fields:
 
         - ``name``: the externally-visible key in ``_processes`` (an inline
-          ``lotsa.yaml`` name, or the preset name for bundled processes).
+          ``lotsa.yaml`` name, or the preset name for bundled processes) or a
+          repo-shipped workflow name (ADR-044 Phase 5) when ``project_id`` is
+          given.
         - ``is_active``: ``True`` for the *configured default* process — the
           one new tasks dispatch against when the caller doesn't pick a
           process. Per ADR-021 it is no longer "the only one that works": any
@@ -1293,9 +1260,11 @@ class OrchestratorService:
           the frontend picker (start) and hand-off dialog (hand-off) filter on
           instead of hardcoding the name ``"chat"``.
 
-        Ordering is stable: the active entry first, then alphabetical. This
-        means the new-task dropdown's first item is the default selection
-        without the UI needing to sort client-side.
+        When ``project_id`` is supplied, that project's repo-shipped workflows
+        (ADR-044 Phase 5) are merged in — they are pickable/promotable only
+        within their owning project. Ordering is stable: the active entry first,
+        then alphabetical, so the new-task dropdown's first item is the default
+        selection without the UI needing to sort client-side.
         """
         inline_defaults = {
             name
@@ -1303,8 +1272,13 @@ class OrchestratorService:
             if isinstance(entry, dict) and entry.get("default") is True
         }
         active_name = self._active_process_name
+        # Bundled/inline catalog + (when scoped) the project's repo workflows.
+        # Repo names cannot shadow bundled ones, so a plain merge is unambiguous.
+        catalog: dict[str, Process] = dict(self._processes)
+        if project_id is not None:
+            catalog.update(self._project_processes.get(project_id, {}))
         summaries: list[dict[str, Any]] = []
-        for name, process in self._processes.items():
+        for name, process in catalog.items():
             flow = process.flows.get("main") or next(iter(process.flows.values()))
             summaries.append(
                 {
@@ -1609,26 +1583,32 @@ class OrchestratorService:
         # ``self.flow`` guard above.
         if self.process is None:
             raise RuntimeError("OrchestratorService not started")
+        # Resolve + validate the project (ADR-029) FIRST. Validation is at
+        # create time, not first dispatch, so the operator learns immediately.
+        # A repo-shipped workflow (ADR-044 Phase 5) is valid only within its
+        # owning project, so the project must be resolved before the process
+        # name is validated against that project's repo catalog.
+        resolved_project_id = self._resolve_project_id(project_id)
+
         active_name = self._active_process_name
-        # ADR-021: any loaded process is a valid dispatch target. The only
-        # error is an unknown name (not in the catalog at all).
+        project_catalog = self._project_processes.get(resolved_project_id, {})
+        # ADR-021: any loaded process is a valid dispatch target — the bundled/
+        # inline catalog OR this project's repo-shipped workflows (ADR-044
+        # Phase 5). The only error is an unknown name (in neither catalog).
         if process_name is None:
             resolved_process_name = active_name
-        elif process_name in self._processes:
+        elif process_name in project_catalog or process_name in self._processes:
             resolved_process_name = process_name
         else:
-            available = sorted(self._processes.keys())
+            available = sorted(set(self._processes) | set(project_catalog))
             raise ProcessNotFound(
-                f"Unknown process {process_name!r}. Available: {available}. "
-                f"Add it to ``lotsa.yaml``'s ``processes:`` block, or load a "
-                f"bundled process by name (chat/build/fix)."
+                f"Unknown process {process_name!r} for project {resolved_project_id!r}. "
+                f"Available: {available}. Add it to ``lotsa.yaml``'s ``processes:`` block, "
+                f"ship it under the project's ``.lotsa/workflows/``, or load a bundled "
+                f"process by name (chat/build/fix)."
             )
-        resolved_process = self._processes[resolved_process_name]
+        resolved_process = project_catalog.get(resolved_process_name) or self._processes[resolved_process_name]
         resolved_flow = resolved_process.flows.get("main") or next(iter(resolved_process.flows.values()))
-
-        # Resolve + validate the project (ADR-029). Validation is at create
-        # time, not first dispatch, so the operator learns immediately.
-        resolved_project_id = self._resolve_project_id(project_id)
 
         # Resolve title from message if not provided explicitly
         if title is None and message is not None:
@@ -6872,19 +6852,168 @@ class OrchestratorService:
     # ``self.flow`` survive only as the active-process default these helpers
     # fall back to (legacy rows, stale names).
 
+    def _register_process_plumbing(self, proc_name: str, process: Process, project_id: str | None = None) -> None:
+        """Derive a process's PR-phase plumbing (ADR-021): action states,
+        monitor state, monitor engine, and pr_monitor config — keyed by
+        :meth:`_plumbing_key`.
+
+        Called for every bundled/inline process (``project_id=None`` — keyed by
+        its plain global name) and, since ADR-044 Phase 5, every repo-shipped
+        workflow (``project_id`` set — keyed by the ``(project_id, proc_name)``
+        tuple). So two projects shipping an identically named repo workflow (e.g.
+        both ``release``, each with its own monitor ``base_branch``) get
+        **separate** action-state sets, monitor engines, and pr_monitor configs
+        instead of silently overwriting each other's by-name entries, while
+        global names keep their pre-Phase-5 plain-string key (str vs. tuple keys
+        never collide, and a repo name can't shadow a bundled one anyway).
+        """
+        from lotsa.registry import get_engine
+
+        key = self._plumbing_key(proc_name, project_id)
+
+        action_states: set[str] = set()
+        monitor_state: str | None = None
+        for job in process.jobs:
+            if job.type == "action":
+                action_states.add(job.queue_state)
+            if job.type == "monitor":
+                # Engine via registry — the engine class is looked up by name
+                # (the ``engine:`` field on the monitor job) and instantiated
+                # with ``(orchestrator, monitor_state, config)``. The
+                # registered-name check ``_validate_registry_references`` ran at
+                # process-build time guarantees ``get_engine`` resolves; we wrap
+                # defensively anyway so a race between process load and engine
+                # teardown surfaces a clear error rather than an opaque KeyError.
+                try:
+                    engine_cls = get_engine(job.engine or "")
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Monitor job {job.name!r} declares engine {job.engine!r} "
+                        f"which is not registered. This should have been caught at "
+                        f"process-build time by _validate_registry_references; if you "
+                        f"see this in production, the registry was mutated after build."
+                    ) from exc
+                # Each monitor-bearing process gets its own engine instance,
+                # scoped to its own monitor state. Re-entrant dispatch is deduped
+                # by ``_dispatching_pr_fix`` + ``_in_flight`` (each process has at
+                # most one monitor job, so the last one wins per process).
+                monitor_state = job.queue_state
+                engine = engine_cls(self, job.queue_state, dict(job.config))
+                self._pr_monitors_by_process[key] = engine
+                # Only the built-in pr_monitor exposes the cap fields the pr-fix
+                # cap logic reads; reach into the engine's already-parsed config
+                # rather than re-parsing.
+                if job.engine == "pr_monitor":
+                    self._pr_monitor_configs_by_process[key] = engine.config
+        self._action_states_by_process[key] = action_states
+        self._monitor_states_by_process[key] = monitor_state
+
+    @staticmethod
+    def _plumbing_key(proc_name: str, project_id: str | None) -> str | tuple[str, str]:
+        """The key for the per-process plumbing dicts (ADR-044 P5).
+
+        A bundled/inline **global** process (``project_id is None``) keeps its
+        plain string name — global processes are genuinely project-less, so their
+        key is unchanged from before Phase 5. A **repo-shipped** workflow keys
+        under the ``(project_id, proc_name)`` tuple, so two projects shipping an
+        identically named repo workflow (e.g. both ``release``) never overwrite
+        each other's plumbing. A ``str`` and a ``tuple`` can never be equal, so
+        the two key spaces never collide (and a repo name can't shadow a bundled
+        one anyway).
+        """
+        return proc_name if project_id is None else (project_id, proc_name)
+
+    def _plumbing_key_for(self, item_or_row: Any) -> str | tuple[str, str]:
+        """Resolve the plumbing key for a task (ADR-044 P5).
+
+        A task whose resolved process name lives in its project's repo-workflow
+        catalog keys under the ``(project_id, name)`` tuple; every other task
+        (bundled / inline / legacy) keys under the plain ``name`` — mirroring how
+        :meth:`_register_process_plumbing` registered it.
+        """
+        name = self._process_name_for(item_or_row)
+        if name in self._project_process_catalog(item_or_row):
+            return (self._project_id_for(item_or_row), name)
+        return name
+
+    def _build_repo_processes(self) -> None:
+        """Discover + build each project's repo-shipped workflows (ADR-044 P5).
+
+        Reads ``<project.path>/.lotsa/workflows`` from the project root
+        (Decision 1 — project-scoped, build-time) through the same
+        ``build_process`` path the bundled catalog uses, so every structural rail
+        (bundled-tools-only references, rule-target validation) applies for free.
+        Fail-soft per workflow: a malformed repo ``process.yaml`` is logged and
+        skipped, never aborting ``start()``. A repo workflow whose name collides
+        with a bundled/global process is skipped (repo cannot shadow bundled).
+
+        Containment is re-checked on the literal ``process.yaml`` path before it
+        is read — the workflow analog of ``_repo_candidate_ok``'s second gate for
+        repo agents. Discovery already rejects a symlinked manifest, so this is
+        defense-in-depth against a caller-supplied path that never passed through
+        ``discover_repo_workflows``.
+        """
+        from lotsa import provenance
+
+        self._project_processes = {}
+        for pid, project in self._projects.items():
+            root = provenance.repo_lotsa_root(project.path)
+            repo_agents_dir = (root / "agents") if root is not None else None
+            built: dict[str, Process] = {}
+            for wf_name, process_yaml in provenance.discover_repo_workflows(project.path).items():
+                if wf_name in self._processes:
+                    logger.warning(
+                        "Repo workflow %r in project %r shadows a bundled/global process; skipping "
+                        "(repo names cannot shadow bundled — ADR-044 Phase 5).",
+                        wf_name,
+                        pid,
+                    )
+                    continue
+                if root is None or not provenance.is_contained(process_yaml, root):
+                    logger.error(
+                        "Skipping repo workflow %r in project %r: process.yaml escapes the .lotsa tree "
+                        "(symlink-escape guard — ADR-044 Phase 5).",
+                        wf_name,
+                        pid,
+                    )
+                    continue
+                try:
+                    process = build_process(
+                        wf_name,
+                        prompts_dir=self.config.prompts_dir,
+                        process_file=process_yaml,
+                        repo_agents_dir=repo_agents_dir,
+                    )
+                except (ValueError, FileNotFoundError, PromptNotFound) as exc:
+                    logger.error(
+                        "Skipping malformed repo workflow %r in project %r: %s",
+                        wf_name,
+                        pid,
+                        exc,
+                    )
+                    continue
+                built[wf_name] = process
+                self._register_process_plumbing(wf_name, process, project_id=pid)
+            self._project_processes[pid] = built
+
+    def _project_process_catalog(self, item_or_row: Any) -> dict[str, Process]:
+        """Return the repo-workflow catalog for the task's project (ADR-044 P5)."""
+        return self._project_processes.get(self._project_id_for(item_or_row), {})
+
     def _process_name_for(self, item_or_row: Any) -> str:
         """Return the catalog name of the process that owns this task.
 
         Reads ``metadata['process_name']`` (Item or TaskRow both expose
-        ``metadata``). Falls back to the active process name for tasks created
-        before multi-process support, or whose recorded name no longer
-        resolves (e.g. the process was removed from lotsa.yaml between
-        restarts). The returned name is always a valid key into
-        ``_processes`` and the per-process collections.
+        ``metadata``). Resolves against the task's project repo-workflow catalog
+        first (ADR-044 Phase 5), then the global bundled/inline catalog. Falls
+        back to the active process name for tasks created before multi-process
+        support, or whose recorded name no longer resolves (e.g. the process was
+        removed from lotsa.yaml between restarts). The returned name is always a
+        valid key into the resolved catalog and the per-process collections.
         """
         metadata = getattr(item_or_row, "metadata", None) or {}
         name = metadata.get("process_name")
-        if name and name in self._processes:
+        if name and (name in self._project_process_catalog(item_or_row) or name in self._processes):
             return name
         return self._active_process_name
 
@@ -6893,12 +7022,17 @@ class OrchestratorService:
 
         This is the canonical per-task process accessor (ADR-021): every
         routing decision resolves the task's own process here rather than
-        reading the ``self.process`` singleton. Legacy rows and stale names
-        fall back to the active process.
+        reading the ``self.process`` singleton. A repo-shipped workflow resolves
+        from the task's project catalog first (ADR-044 Phase 5), then the global
+        catalog. Legacy rows and stale names fall back to the active process.
         """
         if self.process is None:
             raise RuntimeError("_process_for called before start()")
-        return self._processes.get(self._process_name_for(item_or_row), self.process)
+        name = self._process_name_for(item_or_row)
+        project_catalog = self._project_process_catalog(item_or_row)
+        if name in project_catalog:
+            return project_catalog[name]
+        return self._processes.get(name, self.process)
 
     def _root_flow_for(self, item_or_row: Any) -> FlowConfig:
         """Return the root (``main``) flow of the task's own process."""
@@ -6916,15 +7050,15 @@ class OrchestratorService:
 
     def _monitor_state_for(self, item_or_row: Any) -> str | None:
         """Return the monitor queue_state of the task's process (or None)."""
-        return self._monitor_states_by_process.get(self._process_name_for(item_or_row))
+        return self._monitor_states_by_process.get(self._plumbing_key_for(item_or_row))
 
     def _monitor_engine_for(self, item_or_row: Any) -> Any:
         """Return the monitor engine for the task's process (or None)."""
-        return self._pr_monitors_by_process.get(self._process_name_for(item_or_row))
+        return self._pr_monitors_by_process.get(self._plumbing_key_for(item_or_row))
 
     def _pr_monitor_config_for(self, item_or_row: Any) -> PrMonitorConfig | None:
         """Return the pr_monitor config for the task's process (or None)."""
-        return self._pr_monitor_configs_by_process.get(self._process_name_for(item_or_row))
+        return self._pr_monitor_configs_by_process.get(self._plumbing_key_for(item_or_row))
 
     def _resolve_flow(self, item: Item) -> FlowConfig:
         """Return the flow currently driving ``item``'s dispatch.

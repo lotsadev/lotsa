@@ -1,6 +1,6 @@
 # ADR-044 — Workflows for agents
 
-**Status:** Implemented (Phases 1, 2 & 3) — Phases 4–6 Proposed
+**Status:** Implemented (Phases 1, 2, 3 & 5; Phase 4 partial) — Phase 6 Proposed
 
 **Scope:** CE (with a shared-catalog concept that later reaches `rigg`)
 
@@ -162,8 +162,29 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    levels"/ADR-027 §7). (c) Formalizing the promotion payload
    (recommended-workflow + distilled spec) is **deferred** to its own task —
    today's prose recommendation + hand-off button stay.
-5. **In-repo agents *and* workflows** — git-native `.lotsa/` discovery +
-   namespaces + rails (one mechanism serves both).
+5. **In-repo agents *and* workflows** (**Implemented**) — git-native `.lotsa/`
+   discovery + namespaces + rails (one mechanism serves both). A project's repo
+   may ship agents under `<repo>/.lotsa/agents/<name>/` and workflows under
+   `<repo>/.lotsa/workflows/<name>/process.yaml`; `lotsa/provenance.py` discovers
+   them from the **project root** (project-scoped, build-time — resolution is
+   narrowed from the ADR's "worktree under operation" to the project root for
+   v1, deferring branch-sensitivity) with hardened path rails (name charset
+   `[a-z0-9_-]{1,64}`, `.lotsa`-containment / symlink-escape guard, real-dir
+   `.lotsa` only). `AgentPromptRegistry` (`flows.py`) is namespace-aware:
+   unqualified names resolve **operator-override → `lotsa:` (bundled) → `repo:`
+   (repo-local)** so repo (lowest trust) can shadow neither; `lotsa:`/`repo:`
+   qualifiers bind explicitly. `build_process` takes a `repo_agents_dir` so a
+   repo `process.yaml` resolves its repo agents, and the orchestrator builds each
+   project's workflows into `self._project_processes` (project-isolated,
+   fail-soft per workflow, cannot shadow a bundled name). Rails are structural:
+   the operational preamble is always injected, push stays a deterministic
+   orchestrator step, and a repo definition can reference only *bundled*
+   tools/hooks (the existing build validators reject anything else). Repo agent
+   `produces_changes`/`needs_worktree` derive the same orchestrator-owned
+   `commit`/`worktree` hooks. Out of scope (deferred): task-scoped/branch-
+   sensitive resolution, build-time review-before-push graph validation (the
+   `_parse_repo_agent` seam is where a future operator-owned-property tightening
+   would land), cross-repo sharing (stays ADR-035), and the acknowledgment gate.
 6. **(Post-launch)** — visual graph editor.
 
 ## Consequences
