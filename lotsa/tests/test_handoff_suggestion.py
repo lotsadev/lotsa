@@ -29,8 +29,6 @@ build time (``ValueError``), and the drainer never saves the artifact
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 import lotsa.orchestrator as orch
@@ -41,7 +39,6 @@ from lotsa.orchestrator import OrchestratorService, _marker_requirement_footer
 from lotsa.tests.conftest import wait_for_completion, wait_for_status
 from lotsa.tests.test_orchestrator import FakeRunner, SequentialFakeRunner
 from rigg.models import AgentResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -360,9 +357,7 @@ class TestHandoffDrainer:
 
     def test_chat_message_stored_with_marker_stripped(self, chat_service, run):
         svc = chat_service
-        task = _create_chat_task(
-            svc, run, "I recommend the full build for this.\nAGENT_RESULT: COMPLETED build"
-        )
+        task = _create_chat_task(svc, run, "I recommend the full build for this.\nAGENT_RESULT: COMPLETED build")
 
         chat_msgs = run(svc.db.get_messages(task.id, msg_type="chat"))
         agent_msgs = [m for m in chat_msgs if m.role == "agent"]

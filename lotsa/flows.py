@@ -1125,6 +1125,13 @@ def resolve_output_target(
     currently-active *flow*. The old ``target: previous`` shorthand was
     removed in ADR-014 Layer A — any unrecognized target string resolves
     to ``"blocked"`` with a warning.
+
+    ``"needs_input"`` and ``"handoff"`` are intentionally NOT resolved here:
+    the completion drainer intercepts both before calling this function (the
+    NEEDS_INPUT pause and the ADR-044 Phase 4c record-suggestion-and-park
+    respectively), so neither maps to a state. Reaching this function with
+    either target would mean the drainer's intercept was bypassed — the
+    ``blocked`` fallback below is the safe degradation.
     """
     if target == "next":
         # The same Job appears in different flows with different success_states
@@ -1317,12 +1324,16 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
     ``blocked`` fallback.
 
     Recognized non-job keywords: ``next`` (success edge), the terminal states
-    ``blocked`` / ``complete`` / ``abandoned``, and ``needs_input`` — the last
-    is special-cased in the completion drainer's ``AGENT_RESULT: INPUT`` path
-    (e.g. the bundled ``build`` process's ``pr-fix`` rule routes to it), so it
-    is a legitimate target even though it is not a job.
+    ``blocked`` / ``complete`` / ``abandoned``, ``needs_input``, and ``handoff``
+    — the last two are special-cased in the completion drainer (the
+    ``AGENT_RESULT: INPUT`` path and the ADR-044 Phase 4c handoff path
+    respectively), so they are legitimate targets even though neither is a job
+    and neither is resolved to a state by ``resolve_output_target``. ``handoff``
+    records an operator-gated hand-off suggestion and parks the task in place —
+    the bundled ``chat`` process's ``COMPLETED → handoff`` edge is the canonical
+    user.
     """
-    sentinels = {"next", "blocked", "complete", "abandoned", "needs_input"}
+    sentinels = {"next", "blocked", "complete", "abandoned", "needs_input", "handoff"}
     job_names = {j.name for j in jobs}
 
     def _check(target: str, where: str) -> None:

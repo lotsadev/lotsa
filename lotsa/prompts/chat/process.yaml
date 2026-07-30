@@ -14,8 +14,15 @@ jobs:
     type: agent
     prompt: chat
     conversational: true
-    # No output rule / completion marker: the chat step never self-completes.
-    # It runs as a REPL until the operator promotes (ADR-027) or abandons it.
+    # ADR-044 Phase 4c — suggesting a hand-off is edge-routed like every other
+    # outcome. ``COMPLETED <workflow>`` records a hand-off suggestion (the
+    # drainer's handoff branch: validate → store ``handoff_suggestion`` →
+    # park) and NEVER advances or promotes. The chat step still self-completes
+    # nothing — it runs as a REPL until the operator promotes (ADR-027) or
+    # abandons it; ``handoff`` is a non-terminating park, not a transition.
+    routes: { COMPLETED: handoff }
 flows:
   main:
-    steps: [chat]
+    steps:
+      - name: chat
+        routes: { COMPLETED: handoff }

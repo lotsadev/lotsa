@@ -94,27 +94,57 @@ def _summarize_agent_error(return_code: int | None, stderr: str | None) -> str:
     return msg
 
 
-def _marker_requirement_footer(rules: list) -> str:
-    """A mandatory-marker footer derived from a step's stdout output rules.
+def _marker_requirement_footer(rules: list, handoff_destinations: str = "") -> str:
+    """A marker footer derived from a step's stdout output rules.
 
-    Marker-driven steps advance only if the agent emits the literal token (e.g.
-    ``AGENT_RESULT: PASSED``). Agents — especially on cheaper models — often write a prose
-    conclusion and omit it, stranding the task (ADR-039 records the longer-term
-    fix). This footer makes the marker non-optional, and is derived from the
-    step's own ``rules`` so it can never drift from process.yaml. Returns ``""``
-    for steps with no stdout markers.
+    Two kinds of edge get two kinds of footer, split on ``rule.target``:
+
+    * **Mandatory markers** (any non-``handoff`` target). Marker-driven steps
+      advance only if the agent emits the literal token (e.g.
+      ``AGENT_RESULT: PASSED``). Agents — especially on cheaper models — often
+      write a prose conclusion and omit it, stranding the task (ADR-039 records
+      the longer-term fix). This block makes the marker non-optional.
+    * **Handoff suggestion** (a ``handoff`` target, ADR-044 Phase 4c). The
+      COMPLETED marker names a recommended destination workflow; it is
+      **optional** and non-terminating (record-suggestion-and-park, never
+      advance/promote), so a never-completing REPL like ``chat`` must NOT be
+      told a marker is mandatory every turn. ``handoff_destinations`` (rendered
+      ``{available_processes}``) lists the valid destinations.
+
+    Both blocks are derived from the step's own ``rules`` so they can never
+    drift from process.yaml. Returns ``""`` for steps with no stdout markers.
     """
-    markers = [r.pattern.lstrip("^") for r in (rules or []) if getattr(r, "source", None) == "stdout"]
-    if not markers:
-        return ""
-    listed = "\n".join(f"- `{m}`" for m in markers)
-    return (
-        "\n\n## Required outcome marker (mandatory)\n"
-        "This step advances ONLY when your reply contains, on a line by itself, **exactly one** of:\n"
-        f"{listed}\n"
-        "Emit the one matching your conclusion as the final line. A reply with analysis but no "
-        "marker leaves the task stuck with no transition — never omit it."
-    )
+    stdout_rules = [r for r in (rules or []) if getattr(r, "source", None) == "stdout"]
+    handoff_rules = [r for r in stdout_rules if getattr(r, "target", None) == "handoff"]
+    mandatory_rules = [r for r in stdout_rules if getattr(r, "target", None) != "handoff"]
+
+    footer = ""
+    if mandatory_rules:
+        listed = "\n".join(f"- `{r.pattern.lstrip('^')}`" for r in mandatory_rules)
+        footer += (
+            "\n\n## Required outcome marker (mandatory)\n"
+            "This step advances ONLY when your reply contains, on a line by itself, **exactly one** of:\n"
+            f"{listed}\n"
+            "Emit the one matching your conclusion as the final line. A reply with analysis but no "
+            "marker leaves the task stuck with no transition — never omit it."
+        )
+    if handoff_rules:
+        # The outcome word carrying the recommendation (COMPLETED for the
+        # bundled chat edge). Derived from the rule so it never drifts.
+        outcome = handoff_rules[0].pattern.lstrip("^").removeprefix("AGENT_RESULT: ").strip()
+        dests = handoff_destinations.strip()
+        dest_block = f"\nValid destinations:\n{dests}" if dests else ""
+        footer += (
+            "\n\n## Suggesting a hand-off (optional)\n"
+            "When — and ONLY when — the conversation has reached a concrete decision, you may "
+            "suggest handing the task off by emitting, on a line by itself:\n"
+            f"`AGENT_RESULT: {outcome} <workflow>` (e.g. `AGENT_RESULT: {outcome} build`), where "
+            "`<workflow>` is one of the destinations below. This is a **suggestion only** — it does "
+            "not end the conversation or promote the task; the operator decides. Emit nothing on an "
+            "ordinary turn and keep chatting."
+            f"{dest_block}"
+        )
+    return footer
 
 
 class ApproveNotAllowed(Exception):
@@ -388,6 +418,27 @@ def _extract_needs_input(stdout: str) -> str | None:
     return last
 
 
+def _extract_handoff_suggestion(stdout: str) -> str | None:
+    """Extract the recommended-workflow token from a ``COMPLETED`` marker.
+
+    ADR-044 Phase 4c — an agent on a ``→ handoff`` edge names a destination
+    workflow in the trailing payload of ``AGENT_RESULT: COMPLETED <workflow>``.
+    Returns the first whitespace token of the payload from the *last* such
+    marker (latest-wins, mirroring :func:`_extract_needs_input`), or ``None``
+    when there is no COMPLETED marker or its payload is empty (a bare
+    ``AGENT_RESULT: COMPLETED`` carries no suggestion and is inert). Validation
+    that the name is a real, ``hand-off``-invocable destination happens at the
+    call site — this parser only pulls the candidate token out.
+    """
+    last: str | None = None
+    for line in (stdout or "").splitlines():
+        m = _AGENT_RESULT_RE.match(line.strip())
+        if m is not None and m.group(1) == "COMPLETED":
+            tokens = (m.group(2) or "").strip().split(maxsplit=1)
+            last = tokens[0] if tokens else None
+    return last
+
+
 def _extract_needs_decision_question(stdout: str) -> str:
     """Extract a pr-fix ``AGENT_RESULT: INPUT`` question (or a placeholder).
 
@@ -507,6 +558,25 @@ def _strip_spec_marker(stdout: str) -> str:
     """
     lines = stdout.split("\n", 1)
     return lines[1].strip() if len(lines) > 1 else ""
+
+
+def _strip_handoff_marker(stdout: str) -> str:
+    """Remove any ``AGENT_RESULT: COMPLETED …`` marker line(s) from a chat turn.
+
+    ADR-044 Phase 4c — a handoff turn carries its recommendation as a
+    ``COMPLETED <workflow>`` marker line; the stored/displayed chat message
+    should show only the agent's prose, not the routing marker. Cosmetic only
+    (the recommendation is captured separately into the ``handoff_suggestion``
+    artifact). Any line that is a COMPLETED marker is dropped; every other line
+    is preserved verbatim.
+    """
+    kept: list[str] = []
+    for line in (stdout or "").splitlines():
+        m = _AGENT_RESULT_RE.match(line.strip())
+        if m is not None and m.group(1) == "COMPLETED":
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 # Anchors that mark where an artifact's real content starts. Agents narrate
@@ -2011,26 +2081,59 @@ class OrchestratorService:
         )
         await self._dispatch_next_step(item)
 
+    def _handoff_destinations(self) -> list[tuple[str, str]]:
+        """The ``(name, description)`` of every loaded ``hand-off``-invocable
+        process that carries a description (ADR-027 §3 / ADR-044 Phase 4).
+
+        The single source of truth for "which workflows may be suggested /
+        accepted as a hand-off destination", shared by the chat suggest-catalog
+        (:meth:`_render_available_processes`), the marker footer's destination
+        list, and the drainer's validation of an ``AGENT_RESULT: COMPLETED
+        <workflow>`` suggestion (ADR-044 Phase 4c). Keeping all three off one
+        filter guarantees the agent is never accepted for a destination it was
+        not shown. The exclusion is driven off the declared ``invocable``
+        property, not the literal name ``"chat"``: chat (``invocable: [start]``)
+        has no ``hand-off`` and so excludes itself, and the rule generalises to
+        any Think-phase / non-promotable workflow.
+        """
+        return [
+            (name, " ".join(process.description.split()))
+            for name, process in self._processes.items()
+            if "hand-off" in process.invocable and process.description
+        ]
+
     def _render_available_processes(self) -> str:
         """Render the loaded process catalog as an *available processes* block
         for the chat agent's triage prompt (ADR-027 §3).
 
-        Data-driven, not a hardcoded taxonomy: each loaded process that carries
-        a ``description`` contributes one line. Processes without a description
-        are skipped (they opt out of triage), and — ADR-044 Phase 4 — a process
-        that is not ``hand-off``-invocable excludes itself. This drives the
-        exclusion off the declared ``invocable`` property rather than the literal
-        name ``"chat"``: chat (``invocable: [start]``) has no ``hand-off``, so it
-        never suggests promoting to itself, and the same rule generalises to any
-        Think-phase / non-promotable workflow.
+        Data-driven, not a hardcoded taxonomy: one line per
+        :meth:`_handoff_destinations` entry (the shared ``hand-off``-invocable
+        filter).
         """
-        lines: list[str] = []
-        for name, process in self._processes.items():
-            if "hand-off" not in process.invocable or not process.description:
-                continue
-            desc = " ".join(process.description.split())
-            lines.append(f"- {name}: {desc}")
-        return "\n".join(lines)
+        return "\n".join(f"- {name}: {desc}" for name, desc in self._handoff_destinations())
+
+    def _chat_message_metadata(self, info: Any, result: Any) -> dict[str, object]:
+        """Execution metadata for a conversational step's stored chat message.
+
+        Shared by the conversational drain branch and the ADR-044 Phase 4c
+        handoff branch so a handoff turn carries the same rich stats
+        (duration, ``agent_model`` = the resolved per-step model, runner name,
+        tokens, cost) as an ordinary chat turn. ``agent_runner`` (ADR-023) is
+        the registered runner name carried on the in-flight record.
+        """
+        meta: dict[str, object] = {"duration_ms": result.duration_ms}
+        meta["agent_model"] = info.step.model or self.config.model
+        if result.model:
+            meta["model"] = result.model
+        if info.agent_runner_name is not None:
+            meta["agent_runner"] = info.agent_runner_name
+        if result.input_tokens is not None:
+            meta["input_tokens"] = result.input_tokens
+        if result.output_tokens is not None:
+            meta["output_tokens"] = result.output_tokens
+        if result.cost_usd is not None:
+            meta["cost_usd"] = result.cost_usd
+        return meta
 
     async def approve(self, task_id: str) -> None:
         """Approve a waiting (or needs_input) task — advance to next step.
@@ -5661,6 +5764,62 @@ class OrchestratorService:
                         rule_work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
                         rule_target = evaluate_output_rules(info.step.rules, result, rule_work_dir)
                     if rule_target is not None and rule_target != "next":
+                        # ADR-044 Phase 4c — an agent on a ``→ handoff`` edge
+                        # SUGGESTED a hand-off (``AGENT_RESULT: COMPLETED
+                        # <workflow>``). Record the validated destination as a
+                        # ``handoff_suggestion`` artifact (latest-wins) and PARK
+                        # — never advance, promote, or terminate the REPL
+                        # (amends ADR-027 §1: agents may suggest; the operator
+                        # gates). Handled here BEFORE the generic
+                        # ``resolve_output_target`` path, which would route the
+                        # non-state ``handoff`` target to ``blocked``. Edge-
+                        # driven: any step whose rules route an outcome →
+                        # handoff reaches here (today only ``chat``).
+                        if rule_target == "handoff":
+                            # Conversational steps store their turn as a chat
+                            # message (with the marker line stripped from the
+                            # display) so the conversation isn't lost on park.
+                            if info.step.conversational:
+                                await self.db.add_message(
+                                    item.id,
+                                    "agent",
+                                    info.step.job_type,
+                                    _strip_handoff_marker(result.stdout),
+                                    "chat",
+                                    metadata=self._chat_message_metadata(info, result),
+                                )
+                            suggestion = _extract_handoff_suggestion(result.stdout)
+                            valid = {name for name, _desc in self._handoff_destinations()}
+                            if suggestion in valid:
+                                await self.source.save_artifact(
+                                    item.id,
+                                    info.step.job_type,
+                                    suggestion,
+                                    metadata={"artifact_name": "handoff_suggestion", "source": "agent"},
+                                )
+                            elif suggestion:
+                                logger.info(
+                                    "task %s: dropping handoff suggestion %r (not a loaded "
+                                    "hand-off-invocable destination)",
+                                    item.id,
+                                    suggestion,
+                                )
+                            # Park at ``waiting`` in the SAME state (non-
+                            # terminating). Mirrors the conversational default
+                            # park below — a same-state CAS, no SM edge needed,
+                            # no _dispatch_next_step, no promotion.
+                            cas = await self.db.atomic_transition(
+                                item.id,
+                                from_status="working",
+                                from_state=item.state,
+                                to_state=item.state,
+                                to_status="waiting",
+                                to_current_step=info.step.name,
+                                audit_on_win=None,
+                            )
+                            if not cas.won:
+                                continue
+                            continue
                         # Phase 2 — pr-fix NEEDS_DECISION escalation. The
                         # flow.yaml rule targets the synthetic "needs_input"
                         # value; ``resolve_output_target`` would route it
@@ -6154,27 +6313,10 @@ class OrchestratorService:
                         # Check for conversational step completion via rules
                         if info.step.conversational:
                             spec = check_conversational_rules(info.step, result.stdout)
-                            # Store AI response as chat message with execution metadata.
-                            # ``agent_model`` records the resolved per-step model
-                            # (ADR-022: step.model or the global default), applied
-                            # here independently against the drained ResolvedJob.
-                            chat_meta: dict[str, object] = {"duration_ms": result.duration_ms}
-                            chat_meta["agent_model"] = info.step.model or self.config.model
-                            if result.model:
-                                chat_meta["model"] = result.model
-                            # ADR-023 — the registered runner name (e.g. ``gpt``,
-                            # ``default``), carried from the dispatch body on the
-                            # in-flight record. Replaces the former class-name
-                            # ``runner`` field; the frontend reads ``agent_model``,
-                            # not ``runner``, so this is a clean swap.
-                            if info.agent_runner_name is not None:
-                                chat_meta["agent_runner"] = info.agent_runner_name
-                            if result.input_tokens is not None:
-                                chat_meta["input_tokens"] = result.input_tokens
-                            if result.output_tokens is not None:
-                                chat_meta["output_tokens"] = result.output_tokens
-                            if result.cost_usd is not None:
-                                chat_meta["cost_usd"] = result.cost_usd
+                            # Store AI response as chat message with execution
+                            # metadata (duration, resolved per-step model, runner,
+                            # tokens, cost) — see ``_chat_message_metadata``.
+                            chat_meta = self._chat_message_metadata(info, result)
                             await self.db.add_message(
                                 item.id, "agent", info.step.job_type, result.stdout, "chat", metadata=chat_meta
                             )
@@ -7433,10 +7575,13 @@ class OrchestratorService:
                 base = base.replace("{project_name}", project.name).replace("{project_path}", str(project.path))
             except ProjectNotFound:
                 pass
-        # Make any stdout-marker requirement non-optional (ADR-039). Appended
-        # BEFORE the conversational early-return below, because the marker steps
-        # (spec, verify) are themselves conversational.
-        base += _marker_requirement_footer(step.rules)
+        # Make any stdout-marker requirement non-optional (ADR-039), and — for a
+        # step routing ``→ handoff`` (ADR-044 Phase 4c) — advertise the optional
+        # hand-off suggestion marker with the valid destinations. Appended BEFORE
+        # the conversational early-return below, because the marker steps (spec,
+        # verify, chat) are themselves conversational. The destinations are the
+        # same ``hand-off``-invocable catalog the chat suggest-block renders.
+        base += _marker_requirement_footer(step.rules, handoff_destinations=self._render_available_processes())
         # Skip preamble for conversational steps — it instructs file writing
         # which conflicts with spec-style prompts that say "do not create files"
         if step.conversational:
