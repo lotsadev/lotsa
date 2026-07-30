@@ -121,6 +121,88 @@ class FlowResponse(BaseModel):
     gate_states: list[str]
 
 
+# ── ADR-044 Phase 6 — read-only workflow graph viewer ─────────────
+
+
+class AgentInfoResponse(BaseModel):
+    """The declared properties of the agent resolved for a graph node.
+
+    ``agent_class`` (not ``class``, reserved in Python/TS) carries the
+    worker|gate axis; ``outcomes`` is the closed emittable set. ``None`` on a
+    node means an ``action``/``monitor`` step (no agent).
+    """
+
+    name: str
+    agent_class: str
+    outcomes: list[str]
+    needs_worktree: bool = False
+    produces_changes: bool = False
+
+
+class WorkflowGraphNodeResponse(BaseModel):
+    """One node of a workflow flow — a job with its resolved agent + hooks."""
+
+    id: str
+    type: str
+    prompt_name: str | None = None
+    agent: AgentInfoResponse | None = None
+    is_gate: bool = False
+    conversational: bool = False
+    evaluate: bool = False
+    output: str | None = None
+    inputs: list[str] = []
+    prehooks: list[str] = []
+    posthooks: list[str] = []
+
+
+class WorkflowGraphEdgeResponse(BaseModel):
+    """One routing edge. ``outcome`` is the ``AGENT_RESULT:`` word (or ``None``
+    for a raw ``rules:`` pattern, in which case ``label`` carries the pattern).
+    ``kind`` is ``route`` (declared) or ``implicit`` (the fall-through forward
+    edge drawn so the happy path is visible)."""
+
+    source: str
+    target: str
+    outcome: str | None = None
+    kind: str
+    label: str | None = None
+
+
+class WorkflowFlowGraphResponse(BaseModel):
+    """One flow of a workflow (e.g. ``main`` / ``pr_fix``)."""
+
+    name: str
+    nodes: list[WorkflowGraphNodeResponse]
+    edges: list[WorkflowGraphEdgeResponse]
+
+
+class WorkflowGraphResponse(BaseModel):
+    """Response for GET /api/workflows/{name}/graph.
+
+    ``source`` is the provenance (``bundled`` | ``repo``) the viewer badges;
+    ``project`` / ``project_name`` identify the owning project for a repo
+    workflow (both ``None`` for bundled)."""
+
+    name: str
+    source: str
+    project: str | None = None
+    project_name: str | None = None
+    flows: list[WorkflowFlowGraphResponse]
+
+
+class AgentDetailResponse(BaseModel):
+    """Response for GET /api/workflows/{name}/agents/{prompt_name} — the
+    node-detail inspector's payload (declared properties + prompt bodies)."""
+
+    name: str
+    agent_class: str
+    outcomes: list[str]
+    needs_worktree: bool = False
+    produces_changes: bool = False
+    system_prompt: str | None = None
+    user_prompt: str | None = None
+
+
 class DiffResponse(BaseModel):
     """Response for GET /api/tasks/{id}/diff."""
 

@@ -50,6 +50,7 @@ from lotsa.flows import (
     evaluate_output_rules,
     find_step,
     resolve_output_target,
+    serialize_process_graph,
 )
 from lotsa.push_step import CC_TITLE_RE
 from lotsa.status import TaskStatusLiteral
@@ -233,6 +234,15 @@ class ProjectNotFound(ValueError):
     Validation happens at task-creation time — not first dispatch — so the
     operator learns immediately. Inherits from ``ValueError`` so existing
     ``except ValueError:`` callers keep working.
+    """
+
+
+class WorkflowNotFound(ValueError):
+    """Raised when a workflow-graph lookup names a workflow absent from the
+    resolved catalog (bundled + the given project's repo workflows, ADR-044
+    Phase 6). Distinct from :class:`ProcessNotFound` (a task-creation error) so
+    the graph endpoint maps it to its own ``WORKFLOW_NOT_FOUND`` 404. Inherits
+    ``ValueError`` so existing ``except ValueError:`` callers keep working.
     """
 
 
@@ -1274,12 +1284,19 @@ class OrchestratorService:
         active_name = self._active_process_name
         # Bundled/inline catalog + (when scoped) the project's repo workflows.
         # Repo names cannot shadow bundled ones, so a plain merge is unambiguous.
+        # Track the repo entries separately so each summary can carry its
+        # ADR-044 Phase 6 provenance (``source``: ``repo`` vs ``bundled``) —
+        # derived here from which catalog the process came from, never threaded
+        # onto ``Process`` (which has no such field). The same ``source`` flag the
+        # viewer badges is the signal a future editor uses to decide editability
+        # (bundled live in the wheel — read-only).
+        repo_processes = self._project_processes.get(project_id, {}) if project_id is not None else {}
         catalog: dict[str, Process] = dict(self._processes)
-        if project_id is not None:
-            catalog.update(self._project_processes.get(project_id, {}))
+        catalog.update(repo_processes)
         summaries: list[dict[str, Any]] = []
         for name, process in catalog.items():
             flow = process.flows.get("main") or next(iter(process.flows.values()))
+            is_repo = name in repo_processes
             summaries.append(
                 {
                     "name": name,
@@ -1297,10 +1314,82 @@ class OrchestratorService:
                     # hand-off) so the new-task picker and the hand-off dialog
                     # filter on it instead of hardcoding the name ``"chat"``.
                     "invocable": list(process.invocable),
+                    # ADR-044 Phase 6 — provenance for the workflow viewer badge.
+                    # ``inline`` lotsa.yaml processes collapse into ``bundled`` for
+                    # v1 (the distinction that matters is repo-vs-not).
+                    "source": "repo" if is_repo else "bundled",
+                    "project": project_id if is_repo else None,
                 }
             )
         summaries.sort(key=lambda s: (not s["is_active"], s["name"]))
         return summaries
+
+    def _resolve_workflow(self, name: str, project_id: str | None) -> tuple[Process, str]:
+        """Resolve a workflow by name to its ``(Process, source)`` (ADR-044 Phase 6).
+
+        Precedence mirrors the task-dispatch resolution: the given project's
+        repo catalog first (``source == "repo"``), then the bundled/inline
+        catalog (``source == "bundled"``). An unknown name raises
+        :class:`WorkflowNotFound`. Repo names cannot shadow bundled ones, so the
+        project-first lookup can only ever add project-local workflows, never
+        mask a bundled one.
+        """
+        project_catalog = self._project_processes.get(project_id, {}) if project_id is not None else {}
+        if name in project_catalog:
+            return project_catalog[name], "repo"
+        if name in self._processes:
+            return self._processes[name], "bundled"
+        raise WorkflowNotFound(f"Workflow {name!r} not found")
+
+    def workflow_graph(self, name: str, project_id: str | None = None) -> dict[str, Any]:
+        """Serialize a workflow's read-only agent graph (ADR-044 Phase 6).
+
+        Resolves the workflow (project repo catalog → bundled), derives its
+        provenance, and serializes the *resolved* ``Process`` via
+        :func:`~lotsa.flows.serialize_process_graph` — so bundled, inline, and
+        repo-shipped (Phase 5) workflows all render through one source-agnostic
+        path. ``project`` is the owning project id for a repo workflow, else
+        ``None``; ``project_name`` is its human label when resolvable.
+        """
+        process, source = self._resolve_workflow(name, project_id)
+        graph = serialize_process_graph(process)
+        owning_project = project_id if source == "repo" else None
+        project_name = None
+        if owning_project is not None:
+            project_name = next(
+                (p["name"] for p in self.list_projects_summary() if p["id"] == owning_project),
+                owning_project,
+            )
+        return {
+            "name": name,
+            "source": source,
+            "project": owning_project,
+            "project_name": project_name,
+            "flows": graph["flows"],
+        }
+
+    def agent_detail(self, name: str, prompt_name: str, project_id: str | None = None) -> dict[str, Any]:
+        """Resolve one agent's declared properties + prompt bodies (ADR-044 Phase 6).
+
+        Reads through the workflow's own prompt registry so a repo-shipped agent
+        resolves the same way its workflow does (namespaced override → bundled →
+        repo). Feeds the viewer's node-detail inspector — the future agent-editor
+        form, without inputs. Raises :class:`WorkflowNotFound` when the workflow
+        is unknown or the agent is not resolvable within it.
+        """
+        process, _source = self._resolve_workflow(name, project_id)
+        agent = process.registry.load_agent_optional(prompt_name)
+        if agent is None:
+            raise WorkflowNotFound(f"Agent {prompt_name!r} not found in workflow {name!r}")
+        return {
+            "name": prompt_name,
+            "agent_class": agent.agent_class,
+            "outcomes": list(agent.outcomes),
+            "needs_worktree": agent.needs_worktree,
+            "produces_changes": agent.produces_changes,
+            "system_prompt": process.registry.load_optional(f"{prompt_name}-system"),
+            "user_prompt": process.registry.load_optional(f"{prompt_name}-user"),
+        }
 
     @staticmethod
     def _timeout_status(elapsed_s: int, step: FlowStep | None) -> Literal["ok", "warn", "over"]:
