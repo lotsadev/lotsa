@@ -454,7 +454,11 @@ parked status.
 `lotsa/server/` is a FastAPI app that exposes the dashboard:
 
 - **API:** `/api/tasks`, `/api/tasks/{id}/messages`, `/api/tasks/{id}/events`
-  (SSE), plus action endpoints (approve, retry, revise, etc.).
+  (SSE), plus action endpoints (approve, retry, revise, etc.). ADR-044 Phase 6
+  adds the read-only workflow-viewer reads `/api/workflows/{name}/graph` and
+  `/api/workflows/{name}/agents/{prompt_name}` (both `?project=`-scoped); the
+  frontend viewer lives under `frontend/src/components/workflows/` and uses React
+  Flow + Dagre (two frontend deps added in that PR).
 - **Static frontend:** `lotsa/server/static/dist/` holds the built React
   app — **gitignored build artifact**, not committed. Run `npm run build`
   in `lotsa/frontend/` before `lotsa serve` (see *Dev workflow* below).
@@ -994,5 +998,22 @@ rules.
   *into* orchestrator-owned deterministic hooks; `agents._parse_repo_agent` is
   the seam for any future operator-owned-property tightening. Deferred:
   task-scoped/branch-sensitive resolution, build-time review-before-push graph
-  validation, cross-repo sharing (ADR-035). Phase 6 (visual editor) remains
-  proposed. Amends ADR-043/039/014/027.
+  validation, cross-repo sharing (ADR-035). **Phase 6 (viewer)** ships a
+  read-only workflow graph viewer: `flows.serialize_process_graph(process)`
+  serializes a *resolved* `Process` into per-flow nodes (jobs → resolved agent +
+  `class`/`outcomes`/hooks) + edges (per-binding `routes:`/`rules:` targets, an
+  implicit forward edge for the happy path, and materialized `blocked`/
+  `needs_input`/`complete` terminal sinks) — source-agnostic, so bundled/inline/
+  repo workflows all render through one path. `OrchestratorService.workflow_graph`
+  / `agent_detail` resolve the workflow (project repo catalog → bundled) and
+  derive provenance (`source`: `repo` vs `bundled`) from the `_processes` vs
+  `_project_processes` split — never threaded onto `Process`; the same `source`/
+  `project` now rides `list_processes_summary`. `GET /api/workflows/{name}/graph`
+  + `/agents/{prompt_name}` (both `?project=`-scoped) serve the viewer. The
+  frontend adds React Flow (`@xyflow/react`) + Dagre (`@dagrejs/dagre`) — two new
+  MIT/self-hostable deps — a header-launched viewer (workflow list + provenance
+  badge, Dagre-laid-out board of shadcn nodes, node-click agent inspector,
+  main/pr_fix flow selector), read-only (`nodesDraggable`/`nodesConnectable`/
+  `elementsSelectable` off + hidden handles = the editor seam). The **editor**
+  (write affordances, DB-backed workflow storage, agent authoring surface) stays
+  deferred. Amends ADR-043/039/014/027.
