@@ -2201,7 +2201,7 @@ class OrchestratorService:
         """
         return "\n".join(f"- {name}: {desc}" for name, desc in self._handoff_destinations())
 
-    def _chat_message_metadata(self, info: Any, result: Any) -> dict[str, object]:
+    def _chat_message_metadata(self, info: InFlightStep, result: AgentResult) -> dict[str, object]:
         """Execution metadata for a conversational step's stored chat message.
 
         Shared by the conversational drain branch and the ADR-044 Phase 4c

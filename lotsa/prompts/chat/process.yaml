@@ -2,8 +2,9 @@ process: chat
 description: |
   Exploration and triage. Talk through an idea with the operator until the
   next step is clear, then suggest promoting to the matching process. One
-  conversational step that runs as a REPL — no completion marker, no commit
-  pressure. Stays open until the operator promotes or abandons it.
+  conversational step that runs as a REPL — never self-completes, no commit
+  pressure; it may record an optional, non-terminating hand-off suggestion.
+  Stays open until the operator promotes or abandons it.
 # ADR-044 Phase 4 — chat is a Think-phase entry point: selectable at task
 # start, but never advertised as a hand-off (promotion) destination (it never
 # self-refers). ``invocable`` drives this off a declared property instead of a
