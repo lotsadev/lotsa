@@ -22,7 +22,10 @@ jobs:
     # abandons it; ``handoff`` is a non-terminating park, not a transition.
     routes: { COMPLETED: handoff }
 flows:
+  # The ``main`` flow runs the single ``chat`` step with no per-flow routing
+  # override, so it inherits the job-level ``routes: { COMPLETED: handoff }``
+  # above (``_resolve_jobs`` falls back to ``job.rules`` when a binding declares
+  # none). Don't re-declare the identical routes here — a binding-level override
+  # only earns its place when it *diverges* from the job default.
   main:
-    steps:
-      - name: chat
-        routes: { COMPLETED: handoff }
+    steps: [chat]
