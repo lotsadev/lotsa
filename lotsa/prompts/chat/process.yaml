@@ -2,8 +2,9 @@ process: chat
 description: |
   Exploration and triage. Talk through an idea with the operator until the
   next step is clear, then suggest promoting to the matching process. One
-  conversational step that runs as a REPL — no completion marker, no commit
-  pressure. Stays open until the operator promotes or abandons it.
+  conversational step that runs as a REPL — never self-completes, no commit
+  pressure; it may record an optional, non-terminating hand-off suggestion.
+  Stays open until the operator promotes or abandons it.
 # ADR-044 Phase 4 — chat is a Think-phase entry point: selectable at task
 # start, but never advertised as a hand-off (promotion) destination (it never
 # self-refers). ``invocable`` drives this off a declared property instead of a
@@ -14,8 +15,18 @@ jobs:
     type: agent
     prompt: chat
     conversational: true
-    # No output rule / completion marker: the chat step never self-completes.
-    # It runs as a REPL until the operator promotes (ADR-027) or abandons it.
+    # ADR-044 Phase 4c — suggesting a hand-off is edge-routed like every other
+    # outcome. ``COMPLETED <workflow>`` records a hand-off suggestion (the
+    # drainer's handoff branch: validate → store ``handoff_suggestion`` →
+    # park) and NEVER advances or promotes. The chat step still self-completes
+    # nothing — it runs as a REPL until the operator promotes (ADR-027) or
+    # abandons it; ``handoff`` is a non-terminating park, not a transition.
+    routes: { COMPLETED: handoff }
 flows:
+  # The ``main`` flow runs the single ``chat`` step with no per-flow routing
+  # override, so it inherits the job-level ``routes: { COMPLETED: handoff }``
+  # above (``_resolve_jobs`` falls back to ``job.rules`` when a binding declares
+  # none). Don't re-declare the identical routes here — a binding-level override
+  # only earns its place when it *diverges* from the job default.
   main:
     steps: [chat]

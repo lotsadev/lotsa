@@ -441,8 +441,7 @@ def test_process_without_catalog_fields_still_loads(tmp_path):
 
 
 def test_chat_process_loads_as_single_conversational_step():
-    """The bundled ``chat`` process is one conversational REPL step with no
-    completion marker (ADR-027 §3 / R8).
+    """The bundled ``chat`` process is one conversational REPL step (ADR-027 §3 / R8).
 
     Fails pre-fix: ``chat`` is not a bundled preset (ValueError 'Unknown
     process')."""
@@ -451,8 +450,11 @@ def test_chat_process_loads_as_single_conversational_step():
     assert len(main.bindings) == 1
     step = main.steps[0]
     assert step.conversational is True
-    # A REPL step has no auto-completion output rule — it runs until promoted.
-    assert step.rules == []
+    # ADR-044 Phase 4c — the only rule is the ``COMPLETED → handoff`` edge, which
+    # records an operator-gated hand-off suggestion and parks (non-terminating).
+    # It does NOT self-complete: the REPL still runs until the operator promotes
+    # or abandons it.
+    assert [(r.target, r.pattern) for r in step.rules] == [("handoff", "^AGENT_RESULT: COMPLETED")]
 
 
 def test_chat_process_has_description():

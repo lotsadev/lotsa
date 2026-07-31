@@ -63,7 +63,13 @@ packages = ["lotsa", "rigg"]
 [tool.ruff]
 target-version = "py312"
 line-length = 120
-extend-exclude = []
+# Ruff's scope is Python. Ruff >=0.16 began discovering and reformatting Python
+# code blocks *inside* Markdown by default, which reflows hand-authored doc
+# snippets (ADRs, CLAUDE.md) that were written for readability and merged green
+# under older ruff — turning `ruff format --check .` red repo-wide on files no
+# code change touched. Keep the formatter/linter off Markdown so docs stay
+# hand-authored; ruff still covers every .py/.pyi file.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
