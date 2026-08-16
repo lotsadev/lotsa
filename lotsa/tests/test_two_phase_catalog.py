@@ -25,7 +25,6 @@ import pytest
 from lotsa.flows import (
     BUNDLED_PROMPTS,
     PRESET_NAMES,
-    _resolve_prompts_search_paths,
     build_process,
 )
 
@@ -136,14 +135,153 @@ def test_build_plan_is_first_and_ungated():
     assert "planned" not in main.state_machine.states
 
 
-def test_build_commit_posthooks_on_test_code_verify_prfix():
-    """test/code/verify/pr-fix keep posthooks: [commit] (plan §2)."""
+def test_build_commit_posthooks_derived_on_producing_steps():
+    """test/code/pr-fix resolve to posthooks: [commit] — now DERIVED from each
+    agent's ``produces_changes: true`` property (ADR-044 Phase 2), not from a
+    hand-declared ``posthooks: [commit]`` in the YAML.
+
+    Passes both pre- and post-Phase-2 for these three (they carried an explicit
+    commit before, derive it after); the behaviour change is on ``verify``,
+    pinned in ``test_build_verify_no_longer_commits`` below.
+    """
+    import lotsa.posthooks  # noqa: F401 — ensures the built-in ``commit`` exists
+
     process = build_process("build")
     by_name = {j.name: j for j in process.jobs}
-    for step in ("test", "code", "verify", "pr-fix"):
+    for step in ("test", "code", "pr-fix"):
         assert by_name[step].posthooks == ["commit"], (
             f"{step} must run the commit posthook; got {by_name[step].posthooks!r}"
         )
+
+
+def test_build_verify_no_longer_commits():
+    """``verify`` is a gate (``produces_changes: false``): it observes and, on
+    ``FAILED``, routes to ``code`` which commits. Under ADR-044 Phase 2 the
+    contradictory ``posthooks: [commit]`` comes off it, so it resolves to no
+    posthooks.
+
+    RED pre-Phase-2: build's ``verify`` still declares ``posthooks: [commit]``,
+    so it resolves to ``["commit"]``.
+    """
+    import lotsa.posthooks  # noqa: F401
+
+    process = build_process("build")
+    by_name = {j.name: j for j in process.jobs}
+    assert by_name["verify"].posthooks == [], (
+        f"verify must not run the commit posthook (it observes, does not write); got {by_name['verify'].posthooks!r}"
+    )
+
+
+def test_bundled_effective_posthooks_preserved_except_verify():
+    """Behaviour-preservation pin for the derive-and-drop migration (plan §Tests).
+
+    Every bundled ``build``/``fix`` step resolves to the SAME effective posthook
+    set as before Phase 2 — EXCEPT ``build``'s ``verify``, which loses commit.
+    Encodes the whole migration in one place: producing agents derive
+    ``[commit]``; non-producers / gates / action / monitor steps derive nothing.
+
+    RED pre-Phase-2: ``build``'s ``verify`` resolves to ``["commit"]``, not ``[]``.
+    """
+    import lotsa.posthooks  # noqa: F401
+
+    expected_build = {
+        "plan": [],
+        "test": ["commit"],
+        "code": ["commit"],
+        "review": [],
+        "pr-fix": ["commit"],
+        "verify": [],  # ← the one change
+        "pr_summary": [],
+        "push_pr": [],  # action
+        "resolve_conflicts": ["commit"],
+        "wait_for_pr_signal": [],  # monitor
+    }
+    expected_fix = {
+        "code": ["commit"],
+        "review": [],
+        "pr-fix": ["commit"],
+        "pr_summary": [],
+        "push_pr": [],  # action
+        "resolve_conflicts": ["commit"],
+        "wait_for_pr_signal": [],  # monitor
+    }
+
+    build_jobs = {j.name: j for j in build_process("build").jobs}
+    for name, expected in expected_build.items():
+        assert build_jobs[name].posthooks == expected, (
+            f"build/{name}: expected posthooks {expected!r}, got {build_jobs[name].posthooks!r}"
+        )
+
+    fix_jobs = {j.name: j for j in build_process("fix").jobs}
+    for name, expected in expected_fix.items():
+        assert fix_jobs[name].posthooks == expected, (
+            f"fix/{name}: expected posthooks {expected!r}, got {fix_jobs[name].posthooks!r}"
+        )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# ADR-044 Phase 3 — the ``worktree`` prehook is DERIVED from each agent's
+# ``needs_worktree`` property (opt-OUT: worktree is the universal default; only
+# a ``needs_worktree: false`` agent opts out).
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def test_bundled_effective_prehooks_worktree_everywhere_except_monitor():
+    """Every dispatched ``build``/``fix`` step (agent + action) derives the
+    ``worktree`` prehook; monitor steps (which never created a worktree at
+    dispatch) derive none. No bundled agent except ``chat`` sets
+    ``needs_worktree: false``, and ``chat`` isn't in these two processes.
+
+    RED pre-Phase-3: ``ResolvedJob`` has no ``prehooks`` attribute, so every
+    access raises ``AttributeError``.
+    """
+    import lotsa.prehooks  # noqa: F401 — the built-in ``worktree`` must be registered
+
+    expected_build = {
+        "plan": ["worktree"],
+        "test": ["worktree"],
+        "code": ["worktree"],
+        "review": ["worktree"],
+        "pr-fix": ["worktree"],
+        "verify": ["worktree"],
+        "pr_summary": ["worktree"],
+        "push_pr": ["worktree"],  # action — always got a worktree pre-Phase-3
+        "resolve_conflicts": ["worktree"],
+        "wait_for_pr_signal": [],  # monitor — never created one
+    }
+    expected_fix = {
+        "code": ["worktree"],
+        "review": ["worktree"],
+        "pr-fix": ["worktree"],
+        "pr_summary": ["worktree"],
+        "push_pr": ["worktree"],  # action
+        "resolve_conflicts": ["worktree"],
+        "wait_for_pr_signal": [],  # monitor
+    }
+
+    build_jobs = {j.name: j for j in build_process("build").jobs}
+    for name, expected in expected_build.items():
+        assert build_jobs[name].prehooks == expected, (
+            f"build/{name}: expected prehooks {expected!r}, got {build_jobs[name].prehooks!r}"
+        )
+
+    fix_jobs = {j.name: j for j in build_process("fix").jobs}
+    for name, expected in expected_fix.items():
+        assert fix_jobs[name].prehooks == expected, (
+            f"fix/{name}: expected prehooks {expected!r}, got {fix_jobs[name].prehooks!r}"
+        )
+
+
+def test_chat_process_derives_no_worktree_prehook():
+    """The ``chat`` process's sole step opts out of the worktree prehook — chat
+    tasks stop creating a worktree they never use (ADR-044 Phase 3's payoff).
+
+    RED pre-Phase-3: no ``prehooks`` attribute; worktree creation is
+    unconditional for every step including chat.
+    """
+    process = build_process("chat")
+    for j in process.jobs:
+        assert j.prehooks == [], f"chat job {j.name!r} must derive no worktree prehook; got {j.prehooks!r}"
 
 
 def test_build_drops_all_spec_and_plan_inputs():
@@ -159,18 +297,18 @@ def test_build_review_routing_pass_next_fail_code():
     main = build_process("build").flows["main"]
     binding = main.binding_for("review")
     targets = {(r.pattern, r.target) for r in (binding.rules or [])}
-    assert ("^REVIEW_PASS", "next") in targets
-    assert ("^REVIEW_FAIL", "code") in targets
+    assert ("^AGENT_RESULT: PASSED", "next") in targets
+    assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
 def test_build_verify_routing():
-    """verify: VERIFIED→next, NEEDS_CODE→code, NEEDS_REVIEW→review."""
+    """verify is a gate (ADR-044): PASSED→next, FAILED→code (the old two-way
+    NEEDS_CODE/NEEDS_REVIEW failure collapses to FAILED→code)."""
     process = build_process("build")
     by_name = {j.name: j for j in process.jobs}
     targets = {(r.pattern, r.target) for r in by_name["verify"].rules}
-    assert ("^VERIFIED:", "next") in targets
-    assert ("^NEEDS_CODE:", "code") in targets
-    assert ("^NEEDS_REVIEW:", "review") in targets
+    assert ("^AGENT_RESULT: PASSED", "next") in targets
+    assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
 def test_build_pr_fix_subflow_shape():
@@ -206,11 +344,18 @@ def test_fix_process_loads_with_main_and_pr_fix_flows():
 
 
 def test_fix_main_flow_step_order():
-    """fix's main flow is code→review→push_pr→wait_for_pr_signal (it now pushes)."""
+    """fix's main flow is code→review→pr_summary→push_pr→wait_for_pr_signal.
+
+    fix opens a human-facing PR, so it summarizes (pr_summary → pr_description
+    artifact) before push — without it, the PR title falls back to the raw
+    first-prompt commit subject. pr_summary lives in ``main`` only (not the
+    ``pr_fix`` sub-flow, which must not regenerate PR text on a re-push).
+    """
     main = build_process("fix").flows["main"]
     assert [b.name for b in main.bindings] == [
         "code",
         "review",
+        "pr_summary",
         "push_pr",
         "wait_for_pr_signal",
     ]
@@ -239,8 +384,8 @@ def test_fix_review_routing_pass_next_fail_code():
     main = build_process("fix").flows["main"]
     binding = main.binding_for("review")
     targets = {(r.pattern, r.target) for r in (binding.rules or [])}
-    assert ("^REVIEW_PASS", "next") in targets
-    assert ("^REVIEW_FAIL", "code") in targets
+    assert ("^AGENT_RESULT: PASSED", "next") in targets
+    assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
 def test_fix_pr_fix_subflow_shape():
@@ -263,7 +408,7 @@ _BUILD_PROMPT_STEMS = (
     "coding",
     "review",
     "verify",
-    "pr-fix",
+    "pr_fix",
     "resolve_conflicts",
     "pr_summary",
 )
@@ -277,31 +422,23 @@ def test_build_resolves_every_referenced_prompt():
         assert system.strip(), f"{stem}-system.md resolved empty for build"
 
 
-def test_fix_coding_from_own_dir_generics_fall_back_to_build():
-    """fix ships only its distinctive coding prompt; review/pr-fix/resolve_conflicts
-    resolve via the build fallback (acceptance #2)."""
+def test_fix_resolves_its_distinct_coder_and_shared_agents_from_catalog():
+    """ADR-044: fix references its distinctive ``fix_coding`` agent and shares
+    ``review``/``pr_fix``/``resolve_conflicts`` with build — all resolved from the
+    single agent catalog (the old fix→build prompt fallback is gone)."""
     registry = build_process("fix").registry
-    # Own dir.
-    assert registry.load("coding-system").strip()
-    # Fallback to build/.
-    for stem in ("review", "pr-fix", "resolve_conflicts"):
-        assert registry.load(f"{stem}-system").strip(), f"fix must resolve {stem}-system via the build fallback"
+    # fix's distinctive coder.
+    assert registry.load("fix_coding-system").strip()
+    # Shared catalog agents.
+    for stem in ("review", "pr_fix", "resolve_conflicts"):
+        assert registry.load(f"{stem}-system").strip(), f"fix must resolve {stem}-system from the catalog"
 
 
-def test_resolve_prompts_search_paths_fix_falls_back_to_build():
-    """The fallback branch routes ``fix`` → its own dir + ``build`` (was
-    ``quickfix`` → ``full``)."""
-    paths = _resolve_prompts_search_paths("fix", None)
-    assert (BUNDLED_PROMPTS / "fix") in paths
-    assert (BUNDLED_PROMPTS / "build") in paths
-
-
-def test_unknown_process_default_fallback_is_build_not_standard():
-    """A non-preset flow name falls back to the ``build`` generic prompts,
-    since ``standard`` is deleted."""
-    paths = _resolve_prompts_search_paths("some_inline_process", None)
-    assert (BUNDLED_PROMPTS / "build") in paths
-    assert (BUNDLED_PROMPTS / "standard") not in paths
+# NOTE (ADR-044): prompt resolution moved to the shared agent catalog via
+# ``AgentPromptRegistry``; the former ``_resolve_prompts_search_paths`` per-process
+# fallback (and its two tests) were removed with the function. Catalog resolution
+# is covered by ``test_fix_resolves_its_distinct_coder_and_shared_agents_from_catalog``
+# and ``test_agent_catalog.py``.
 
 
 # ───────────────────────────────────────────────────────────────────────────

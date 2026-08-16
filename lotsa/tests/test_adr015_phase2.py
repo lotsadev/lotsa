@@ -9,7 +9,7 @@ Tests target the following spec requirements:
 4. ``_sync_branch_to_main`` on a conflict leaves markers in place (no
    ``git merge --abort``), so the agent can resolve them.
 5. A conflicted sync dispatches ``resolve_conflicts`` instead of blocking.
-6. ``CONFLICTS_RESOLVED:`` advances the task through to ``pr-fix``.
+6. ``AGENT_RESULT: COMPLETED:`` advances the task through to ``pr-fix``.
 7. ``NEEDS_INPUT:`` from ``resolve_conflicts`` parks at ``needs_input``.
 8. ``answer()`` re-dispatches ``resolve_conflicts`` with the operator's
    decision under ``## Revision Feedback``.
@@ -498,7 +498,7 @@ class TestPublishConflictDispatchesResolveConflicts:
             step=pr_fix_step,
             agent_result=AgentResult(
                 success=True,
-                stdout="PR_FIX_DONE: addressed feedback\n",
+                stdout="AGENT_RESULT: COMPLETED: addressed feedback\n",
                 stderr="",
                 return_code=0,
                 duration_ms=100,
@@ -553,17 +553,17 @@ class TestPublishConflictDispatchesResolveConflicts:
 
 
 # ---------------------------------------------------------------------------
-# 6. CONFLICTS_RESOLVED: advances to pr-fix
+# 6. AGENT_RESULT: COMPLETED: advances to pr-fix
 # ---------------------------------------------------------------------------
 
 
 class TestConflictsResolvedMarkerRouting:
-    """``CONFLICTS_RESOLVED:`` from the ``resolve_conflicts`` step must route
+    """``AGENT_RESULT: COMPLETED:`` from the ``resolve_conflicts`` step must route
     the task forward to ``pr-fix``.
 
     Tests flow through ``dispatch_pr_fix`` on a conflicted worktree so the full
     path is exercised: conflict detected → resolve_conflicts dispatched → agent
-    emits CONFLICTS_RESOLVED → pr-fix dispatched.
+    emits AGENT_RESULT: COMPLETED → pr-fix dispatched.
 
     Pre-fix failure shape: Phase 1 blocks the task at ``dispatch_pr_fix`` before
     any agent runs, so the task lands in ``blocked``, the runner records zero
@@ -633,12 +633,14 @@ class TestConflictsResolvedMarkerRouting:
 
     def test_conflicts_resolved_advances_to_pr_fixing(self, tmp_path, run, monkeypatch):
         """A full-path test: conflicted sync → resolve_conflicts dispatched →
-        agent emits ``CONFLICTS_RESOLVED:`` → task advances to pr-fixing.
+        agent emits ``AGENT_RESULT: COMPLETED:`` → task advances to pr-fixing.
 
         Pre-fix failure: Phase 1 blocks the task at ``dispatch_pr_fix``; the
         runner records 0 calls and ``state='blocked'`` — not ``pr-fixing``.
         """
-        svc, db = self._make_svc_with_conflict(tmp_path, run, resolve_stdout="CONFLICTS_RESOLVED: all markers resolved")
+        svc, db = self._make_svc_with_conflict(
+            tmp_path, run, resolve_stdout="AGENT_RESULT: COMPLETED: all markers resolved"
+        )
         rec = _PushRecorder()
         try:
             run(svc.start())
@@ -658,7 +660,7 @@ class TestConflictsResolvedMarkerRouting:
 
                 row = run(db.get_task(task.id))
                 assert row.state == "pr-fixing", (
-                    f"CONFLICTS_RESOLVED must advance task to pr-fixing, got state={row.state!r}. "
+                    f"AGENT_RESULT: COMPLETED must advance task to pr-fixing, got state={row.state!r}. "
                     "Pre-fix: Phase 1 blocks at dispatch_pr_fix; state='blocked'."
                 )
                 assert row.status == "working"
@@ -670,12 +672,14 @@ class TestConflictsResolvedMarkerRouting:
             raise
 
     def test_conflicts_resolved_dispatches_pr_fix_agent(self, tmp_path, run, monkeypatch):
-        """After CONFLICTS_RESOLVED routes to pr-fixing, the pr-fix agent must be
+        """After AGENT_RESULT: COMPLETED routes to pr-fixing, the pr-fix agent must be
         dispatched (runner receives a second call).
 
         Pre-fix failure: Phase 1 blocks; runner records 0 calls.
         """
-        svc, db = self._make_svc_with_conflict(tmp_path, run, resolve_stdout="CONFLICTS_RESOLVED: all markers resolved")
+        svc, db = self._make_svc_with_conflict(
+            tmp_path, run, resolve_stdout="AGENT_RESULT: COMPLETED: all markers resolved"
+        )
         rec = _PushRecorder()
         try:
             run(svc.start())
@@ -774,7 +778,7 @@ class TestResolveConflictsNeedsInputEscalation:
                 # Subsequent calls hang (shouldn't reach here before the assertions).
                 await self._gate.wait()
                 return AgentResult(
-                    success=True, stdout="CONFLICTS_RESOLVED: done", stderr="", return_code=0, duration_ms=1
+                    success=True, stdout="AGENT_RESULT: COMPLETED: done", stderr="", return_code=0, duration_ms=1
                 )
 
         svc = OrchestratorService(config, db)
@@ -977,7 +981,7 @@ class TestAnswerRedispatchesResolveConflicts:
                 self.calls.append({"user_prompt": user_prompt})
                 await self._gate.wait()
                 return AgentResult(
-                    success=True, stdout="CONFLICTS_RESOLVED: done", stderr="", return_code=0, duration_ms=1
+                    success=True, stdout="AGENT_RESULT: COMPLETED: done", stderr="", return_code=0, duration_ms=1
                 )
 
         svc = OrchestratorService(config, db)
@@ -1139,9 +1143,9 @@ def test_conflict_blocks_when_process_has_no_resolve_conflicts_step(tmp_path, ru
                         "prompt": "pr-fix",
                         "model": "sonnet",
                         "rules": [
-                            {"source": "stdout", "pattern": "^PR_FIX_DONE:", "target": "next"},
-                            {"source": "stdout", "pattern": "^PR_FIX_SKIPPED:", "target": "wait_for_pr_signal"},
-                            {"source": "stdout", "pattern": "^PR_FIX_BLOCKED:", "target": "blocked"},
+                            {"source": "stdout", "pattern": "^AGENT_RESULT: COMPLETED:", "target": "next"},
+                            {"source": "stdout", "pattern": "^AGENT_RESULT: SKIPPED:", "target": "wait_for_pr_signal"},
+                            {"source": "stdout", "pattern": "^AGENT_RESULT: FAILED:", "target": "blocked"},
                         ],
                     },
                     {"name": "push_pr", "type": "action", "tool": "push_pr"},
@@ -1159,9 +1163,13 @@ def test_conflict_blocks_when_process_has_no_resolve_conflicts_step(tmp_path, ru
                             {
                                 "name": "pr-fix",
                                 "rules": [
-                                    {"source": "stdout", "pattern": "^PR_FIX_DONE:", "target": "next"},
-                                    {"source": "stdout", "pattern": "^PR_FIX_SKIPPED:", "target": "wait_for_pr_signal"},
-                                    {"source": "stdout", "pattern": "^PR_FIX_BLOCKED:", "target": "blocked"},
+                                    {"source": "stdout", "pattern": "^AGENT_RESULT: COMPLETED:", "target": "next"},
+                                    {
+                                        "source": "stdout",
+                                        "pattern": "^AGENT_RESULT: SKIPPED:",
+                                        "target": "wait_for_pr_signal",
+                                    },
+                                    {"source": "stdout", "pattern": "^AGENT_RESULT: FAILED:", "target": "blocked"},
                                 ],
                             },
                             "push_pr",
@@ -1289,7 +1297,7 @@ def test_pr_fixing_to_resolving_conflicts_edge_in_pr_fix_sm():
 
 
 def test_conflicts_resolved_rule_edge_in_sm():
-    """The ``CONFLICTS_RESOLVED → pr-fix`` rule-target edge must be registered
+    """The ``AGENT_RESULT: COMPLETED → pr-fix`` rule-target edge must be registered
     in both pr_fix's and main's SM so the drainer can CAS the forward step.
 
     Pre-fix failure: no rule → no edge registered by _build_state_machine.
@@ -1304,7 +1312,7 @@ def test_conflicts_resolved_rule_edge_in_sm():
     pr_fix_sm = process.flows["pr_fix"].state_machine
     assert (resolve_step.active_state, pr_fix_job.queue_state) in pr_fix_sm.transitions, (
         f"pr_fix SM must have ({resolve_step.active_state!r}, {pr_fix_job.queue_state!r}) "
-        "for the CONFLICTS_RESOLVED → pr-fix rule routing."
+        "for the AGENT_RESULT: COMPLETED → pr-fix rule routing."
     )
 
 
@@ -1369,7 +1377,7 @@ def test_full_process_pr_fix_flow_contains_resolve_conflicts():
 
 
 def test_full_process_resolve_conflicts_has_conflicts_resolved_rule():
-    """``resolve_conflicts`` must declare a ``CONFLICTS_RESOLVED:`` output rule
+    """``resolve_conflicts`` must declare a ``AGENT_RESULT: COMPLETED:`` output rule
     routing to ``pr-fix``."""
     process = build_process("build")
     # The per-flow rule override in the pr_fix binding takes precedence, but the
@@ -1379,12 +1387,12 @@ def test_full_process_resolve_conflicts_has_conflicts_resolved_rule():
     assert resolve_step is not None
     rule_targets = {r.target for r in resolve_step.rules}
     assert "pr-fix" in rule_targets, (
-        f"resolve_conflicts must have a rule with target='pr-fix' (CONFLICTS_RESOLVED path). "
+        f"resolve_conflicts must have a rule with target='pr-fix' (AGENT_RESULT: COMPLETED path). "
         f"Got rule targets: {rule_targets}"
     )
     patterns = {r.pattern for r in resolve_step.rules}
-    assert any("CONFLICTS_RESOLVED" in p for p in patterns), (
-        f"resolve_conflicts must have a rule matching CONFLICTS_RESOLVED. Patterns: {patterns}"
+    assert any("AGENT_RESULT: COMPLETED" in p for p in patterns), (
+        f"resolve_conflicts must have a rule matching AGENT_RESULT: COMPLETED. Patterns: {patterns}"
     )
 
 

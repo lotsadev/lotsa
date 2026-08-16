@@ -723,6 +723,29 @@ class TestProcessesEndpointPromotionFields:
 
         run(_test())
 
+    def test_processes_expose_invocable(self, app_with_service, run):
+        """ADR-044 Phase 4 — ``GET /api/processes`` exposes the ``invocable``
+        property (a list of ``start``/``hand-off`` options) so the frontend
+        hand-off picker filters on it instead of the literal name ``"chat"``.
+
+        Fails pre-Phase-4: the ``invocable`` key is absent from the
+        ``ProcessSummary`` response."""
+        app, _ = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/api/processes")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data, "expected at least one loaded process"
+                for entry in data:
+                    assert "invocable" in entry, f"ProcessSummary must expose invocable; got {entry}"
+                    assert isinstance(entry["invocable"], list)
+                    assert all(isinstance(opt, str) for opt in entry["invocable"])
+
+        run(_test())
+
 
 class TestAttachmentsEndpoint:
     """``POST/GET /api/tasks/{id}/attachments`` — prompt file attachments (Path A).

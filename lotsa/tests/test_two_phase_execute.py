@@ -506,7 +506,7 @@ def test_chat_prompt_offers_spec_distillation():
 
     Fails pre-impl: chat-system.md carries no spec-distillation guidance today.
     """
-    text = (BUNDLED_PROMPTS / "chat" / "chat-system.md").read_text().lower()
+    text = (BUNDLED_PROMPTS / "agents" / "chat" / "system.md").read_text().lower()
     assert "spec" in text, "chat prompt must describe distilling a spec on request"
 
 
@@ -528,6 +528,6 @@ def test_build_planning_prompt_injects_carried_spec():
 
     Fails pre-impl: the build planning prompt doesn't exist.
     """
-    path = BUNDLED_PROMPTS / "build" / "planning-user.md"
+    path = BUNDLED_PROMPTS / "agents" / "planning" / "user.md"
     assert path.is_file(), "build/planning-user.md must exist"
     assert "{artifact:draft_spec}" in path.read_text()

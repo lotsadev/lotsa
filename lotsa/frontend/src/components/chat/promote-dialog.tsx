@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/select'
 import { promoteTask } from '@/api/tasks'
 import { useProcesses } from '@/hooks/use-processes'
+import { useTask } from '@/hooks/use-task'
 
 interface PromoteDialogProps {
   taskId: string
@@ -40,17 +41,45 @@ const handoffLabel = (name: string) => HANDOFF_LABELS[name] ?? name
 // forward automatically (promote_task seeds it under promotion_context and each
 // of the destination's declared promotion_inputs when called with no explicit
 // artifacts), so there are no per-input fields to fill in.
+//
+// ADR-044 Phase 4c — when the chat agent has recorded a `handoff_suggestion`
+// (the task detail's named-artifact map), the dialog pre-selects that
+// destination and turns the primary button into an accept-the-recommendation
+// action. The operator can still pick another destination or cancel and keep
+// chatting; promotion seeding is unchanged (still called with no artifacts).
 export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps) {
   const queryClient = useQueryClient()
   const { data: processes } = useProcesses()
+  const { data: taskData } = useTask(taskId)
   const [destination, setDestination] = useState<string>('')
 
-  // Don't offer the chat process as a destination — promotion never targets
-  // chat (no demotion; ADR-027 §7).
+  // ADR-044 Phase 4 — offer only workflows that advertise themselves as a
+  // hand-off destination (``invocable`` includes 'hand-off'), driving the
+  // filter off the declared property instead of the hardcoded name 'chat'.
+  // chat is ``invocable: [start]`` so it excludes itself; a payload missing the
+  // field (older server) defaults to offerable, preserving prior behaviour.
   const options = useMemo(
-    () => (processes ?? []).filter((p) => p.name !== 'chat'),
+    () =>
+      (processes ?? []).filter(
+        (p) => p.invocable === undefined || p.invocable.includes('hand-off')
+      ),
     [processes]
   )
+
+  // ADR-044 Phase 4c — the agent's recommendation, but only trust it if it is
+  // actually an offered destination (drops a stale / non-hand-off-invocable
+  // suggestion so a bad recommendation never drives a pre-selection).
+  const suggested = useMemo(() => {
+    const rec = taskData?.artifacts?.handoff_suggestion
+    return rec && options.some((p) => p.name === rec) ? rec : ''
+  }, [taskData, options])
+
+  // The effective selection: an explicit operator pick (``destination``) wins;
+  // otherwise fall back to the recommendation. Deriving it (rather than syncing
+  // ``destination`` in an effect) keeps the pre-selection reactive without a
+  // setState-in-effect, and the operator can still override via the dropdown.
+  const selected = destination || suggested
+  const isAccepting = selected !== '' && selected === suggested
 
   const mutation = useMutation({
     // No artifacts: the destination's first step (build's plan, fix's coding)
@@ -58,7 +87,7 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
     // promotion_context and each of the destination's declared promotion_inputs
     // (draft_spec for build, instruction for fix) when called with no explicit
     // fields.
-    mutationFn: () => promoteTask(taskId, destination, undefined),
+    mutationFn: () => promoteTask(taskId, selected, undefined),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', taskId] })
       onOpenChange(false)
@@ -84,7 +113,7 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
 
         <div className="flex flex-col gap-3">
           <Select
-            value={destination}
+            value={selected}
             onValueChange={(value) => {
               // Clear any prior refusal so a stale PROMOTE_NOT_ALLOWED message
               // doesn't linger after the operator picks a different destination.
@@ -121,8 +150,8 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
           <Button variant="secondary" onClick={() => onOpenChange(false)} disabled={mutation.isPending}>
             Cancel
           </Button>
-          <Button onClick={() => mutation.mutate()} disabled={!destination || mutation.isPending}>
-            Hand off
+          <Button onClick={() => mutation.mutate()} disabled={!selected || mutation.isPending}>
+            {isAccepting ? `Accept → ${handoffLabel(selected)}` : 'Hand off'}
           </Button>
         </DialogFooter>
       </DialogContent>

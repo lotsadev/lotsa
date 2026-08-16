@@ -26,21 +26,228 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import yaml as _yaml
 
-from rigg import DispatchRule, PromptRegistry, StateMachine, TransitionRule
+from lotsa.agents import AGENT_OUTCOMES, AGENTS_DIR
+from rigg import DispatchRule, StateMachine, TransitionRule
 from rigg.models import Item
+from rigg.prompt_registry import PromptNotFound
 
 if TYPE_CHECKING:
+    from lotsa.agents import Agent
     from rigg.models import AgentResult
 
 logger = logging.getLogger(__name__)
 
 BUNDLED_PROMPTS = Path(__file__).parent / "prompts"
+
+
+@runtime_checkable
+class PromptLoader(Protocol):
+    """The prompt-resolution surface the flow/orchestrator layer depends on.
+
+    Both :class:`rigg.PromptRegistry` and the catalog-aware
+    :class:`AgentPromptRegistry` (below) satisfy it — callers only ever invoke
+    ``load`` / ``load_optional``, so the process/flow config is typed against
+    this Protocol rather than either concrete class.
+    """
+
+    def load(self, name: str) -> str: ...
+
+    def load_optional(self, name: str) -> str | None: ...
+
+
+class AgentPromptRegistry:
+    """Load prompts from the ADR-044 agent catalog (``agents/<name>/<kind>.md``).
+
+    Presents the same ``load`` / ``load_optional`` surface as
+    :class:`rigg.PromptRegistry` so callers (the orchestrator, dispatch-rule
+    builders) are unchanged: they still ask for ``"<agent>-system"`` /
+    ``"<agent>-user"``.
+
+    **Namespaces (ADR-044 Phase 5).** A name's agent part may carry a
+    ``lotsa:`` (bundled) or ``repo:`` (repo-local) qualifier. Unqualified names
+    resolve through the whole chain; a qualifier binds one namespace. The
+    resolution precedence is **operator override → ``lotsa:`` (bundled) →
+    ``repo:`` (repo-local)** — repo is lowest-trust and can shadow neither the
+    operator override nor a bundled name. Concretely, for ``"<agent>-<kind>"``:
+
+    1. operator override dir, flat legacy name ``<agent>-<kind>.md`` (keeps
+       pre-catalog custom ``--prompts-dir`` layouts and inline-process prompts
+       working);
+    2. operator override dir, catalog layout ``<agent>/<kind>.md``;
+    3. the bundled catalog ``<catalog_dir>/<agent>/<kind>.md``;
+    4. the repo catalog ``<repo_agents_dir>/<agent>/<kind>.md`` (dir-layout
+       only; only for unqualified or explicit ``repo:`` names, and only for a
+       name passing the ``[a-z0-9_-]{1,64}`` charset rail —
+       :func:`lotsa.provenance.is_valid_repo_name`).
+
+    Every repo-dir candidate passes the containment guard (:meth:`_repo_candidate_ok`)
+    before it is read: the ``repo_agents_dir`` root must be a *real directory*
+    (never a symlink) and the candidate must resolve inside it, so neither a
+    symlinked ``agents`` dir nor a symlinked ``system.md`` pointing outside the
+    repo tree is ever injected.
+    """
+
+    def __init__(
+        self,
+        override_dir: Path | None,
+        catalog_dir: Path = AGENTS_DIR,
+        repo_agents_dir: Path | None = None,
+    ) -> None:
+        self.override_dir = override_dir
+        self.catalog_dir = catalog_dir
+        # The owning project's ``.lotsa/agents`` dir, or ``None`` for a bundled/
+        # inline process that ships no repo-local agents (ADR-044 Phase 5).
+        self.repo_agents_dir = repo_agents_dir
+
+    @staticmethod
+    def _split(name: str) -> tuple[str, str | None]:
+        for suffix in ("-system", "-user"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)], suffix[1:]
+        return name, None
+
+    @staticmethod
+    def _split_namespace(agent: str) -> tuple[str | None, str]:
+        """Peel a ``lotsa:`` / ``repo:`` qualifier off an agent name."""
+        for namespace in ("lotsa", "repo"):
+            prefix = f"{namespace}:"
+            if agent.startswith(prefix):
+                return namespace, agent[len(prefix) :]
+        return None, agent
+
+    def _candidates(self, name: str) -> list[tuple[Path, bool]]:
+        """Ordered ``(path, is_repo)`` prompt-file candidates for *name*.
+
+        ``is_repo`` flags a repo-catalog candidate so :meth:`load` can apply the
+        containment guard only where the trust boundary requires it.
+        """
+        agent_ns, kind = self._split(name)
+        namespace, agent = self._split_namespace(agent_ns)
+        flat = f"{agent}-{kind}" if kind is not None else agent
+
+        def override() -> list[tuple[Path, bool]]:
+            if self.override_dir is None:
+                return []
+            out: list[tuple[Path, bool]] = [(self.override_dir / f"{flat}.md", False)]
+            if kind is not None:
+                out.append((self.override_dir / agent / f"{kind}.md", False))
+            return out
+
+        def bundled() -> list[tuple[Path, bool]]:
+            out: list[tuple[Path, bool]] = []
+            if kind is not None:
+                out.append((self.catalog_dir / agent / f"{kind}.md", False))
+            out.append((self.catalog_dir / f"{flat}.md", False))
+            return out
+
+        def repo() -> list[tuple[Path, bool]]:
+            from lotsa.provenance import is_valid_repo_name
+
+            if self.repo_agents_dir is None or kind is None:
+                return []  # repo catalog is dir-layout only
+            if not is_valid_repo_name(agent):
+                return []  # rail: repo name charset — enforced on the real read path
+            return [(self.repo_agents_dir / agent / f"{kind}.md", True)]
+
+        if namespace == "lotsa":
+            return override() + bundled()  # override still outranks the bundled namespace
+        if namespace == "repo":
+            return repo()
+        return override() + bundled() + repo()
+
+    def _repo_candidate_ok(self, candidate: Path) -> bool:
+        """A repo candidate must stay inside a *verified* repo ``.lotsa/agents`` tree.
+
+        The tree root must be a **real directory, not a symlink**, before the
+        containment check means anything: if ``repo_agents_dir`` is itself a
+        symlink (e.g. ``.lotsa/agents -> ~/.ssh``), both ``candidate`` and the
+        root ``.resolve()`` *through the same symlink prefix*, so
+        :func:`~lotsa.provenance.is_contained` would be tautologically true and a
+        symlinked ``agents`` dir would leak operator content into a prompt.
+        Verifying the root is a real dir first is exactly what
+        :func:`~lotsa.provenance.repo_lotsa_root` does for ``.lotsa`` and
+        :func:`~lotsa.provenance._discover` relies on for workflows — the check
+        must be rooted at a verified directory, never a mutable/unverified one.
+        """
+        from lotsa.provenance import is_contained
+
+        root = self.repo_agents_dir
+        if root is None or root.is_symlink() or not root.is_dir():
+            return False
+        return is_contained(candidate, root)
+
+    def load(self, name: str) -> str:
+        if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
+            raise PromptNotFound(f"Invalid prompt name {name!r} — must be a plain basename")
+        for candidate, is_repo in self._candidates(name):
+            if not candidate.is_file():
+                continue
+            if is_repo and not self._repo_candidate_ok(candidate):
+                continue  # symlink-escape guard — never read outside the .lotsa tree
+            return candidate.read_text()
+        raise PromptNotFound(f"Prompt {name!r} not found in override {self.override_dir} or catalog {self.catalog_dir}")
+
+    def load_optional(self, name: str) -> str | None:
+        try:
+            return self.load(name)
+        except PromptNotFound:
+            return None
+
+    def _agent_yaml_candidates(self, name: str) -> list[tuple[Path, bool]]:
+        """Ordered ``(agent.yaml path, is_repo)`` candidates for agent *name*."""
+        from lotsa.provenance import is_valid_repo_name
+
+        namespace, agent = self._split_namespace(name)
+
+        def at(root: Path | None, is_repo: bool) -> list[tuple[Path, bool]]:
+            if root is None:
+                return []
+            if is_repo and not is_valid_repo_name(agent):
+                return []  # rail: repo name charset — enforced on the real read path
+            return [(root / agent / "agent.yaml", is_repo)]
+
+        if namespace == "lotsa":
+            return at(self.override_dir, False) + at(self.catalog_dir, False)
+        if namespace == "repo":
+            return at(self.repo_agents_dir, True)
+        return at(self.override_dir, False) + at(self.catalog_dir, False) + at(self.repo_agents_dir, True)
+
+    def load_agent_optional(self, name: str) -> Agent | None:
+        """Resolve the agent-catalog properties for prompt/agent *name* (ADR-044 Phase 2/5).
+
+        Mirrors :meth:`load`'s namespaced resolution roots — an operator-supplied
+        override wins over the bundled catalog, which wins over a repo-local
+        agent (ADR-044 Phase 5). Returns ``None`` when none exists (a non-catalog
+        prompt / inline process step), so the property-derived ``commit`` posthook
+        is simply a no-op there.
+
+        Used by :func:`_resolve_jobs` (to fold ``commit`` in when
+        ``produces_changes`` is true) and by
+        :func:`_validate_posthook_property_consistency` (to reject an explicit
+        ``commit`` on a non-producing agent). A malformed ``agent.yaml`` raises
+        ``ValueError`` — fail-loud at build time, matching the rest of the module.
+        """
+        from lotsa.agents import _parse_agent, _parse_repo_agent  # local import mirrors the validators' style
+
+        if not name or "/" in name or "\\" in name or ".." in name or Path(name).is_absolute():
+            return None
+        _namespace, agent = self._split_namespace(name)
+        for candidate, is_repo in self._agent_yaml_candidates(name):
+            if not candidate.is_file():
+                continue
+            if is_repo and not self._repo_candidate_ok(candidate):
+                continue  # symlink-escape guard
+            data = _yaml.safe_load(candidate.read_text()) or {}
+            return _parse_repo_agent(agent, data) if is_repo else _parse_agent(agent, data)
+        return None
+
 
 JobType = Literal["agent", "action", "monitor"]
 
@@ -86,7 +293,12 @@ class Job:
         prompt:         prompt file prefix (defaults to ``name``). None = no agent
         resume:         --resume from stored session_id
         evaluate:       human evaluates output before advancing
-        rules:          automatic output-based routing
+        rules:          automatic output-based routing. May be declared directly
+                        (``rules:`` — the escape hatch for file-source / raw-regex
+                        patterns) OR via the ``routes:`` sugar (ADR-044 Phase 4),
+                        a ``{OUTCOME: target}`` map that desugars into
+                        ``^AGENT_RESULT: <OUTCOME>`` stdout rules at parse time.
+                        A step declares one or the other, never both.
         conversational: chat-style step with iterative messages
         output:         artifact name this step produces
         inputs:         artifact names required before dispatch
@@ -107,6 +319,17 @@ class Job:
                         success-state transition. ``[commit]`` is the built-in.
         commit_prefix:  Conventional-Commits prefix for the ``commit`` posthook's
                         deterministic message (default ``chore``).
+
+    ADR-044 Phase 3 step prehooks (applies to ``agent``/``action`` steps):
+        prehooks:       names of prehooks (registered via
+                        ``lotsa.registry.register_prehook``) the orchestrator
+                        runs before this step dispatches. ``[worktree]`` is the
+                        built-in. Usually left unset — ``worktree`` is *derived*
+                        from the agent's ``needs_worktree`` property at
+                        process-build time (opt-out: worktree is the universal
+                        default; only a ``needs_worktree: false`` agent, e.g.
+                        ``chat``, drops it). A per-binding ``prehooks:`` value
+                        (including ``[]``) fully replaces the derived base.
 
     ADR-016 schema slots (parser only; write path deferred):
         output_file:  worktree-relative path to persist agent stdout to
@@ -136,6 +359,7 @@ class Job:
     output_file: str | None = None
     commit: bool = False
     posthooks: list[str] = field(default_factory=list)
+    prehooks: list[str] = field(default_factory=list)
     commit_prefix: str | None = None
     model: str | None = None
     runner: str | None = None
@@ -168,6 +392,7 @@ class ResolvedJob:
     output_file: str | None = None
     commit: bool = False
     posthooks: list[str] = field(default_factory=list)
+    prehooks: list[str] = field(default_factory=list)
     commit_prefix: str | None = None
     model: str | None = None
     runner: str | None = None
@@ -222,6 +447,7 @@ class FlowBinding:
     rules: list[OutputRule] | None = None
     config: dict[str, Any] = field(default_factory=dict)
     posthooks: list[str] | None = None
+    prehooks: list[str] | None = None
 
 
 @dataclass
@@ -232,7 +458,7 @@ class FlowConfig:
     state_machine: StateMachine
     jobs: list[ResolvedJob]
     bindings: list[FlowBinding]
-    registry: PromptRegistry
+    registry: PromptLoader
     gate_states: set[str] = field(default_factory=set)
 
     @property
@@ -258,14 +484,26 @@ class Process:
         promotion_inputs:  artifact inputs the destination's first step reads on
                            promotion; the dashboard renders a form field each.
     Processes that omit them load unchanged (``None`` / empty list).
+
+    ADR-044 Phase 4 — ``invocable`` declares *where* a workflow may be selected,
+    driving the chat de-special-casing (option ii): a declared property replaces
+    the hardcoded ``name == "chat"`` checks. Each entry is one of ``"start"``
+    (offerable at task creation) / ``"hand-off"`` (offerable as a promotion
+    destination). Omitting it defaults to both, so existing processes advertise
+    everywhere unchanged; the bundled ``chat`` declares ``[start]`` only (a
+    Think-phase entry point, never a hand-off target). This gates *advertising*
+    (the picker + the chat agent's suggest-catalog), NOT enforcement — the
+    hard "cannot promote into chat" rule was dropped (an operator may have a
+    reason), amending ADR-027 §7.
     """
 
     name: str
     jobs: list[ResolvedJob]
     flows: dict[str, FlowConfig]
-    registry: PromptRegistry
+    registry: PromptLoader
     description: str | None = None
     promotion_inputs: list[PromotionInput] = field(default_factory=list)
+    invocable: tuple[str, ...] = ("start", "hand-off")
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +539,25 @@ def _parse_promotion_inputs(raw: Any) -> list[PromotionInput]:
     return inputs
 
 
+def _parse_invocable(raw: Any) -> tuple[str, ...]:
+    """Parse the root-level ``invocable:`` block (ADR-044 Phase 4).
+
+    ``None`` (the field omitted) defaults to both options so existing processes
+    are selectable everywhere unchanged. Otherwise it must be a list whose
+    entries are each ``"start"`` or ``"hand-off"``; anything else fails loudly at
+    build time, matching the field-level validators elsewhere in this module.
+    """
+    if raw is None:
+        return ("start", "hand-off")
+    if not isinstance(raw, list):
+        raise ValueError(f"invocable must be a list, got {type(raw).__name__}")
+    allowed = {"start", "hand-off"}
+    for entry in raw:
+        if entry not in allowed:
+            raise ValueError(f"invocable entry {entry!r} must be one of {sorted(allowed)}")
+    return tuple(raw)
+
+
 def _parse_rules(raw: list[dict] | None) -> list[OutputRule] | None:
     if raw is None:
         return None
@@ -312,6 +569,68 @@ def _parse_rules(raw: list[dict] | None) -> list[OutputRule] | None:
         )
         for r in raw
     ]
+
+
+# ADR-044 Phase 4 — the canonical desugared pattern for an ``AGENT_RESULT:``
+# outcome edge. ``routes: {FAILED: code}`` compiles to
+# ``OutputRule("stdout", "^AGENT_RESULT: FAILED", "code")``; the gate-only
+# derived ``FAILED → blocked`` default (in ``_resolve_jobs``) recognises an
+# already-routed outcome by matching this exact pattern.
+def _agent_result_pattern(outcome: str) -> str:
+    return f"^AGENT_RESULT: {outcome}"
+
+
+def _parse_routes(raw: Any, *, where: str) -> list[OutputRule] | None:
+    """Desugar a ``routes:`` map (outcome → target) into stdout AGENT_RESULT rules.
+
+    ``{PASSED: next, FAILED: code}`` becomes two ``OutputRule``s with the
+    canonical ``^AGENT_RESULT: <OUTCOME>`` stdout patterns, preserving the
+    declared (dict insertion) order. ``None`` (the key omitted) returns ``None``
+    — distinct from ``[]`` — mirroring ``_parse_rules`` so "no routes declared"
+    stays distinguishable from "declared empty". Keys must be in the closed
+    :data:`~lotsa.agents.AGENT_OUTCOMES` vocabulary; an unknown key fails loudly
+    at build time (naming ``where`` and the bad key), never silently dropping a
+    routing edge.
+
+    ``routes:`` is the concise sugar for the common stdout-``AGENT_RESULT`` case
+    (ADR-044 Phase 4 — routing lives on the edge); ``rules:`` remains for the
+    rare file-source / raw-regex case. A step declares one or the other, never
+    both (guarded by the callers).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: 'routes:' must be a mapping of outcome → target, got {type(raw).__name__}")
+    rules: list[OutputRule] = []
+    for outcome, target in raw.items():
+        if outcome not in AGENT_OUTCOMES:
+            raise ValueError(
+                f"{where}: 'routes:' key {outcome!r} is not a valid AGENT_RESULT outcome; "
+                f"allowed: {list(AGENT_OUTCOMES)}"
+            )
+        rules.append(OutputRule(source="stdout", pattern=_agent_result_pattern(outcome), target=str(target)))
+    return rules
+
+
+def _combine_routes_and_rules(
+    routes: list[OutputRule] | None,
+    rules: list[OutputRule] | None,
+    *,
+    where: str,
+) -> list[OutputRule] | None:
+    """Resolve a step's ``routes:`` / ``rules:`` into a single rule list.
+
+    A step declares ``routes:`` OR ``rules:``, not both — the both-declared
+    contradiction fails loudly at build time (the coexistence rule). Returns the
+    desugared routes when present, else the parsed rules (which may itself be
+    ``None`` = "unset", preserving the job-default fallback semantics that
+    ``_resolve_jobs`` / the binding lookup rely on).
+    """
+    if routes is not None and rules is not None:
+        raise ValueError(f"{where}: declare 'routes:' OR 'rules:', not both (routes is the sugar for the common case)")
+    if routes is not None:
+        return routes
+    return rules
 
 
 def _parse_job(jd: dict) -> Job:
@@ -339,7 +658,19 @@ def _parse_job(jd: dict) -> Job:
     if isinstance(raw_posthooks, str):
         raw_posthooks = [raw_posthooks]
 
-    parsed_rules = _parse_rules(jd.get("rules"))
+    # ``prehooks`` accepts the same list-or-bare-string shape (ADR-044 Phase 3).
+    raw_prehooks = jd.get("prehooks", []) or []
+    if isinstance(raw_prehooks, str):
+        raw_prehooks = [raw_prehooks]
+
+    # ADR-044 Phase 4 — ``routes:`` is the concise sugar for the common
+    # stdout-``AGENT_RESULT`` routing case; it desugars into the same
+    # ``OutputRule`` list as ``rules:``. A step declares one or the other.
+    parsed_rules = _combine_routes_and_rules(
+        _parse_routes(jd.get("routes"), where=f"Job {jd.get('name')!r}"),
+        _parse_rules(jd.get("rules")),
+        where=f"Job {jd.get('name')!r}",
+    )
 
     return Job(
         name=jd["name"],
@@ -360,6 +691,7 @@ def _parse_job(jd: dict) -> Job:
         output_file=output_file,
         commit=commit,
         posthooks=list(raw_posthooks),
+        prehooks=list(raw_prehooks),
         commit_prefix=jd.get("commit_prefix"),
         model=jd.get("model"),
         runner=jd.get("runner"),
@@ -379,11 +711,27 @@ def _parse_flow_step(raw: Any) -> FlowBinding:
         raw_posthooks = raw.get("posthooks")
         if isinstance(raw_posthooks, str):
             raw_posthooks = [raw_posthooks]
+        # ``prehooks`` mirrors ``posthooks``: default None (= "use the job's
+        # derived prehooks") so a binding-level empty list is distinguishable
+        # from "unset" and can override the step to run no prehooks. A bare
+        # string is sugar for a one-prehook list.
+        raw_prehooks = raw.get("prehooks")
+        if isinstance(raw_prehooks, str):
+            raw_prehooks = [raw_prehooks]
+        # ADR-044 Phase 4 — a per-flow binding may override routing with the
+        # ``routes:`` sugar too (same one-or-the-other rule as the job level).
+        # ``None`` still means "use the job's rules" (lookup-then-fallback).
+        binding_rules = _combine_routes_and_rules(
+            _parse_routes(raw.get("routes"), where=f"Flow step {raw['name']!r}"),
+            _parse_rules(raw.get("rules")),
+            where=f"Flow step {raw['name']!r}",
+        )
         return FlowBinding(
             name=raw["name"],
-            rules=_parse_rules(raw.get("rules")),
+            rules=binding_rules,
             config=dict(raw.get("config", {})),
             posthooks=list(raw_posthooks) if raw_posthooks is not None else None,
+            prehooks=list(raw_prehooks) if raw_prehooks is not None else None,
         )
     raise ValueError(f"Bad flow step: {raw!r}")
 
@@ -444,12 +792,34 @@ def _load_yaml_process(path: Path) -> tuple[str, list[Job], dict[str, list[FlowB
 # ---------------------------------------------------------------------------
 
 
-def _resolve_jobs(jobs: list[Job], bindings: list[FlowBinding]) -> tuple[list[ResolvedJob], set[str]]:
+def _resolve_jobs(
+    jobs: list[Job],
+    bindings: list[FlowBinding],
+    resolve_agent: Callable[[str], Agent | None] | None = None,
+) -> tuple[list[ResolvedJob], set[str]]:
     """Resolve job states for a flow's binding order.
 
     success_state derivation only makes sense in the context of a flow's
     ordering (because "next" means "next in this flow"). Each call resolves
     states for one flow's view of the jobs.
+
+    ``resolve_agent`` (ADR-044 Phase 2) maps a job's prompt/agent name to its
+    catalog :class:`~lotsa.agents.Agent` (or ``None``). When supplied, an agent
+    job whose agent declares ``produces_changes: true`` has the built-in
+    ``commit`` posthook folded into its base posthooks — the property is the
+    single source of truth, replacing a hand-declared ``posthooks: [commit]``.
+    A per-binding ``posthooks:`` override still fully replaces the step
+    (derivation only touches the no-override base).
+
+    ``resolve_agent`` also drives the ADR-044 Phase 3 ``worktree`` prehook
+    derivation, but with the *inverse* polarity to commit: worktree is the
+    pre-existing universal default for every dispatched step, so it is derived
+    onto every agent/action step EXCEPT the one opt-out — an agent whose
+    ``needs_worktree`` is false (today: only ``chat``). Monitor jobs never
+    created a worktree at dispatch, so they derive none. Deriving worktree
+    opt-in (like commit) would strip it from ``push_pr`` (action),
+    ``resolve_conflicts``, and inline agent steps with no ``agent.yaml`` — a
+    regression. A per-binding ``prehooks:`` override fully replaces the step.
     """
     by_name = {j.name: j for j in jobs}
     binding_names = [b.name for b in bindings]
@@ -488,9 +858,81 @@ def _resolve_jobs(jobs: list[Job], bindings: list[FlowBinding]) -> tuple[list[Re
             success = next_queue
 
         effective_rules = binding.rules if binding.rules is not None else list(job.rules)
+        # ADR-044 Phase 4 — derived ``FAILED → blocked`` default, scoped to
+        # AUTO-ROUTING GATE steps. A gate that renders a ``FAILED`` verdict with
+        # no rule for it would otherwise auto-advance (the drainer's implicit "no
+        # match → next"), silently passing a failed gate. The ADR default-route
+        # table says ``FAILED → blocked``; fold it in when the resolved agent is
+        # a gate declaring ``FAILED`` and nothing already routes that outcome.
+        # Purely additive: every bundled gate routes ``FAILED`` explicitly, so
+        # this changes no current behaviour — it is a safety net for a future
+        # bare gate. Keyed on the canonical desugared pattern so a raw custom
+        # ``FAILED`` pattern (the ``rules:`` escape hatch) still counts as
+        # routed. Same lookup-then-fallback shape as the commit/worktree
+        # derivations below; a per-binding override fully replaces the step, so
+        # the derivation only touches the effective (already-resolved) set.
+        #
+        # Two exclusions keep the default *additive* — it only completes a
+        # partial marker-routing table, never imposes routing on a step that
+        # opted out of markers:
+        #   * ``evaluate`` gates park for human approval and never auto-route, so
+        #     a derived routing rule is both moot and harmful.
+        #   * a step with NO effective rules opted out of marker routing entirely
+        #     (it auto-advances on any output); leave it alone. Deriving here
+        #     would make the step rule-bearing, so the drainer's "no recognized
+        #     marker → block" guard would flip a previously auto-advancing gate
+        #     to ``blocked`` on non-marker output — a behaviour change, not a
+        #     safety net. The default therefore only fires for a gate that
+        #     already routes at least one outcome (e.g. ``PASSED``) but is
+        #     missing ``FAILED`` — the "forgot a rule" case the ADR guards.
+        if job.type == "agent" and not job.evaluate and effective_rules and resolve_agent is not None:
+            agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+            if agent is not None and agent.is_gate and "FAILED" in agent.outcomes:
+                routed_failed = any(
+                    r.source == "stdout" and r.pattern == _agent_result_pattern("FAILED") for r in effective_rules
+                )
+                if not routed_failed:
+                    effective_rules = [
+                        *effective_rules,
+                        OutputRule(source="stdout", pattern=_agent_result_pattern("FAILED"), target="blocked"),
+                    ]
         # Per-binding posthooks override the job's default; ``None`` (unset)
-        # falls back to the job. Same lookup-then-fallback shape as rules.
-        effective_posthooks = binding.posthooks if binding.posthooks is not None else list(job.posthooks)
+        # falls back to the job's base. Same lookup-then-fallback shape as rules.
+        if binding.posthooks is not None:
+            effective_posthooks = list(binding.posthooks)
+        else:
+            # ADR-044 Phase 2: the agent's ``produces_changes`` property is the
+            # single source of truth for "this step's output needs committing".
+            # Fold the built-in ``commit`` into the job's base posthooks when
+            # the resolved agent produces changes. Binding overrides (handled
+            # above) fully replace the step, so derivation never touches them.
+            effective_posthooks = list(job.posthooks)
+            if job.type == "agent" and resolve_agent is not None:
+                agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+                if agent is not None and agent.produces_changes and "commit" not in effective_posthooks:
+                    effective_posthooks.append("commit")
+
+        # Per-binding prehooks override the job's default; ``None`` (unset)
+        # falls back to the derived base. Same lookup-then-fallback shape.
+        if binding.prehooks is not None:
+            effective_prehooks = list(binding.prehooks)
+        else:
+            # ADR-044 Phase 3: worktree creation is the pre-existing universal
+            # default for every dispatched step (agent + action). The SOLE
+            # opt-out is an agent step whose agent declares ``needs_worktree:
+            # false`` (today: only ``chat``). Monitor jobs never dispatch a
+            # worktree — they are excluded (and never reach the orchestrator's
+            # prehook site). This is deliberately the INVERSE of the opt-in
+            # commit derivation above (see the method docstring).
+            effective_prehooks = list(job.prehooks)
+            if job.type != "monitor" and "worktree" not in effective_prehooks:
+                opts_out = False
+                if job.type == "agent" and resolve_agent is not None:
+                    agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+                    if agent is not None and not agent.needs_worktree:
+                        opts_out = True
+                if not opts_out:
+                    effective_prehooks.append("worktree")
 
         resolved.append(
             ResolvedJob(
@@ -512,6 +954,7 @@ def _resolve_jobs(jobs: list[Job], bindings: list[FlowBinding]) -> tuple[list[Re
                 output_file=job.output_file,
                 commit=job.commit,
                 posthooks=list(effective_posthooks),
+                prehooks=list(effective_prehooks),
                 commit_prefix=job.commit_prefix,
                 model=job.model,
                 runner=job.runner,
@@ -608,12 +1051,12 @@ def _build_state_machine(
 # Leading markdown noise an agent may put before a line-anchored routing
 # marker: a heading prefix (``#``..``######`` + space) and/or tight inline
 # wrappers (inline code, bold, italic, strikethrough). Stripped in
-# ``_match_marker``'s fallback so ``## SPEC_COMPLETE:`` (an internal task),
-# ``\`SPEC_COMPLETE:\``` (an internal task), and ``**REVIEW_PASS**`` all route.
+# ``_match_marker``'s fallback so ``## AGENT_RESULT: PASSED`` (an internal task),
+# ``\`AGENT_RESULT: PASSED\``` (an internal task), and ``**AGENT_RESULT: PASSED**`` all route.
 # Deliberately narrow on the wrapper side: a wrapper run must abut the text
-# with NO space, so a bullet quoting a marker mid-document ("* `SPEC_…` is
+# with NO space, so a bullet quoting a marker mid-document ("* `AGENT_RESULT:` is
 # emitted when …" — ``*`` then a space) cannot false-match. The heading
-# alternative DOES consume its trailing space (``## `` → ``SPEC_…``) because
+# alternative DOES consume its trailing space (``## `` → ``AGENT_RESULT:``) because
 # a ``#``-prefixed line is unambiguously a heading, not a list item.
 _MARKER_WRAPPER_RE = re.compile(r"^(?:#{1,6}[ \t]+|[`*_~]{1,3})+")
 
@@ -651,6 +1094,165 @@ def check_conversational_rules(step: ResolvedJob, stdout: str) -> str | None:
     return None
 
 
+# ADR-044 Phase 6 — synthetic terminal targets. ``routes:`` may point an
+# outcome at a non-step sink (``blocked``/``needs_input``) or the ``next``-on-
+# last-step ``complete`` state; the graph materializes each referenced one as a
+# node so the read-only canvas can draw the edge to it.
+_TERMINAL_TARGETS: tuple[str, ...] = ("complete", "blocked", "needs_input")
+
+
+def _outcome_from_pattern(pattern: str) -> str | None:
+    """Reverse :func:`_agent_result_pattern` — the outcome word, or ``None``.
+
+    A ``routes:`` edge compiles to ``^AGENT_RESULT: <OUTCOME>``; the graph
+    serializer reads the outcome back off the pattern for its edge label. A raw
+    ``rules:`` pattern (file source / custom regex) has no outcome — return
+    ``None`` and let the caller fall back to the raw pattern as a label.
+    """
+    prefix = "^AGENT_RESULT: "
+    if pattern.startswith(prefix):
+        return pattern[len(prefix) :].strip() or None
+    return None
+
+
+def _default_success_outcome(agent: Agent | None) -> str | None:
+    """The outcome a step emits on its implicit forward (success) edge.
+
+    A gate advances on ``PASSED``; a worker on ``COMPLETED``. Non-agent steps
+    (action/monitor) have no agent, so no outcome word — return ``None``.
+    """
+    if agent is None:
+        return None
+    return "PASSED" if agent.agent_class == "gate" else "COMPLETED"
+
+
+def serialize_process_graph(process: Process) -> dict[str, Any]:
+    """Serialize a *resolved* ``Process`` into a read-only graph payload (ADR-044 Phase 6).
+
+    Source-agnostic by construction — it reads only the built ``Process`` (jobs,
+    flows, registry), so a bundled, inline, or repo-shipped (Phase 5) workflow
+    all render through this one path, and a future DB-sourced workflow would too.
+    Returns a plain dict (the service/HTTP layer wraps it in Pydantic), mirroring
+    :meth:`OrchestratorService.list_processes_summary`'s "domain layer stays
+    HTTP-agnostic" convention.
+
+    Shape::
+
+        {"flows": [{"name", "nodes": [...], "edges": [...]}, ...]}
+
+    One entry per flow (``build``/``fix`` ship ``main`` + ``pr_fix``) because a
+    job shared across flows (``review``, ``pr-fix``, ``push_pr``) routes
+    differently per flow — merging would produce ambiguous edges. Each flow's
+    edges are resolved from the *per-binding effective rules* (binding override
+    then job default — mirroring ``_resolve_jobs``/``evaluate`` at runtime).
+    """
+    return {"flows": [_serialize_flow(process, flow) for flow in process.flows.values()]}
+
+
+def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
+    steps = flow.steps  # ResolvedJobs in flow (binding) order
+    order = [s.name for s in steps]
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    node_ids: set[str] = set(order)
+    referenced_terminals: list[str] = []
+
+    def _resolve_target(target: str, idx: int) -> str:
+        if target == "next":
+            return order[idx + 1] if idx + 1 < len(order) else "complete"
+        return target
+
+    for idx, job in enumerate(steps):
+        binding = flow.binding_for(job.name)
+        agent = process.registry.load_agent_optional(job.prompt_name) if job.type == "agent" else None
+
+        prehooks = binding.prehooks if binding and binding.prehooks is not None else list(job.prehooks)
+        posthooks = binding.posthooks if binding and binding.posthooks is not None else list(job.posthooks)
+
+        nodes.append(
+            {
+                "id": job.name,
+                "type": job.type,
+                "prompt_name": job.prompt_name if job.type == "agent" else None,
+                "agent": (
+                    {
+                        "name": agent.name,
+                        "agent_class": agent.agent_class,
+                        "outcomes": list(agent.outcomes),
+                        "needs_worktree": agent.needs_worktree,
+                        "produces_changes": agent.produces_changes,
+                    }
+                    if agent is not None
+                    else None
+                ),
+                "is_gate": agent is not None and agent.agent_class == "gate",
+                "conversational": job.conversational,
+                "evaluate": job.evaluate,
+                "output": job.output,
+                "inputs": list(job.inputs),
+                "prehooks": list(prehooks),
+                "posthooks": list(posthooks),
+            }
+        )
+
+        # Effective routing for THIS flow (binding override wins, else job's).
+        effective_rules = binding.rules if binding and binding.rules is not None else list(job.rules)
+        routes_next = False
+        for rule in effective_rules:
+            target = _resolve_target(rule.target, idx)
+            outcome = _outcome_from_pattern(rule.pattern)
+            edges.append(
+                {
+                    "source": job.name,
+                    "target": target,
+                    "outcome": outcome,
+                    "kind": "route",
+                    "label": None if outcome is not None else rule.pattern,
+                }
+            )
+            if rule.target == "next":
+                routes_next = True
+            if target in _TERMINAL_TARGETS and target not in node_ids:
+                referenced_terminals.append(target)
+
+        # Implicit forward (success) edge: an unmatched marker falls through to
+        # the next step at runtime. Draw it so the happy path is visible —
+        # unless the step already routes ``next`` explicitly, is the last step,
+        # or is a monitor (which exits the flow via an external engine, e.g.
+        # pr_monitor dispatching pr_fix — not a sequential advance).
+        if not routes_next and idx + 1 < len(order) and job.type != "monitor":
+            edges.append(
+                {
+                    "source": job.name,
+                    "target": order[idx + 1],
+                    "outcome": _default_success_outcome(agent),
+                    "kind": "implicit",
+                    "label": None,
+                }
+            )
+
+    # Materialize any referenced terminal sink as a node (dedup, stable order).
+    for terminal in dict.fromkeys(referenced_terminals):
+        nodes.append(
+            {
+                "id": terminal,
+                "type": "terminal",
+                "prompt_name": None,
+                "agent": None,
+                "is_gate": False,
+                "conversational": False,
+                "evaluate": False,
+                "output": None,
+                "inputs": [],
+                "prehooks": [],
+                "posthooks": [],
+            }
+        )
+
+    return {"name": flow.name, "nodes": nodes, "edges": edges}
+
+
 def evaluate_output_rules(
     rules: list[OutputRule],
     result: AgentResult,
@@ -682,6 +1284,13 @@ def resolve_output_target(
     currently-active *flow*. The old ``target: previous`` shorthand was
     removed in ADR-014 Layer A — any unrecognized target string resolves
     to ``"blocked"`` with a warning.
+
+    ``"needs_input"`` and ``"handoff"`` are intentionally NOT resolved here:
+    the completion drainer intercepts both before calling this function (the
+    NEEDS_INPUT pause and the ADR-044 Phase 4c record-suggestion-and-park
+    respectively), so neither maps to a state. Reaching this function with
+    either target would mean the drainer's intercept was bypassed — the
+    ``blocked`` fallback below is the safe degradation.
     """
     if target == "next":
         # The same Job appears in different flows with different success_states
@@ -700,7 +1309,7 @@ def resolve_output_target(
             return rj.queue_state
     # Cross-flow rule targets other than the orchestrator's SKIPPED→monitor
     # short-circuit resolve to ``"blocked"`` here. The drainer's
-    # ``PR_FIX_SKIPPED:`` branch handles the one cross-flow handoff the
+    # ``AGENT_RESULT: SKIPPED`` branch handles the one cross-flow handoff the
     # bundled processes use (sub-flow → host monitor) by short-circuiting
     # the rule resolver and routing back to the parent flow's monitor by
     # name. Any *other* custom rule that names a job belonging to a sibling
@@ -723,29 +1332,6 @@ def resolve_output_target(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_prompts_search_paths(
-    flow_name: str,
-    prompts_dir: Path | None,
-) -> list[Path]:
-    paths: list[Path] = []
-    if prompts_dir is not None:
-        paths.append(prompts_dir)
-    if flow_name in PRESET_NAMES:
-        paths.append(BUNDLED_PROMPTS / flow_name)
-    else:
-        paths.append(BUNDLED_PROMPTS / "build")
-    # ``fix`` ships only its distinctive ``coding`` prompt (the "execute this
-    # instruction" framing); its ``review`` / ``pr-fix`` / ``resolve_conflicts``
-    # jobs reuse the generic prompts. Fall back to ``build`` (which carries every
-    # generic diff/PR/git-driven prompt) so those resolve without duplicating the
-    # text (ADR-043 §8 / ADR-027 §3 — the generics are shared across processes;
-    # fix's narrowness comes from the coder prompt). Inline / unknown processes
-    # fall back to ``build`` via the ``else`` branch above for the same reason.
-    if flow_name == "fix":
-        paths.append(BUNDLED_PROMPTS / "build")
-    return paths
-
-
 def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
     """Stitch sub-flow entry/exit edges into each flow's state machine.
 
@@ -760,7 +1346,7 @@ def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
       and the task stalls at ``status=working`` until the next restart.
     * sub-flow exit (sub_step.active_state, host_job.queue_state) is missing
       → the drainer's post-rule CAS check rejects the routing (e.g.
-      PR_FIX_SKIPPED → wait_for_pr_signal, PR_FIX_DONE → reviewing).
+      pr-fix SKIPPED → wait_for_pr_signal, pr-fix COMPLETED → reviewing).
 
     The fix is to mutate the underlying ``StateMachine`` after construction:
     register the missing edges and add any newly-referenced states. This is
@@ -835,7 +1421,7 @@ def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
                     sm_states.add(target.queue_state)
                     sm_trans[(rj.active_state, target.queue_state)] = TransitionRule()
                     # The other-flow step may also need to terminate at
-                    # blocked from this flow's perspective (PR_FIX_BLOCKED).
+                    # blocked from this flow's perspective (pr-fix FAILED → blocked).
                     sm_trans[(rj.active_state, "blocked")] = TransitionRule()
                     # And needs the self-loop for retry on its own active state.
                     sm_trans[(rj.active_state, rj.active_state)] = TransitionRule()
@@ -891,18 +1477,22 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
     Both rule surfaces are checked: the job-level default ``rules:`` AND the
     per-flow binding override ``rules:`` (``{name: review, rules: [...]}``).
     The override rules ARE the "sub-flow rules" R6 names — sub-flow routing
-    (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``) lives in binding overrides,
+    (e.g. ``pr_fix.review`` FAILED → pr-fix) lives in binding overrides,
     not the job defaults, so validating only ``Job.rules`` would let a
     cross-process sub-flow target slip straight through to the runtime
     ``blocked`` fallback.
 
     Recognized non-job keywords: ``next`` (success edge), the terminal states
-    ``blocked`` / ``complete`` / ``abandoned``, and ``needs_input`` — the last
-    is special-cased in the completion drainer's PR_FIX_NEEDS_DECISION path
-    (e.g. the bundled ``build`` process's ``pr-fix`` rule routes to it), so it
-    is a legitimate target even though it is not a job.
+    ``blocked`` / ``complete`` / ``abandoned``, ``needs_input``, and ``handoff``
+    — the last two are special-cased in the completion drainer (the
+    ``AGENT_RESULT: INPUT`` path and the ADR-044 Phase 4c handoff path
+    respectively), so they are legitimate targets even though neither is a job
+    and neither is resolved to a state by ``resolve_output_target``. ``handoff``
+    records an operator-gated hand-off suggestion and parks the task in place —
+    the bundled ``chat`` process's ``COMPLETED → handoff`` edge is the canonical
+    user.
     """
-    sentinels = {"next", "blocked", "complete", "abandoned", "needs_input"}
+    sentinels = {"next", "blocked", "complete", "abandoned", "needs_input", "handoff"}
     job_names = {j.name for j in jobs}
 
     def _check(target: str, where: str) -> None:
@@ -1003,6 +1593,128 @@ def _validate_posthook_references(jobs: list[Job], flow_bindings: dict[str, list
             )
 
 
+def _validate_posthook_property_consistency(
+    jobs: list[Job],
+    flow_bindings: dict[str, list[FlowBinding]],
+    resolve_agent: Callable[[str], Agent | None],
+) -> None:
+    """Fail loud if a step explicitly declares ``commit`` on an agent whose
+    catalog property says it produces no changes (ADR-044 Phase 2).
+
+    ``commit`` is now *derived* from the agent's ``produces_changes`` property,
+    so an explicit ``commit`` on a non-producing agent (e.g. a gate) is drift —
+    the exact duplication Phase 2 removes. This guard turns a future re-drift
+    into a build-time error rather than a silently-contradictory config, the
+    same way ``_validate_posthook_references`` fails an unknown posthook name.
+
+    Only the contradiction direction is checked. A producing agent explicitly
+    listing ``commit`` is redundant-but-consistent (the derivation union dedups
+    it), and a binding ``posthooks: []`` suppressing a producer's commit is the
+    documented override seam — neither is flagged. Non-agent jobs (which never
+    run posthooks) and prompts with no ``agent.yaml`` are skipped.
+    """
+    by_name = {j.name: j for j in jobs}
+
+    def _check(job: Job, posthooks: list[str], where: str) -> None:
+        if job.type != "agent" or "commit" not in posthooks:
+            return
+        agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+        if agent is not None and not agent.produces_changes:
+            raise ValueError(
+                f"{where} explicitly declares the ``commit`` posthook, but its agent "
+                f"({job.prompt or job.name!r}) has ``produces_changes: false``. "
+                "commit is derived from ``produces_changes`` (ADR-044 Phase 2) — drop the "
+                "explicit posthook, or set ``produces_changes: true`` in the agent's "
+                "agent.yaml if it genuinely writes changes."
+            )
+
+    for j in jobs:
+        _check(j, j.posthooks, f"Job {j.name!r}")
+    for flow_name, bindings in flow_bindings.items():
+        for b in bindings:
+            if b.posthooks:
+                job = by_name.get(b.name)
+                if job is not None:
+                    _check(job, b.posthooks, f"Flow {flow_name!r} step {b.name!r}")
+
+
+def _validate_prehook_references(jobs: list[Job], flow_bindings: dict[str, list[FlowBinding]]) -> None:
+    """Raise ``ValueError`` if any job/binding references an unregistered prehook.
+
+    Mirrors ``_validate_posthook_references``: imports ``lotsa.prehooks`` for
+    its self-registration side-effect so direct ``build_process`` callers
+    (tests, custom entry points) see the same built-in registry (``worktree``)
+    the runtime path sees, then checks every referenced prehook name — across
+    both per-job ``prehooks:`` and per-binding ``prehooks:`` overrides — against
+    the registry. An unknown name is unambiguously a typo, so failing here at
+    build time beats failing at dispatch time.
+    """
+    import lotsa.prehooks  # noqa: F401 — import side-effect registers built-ins
+    from lotsa.registry import is_prehook_registered, list_prehooks
+
+    referenced: set[str] = set()
+    for j in jobs:
+        referenced.update(j.prehooks)
+    for bindings in flow_bindings.values():
+        for b in bindings:
+            if b.prehooks:
+                referenced.update(b.prehooks)
+
+    for name in sorted(referenced):
+        if not is_prehook_registered(name):
+            raise ValueError(
+                f"Process references unknown prehook {name!r}. "
+                f"Registered prehooks: {list_prehooks()}. "
+                "Register the prehook via ``lotsa.registry.register_prehook``, "
+                "or check for a typo."
+            )
+
+
+def _validate_prehook_property_consistency(
+    jobs: list[Job],
+    flow_bindings: dict[str, list[FlowBinding]],
+    resolve_agent: Callable[[str], Agent | None],
+) -> None:
+    """Fail loud if a step explicitly declares ``worktree`` on an agent whose
+    catalog property says it needs no worktree (ADR-044 Phase 3).
+
+    ``worktree`` is *derived* from the agent's ``needs_worktree`` property, so an
+    explicit ``worktree`` on a ``needs_worktree: false`` agent (e.g. ``chat``) is
+    drift — the exact contradiction the derivation removes. This guard turns a
+    future re-drift into a build-time error, mirroring
+    ``_validate_posthook_property_consistency``.
+
+    Only the contradiction direction is checked. A ``needs_worktree: true`` agent
+    explicitly listing ``worktree`` is redundant-but-consistent (the derivation
+    union dedups it), and a binding ``prehooks: []`` suppressing the derived
+    worktree is the documented override seam — neither is flagged. Non-agent jobs
+    and prompts with no ``agent.yaml`` are skipped.
+    """
+    by_name = {j.name: j for j in jobs}
+
+    def _check(job: Job, prehooks: list[str], where: str) -> None:
+        if job.type != "agent" or "worktree" not in prehooks:
+            return
+        agent = resolve_agent(job.prompt if job.prompt is not None else job.name)
+        if agent is not None and not agent.needs_worktree:
+            raise ValueError(
+                f"{where} explicitly declares the ``worktree`` prehook, but its agent "
+                f"({job.prompt or job.name!r}) has ``needs_worktree: false``. "
+                "worktree is derived from ``needs_worktree`` (ADR-044 Phase 3) — drop the "
+                "explicit prehook, or set ``needs_worktree: true`` in the agent's "
+                "agent.yaml if it genuinely needs a worktree."
+            )
+
+    for j in jobs:
+        _check(j, j.prehooks, f"Job {j.name!r}")
+    for flow_name, bindings in flow_bindings.items():
+        for b in bindings:
+            if b.prehooks:
+                job = by_name.get(b.name)
+                if job is not None:
+                    _check(job, b.prehooks, f"Flow {flow_name!r} step {b.name!r}")
+
+
 def _validate_runner_references(jobs: list[Job]) -> None:
     """Raise ``ValueError`` if any job names an unregistered ``runner:``.
 
@@ -1049,8 +1761,16 @@ def build_process(
     name: str,
     prompts_dir: Path | None = None,
     process_file: Path | None = None,
+    repo_agents_dir: Path | None = None,
 ) -> Process:
-    """Build a Process by preset name or from a YAML file."""
+    """Build a Process by preset name or from a YAML file.
+
+    ``repo_agents_dir`` (ADR-044 Phase 5) is the owning project's
+    ``.lotsa/agents`` directory — supplied only when building a repo-shipped
+    workflow, so its ``prompt:`` references can resolve ``repo:``/unqualified
+    repo agents alongside the bundled catalog. Bundled/inline processes pass
+    ``None`` and are unaffected.
+    """
     if process_file is not None:
         loaded_name, jobs, flow_bindings, _raw = _load_yaml_process(process_file)
     elif name in PRESET_NAMES:
@@ -1065,12 +1785,11 @@ def build_process(
     else:
         raise ValueError(f"Unknown process: {name!r}. Choose from: {PRESET_NAMES}")
 
-    search_paths = _resolve_prompts_search_paths(name, prompts_dir)
-    registry = PromptRegistry(search_paths=search_paths)
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR, repo_agents_dir=repo_agents_dir)
 
     flows: dict[str, FlowConfig] = {}
     for flow_name, bindings in flow_bindings.items():
-        resolved, gate_states = _resolve_jobs(jobs, bindings)
+        resolved, gate_states = _resolve_jobs(jobs, bindings, resolve_agent=registry.load_agent_optional)
         sm = _build_state_machine(resolved, gate_states)
         flows[flow_name] = FlowConfig(
             name=flow_name,
@@ -1112,6 +1831,18 @@ def build_process(
     # tool/engine references above.
     _validate_posthook_references(jobs, flow_bindings)
 
+    # ADR-044 Phase 2 — reject an explicit ``commit`` posthook on an agent whose
+    # ``produces_changes: false`` property contradicts it (commit is now derived
+    # from the property; an explicit one on a non-producer is drift).
+    _validate_posthook_property_consistency(jobs, flow_bindings, registry.load_agent_optional)
+
+    # ADR-044 Phase 3 — validate ``prehooks:`` references (per-job and
+    # per-binding) against the prehook registry, and reject an explicit
+    # ``worktree`` on a ``needs_worktree: false`` agent (worktree is now derived
+    # from the property; an explicit one on an opt-out agent is drift).
+    _validate_prehook_references(jobs, flow_bindings)
+    _validate_prehook_property_consistency(jobs, flow_bindings, registry.load_agent_optional)
+
     # Validate ``runner:`` job references against the runner registry (ADR-028
     # Phase 3) so a mistyped or missing runner name fails at startup, not at
     # dispatch time. The registry is populated by ``start()`` before processes
@@ -1150,6 +1881,7 @@ def build_process(
                 output_file=j.output_file,
                 commit=j.commit,
                 posthooks=list(j.posthooks),
+                prehooks=list(j.prehooks),
                 commit_prefix=j.commit_prefix,
                 model=j.model,
                 runner=j.runner,
@@ -1165,6 +1897,7 @@ def build_process(
         registry=registry,
         description=_raw.get("description"),
         promotion_inputs=_parse_promotion_inputs(_raw.get("promotion_inputs")),
+        invocable=_parse_invocable(_raw.get("invocable")),
     )
 
 
@@ -1256,14 +1989,24 @@ def build_process_from_inline(
             )
         )
 
+    registry = AgentPromptRegistry(prompts_dir, AGENTS_DIR)
+
     # Bindings mirror the steps in order (no per-flow rule overrides for the
     # inline form — every rule lives on the job itself).
     bindings = [FlowBinding(name=j.name) for j in jobs]
-    resolved, gate_states = _resolve_jobs(jobs, bindings)
+    resolved, gate_states = _resolve_jobs(jobs, bindings, resolve_agent=registry.load_agent_optional)
     sm = _build_state_machine(resolved, gate_states)
 
-    search_paths = [prompts_dir, BUNDLED_PROMPTS / "build"]
-    registry = PromptRegistry(search_paths=search_paths)
+    # ADR-044 Phase 2 — an inline step referencing a catalog agent by name
+    # derives/guards ``commit`` just like a bundled process; a step whose
+    # prompt has no ``agent.yaml`` resolves to ``None`` and is a no-op.
+    _validate_posthook_property_consistency(jobs, {"main": bindings}, registry.load_agent_optional)
+
+    # ADR-044 Phase 3 — same guard for the derived ``worktree`` prehook. Inline
+    # steps carry no explicit ``prehooks:`` (the inline schema doesn't parse
+    # them), so reference validation is unnecessary here; only the property
+    # consistency guard is relevant for a step referencing an opt-out agent.
+    _validate_prehook_property_consistency(jobs, {"main": bindings}, registry.load_agent_optional)
 
     flow = FlowConfig(
         name="main",
@@ -1284,6 +2027,7 @@ def build_process_from_inline(
         registry=registry,
         description=raw.get("description"),
         promotion_inputs=_parse_promotion_inputs(raw.get("promotion_inputs")),
+        invocable=_parse_invocable(raw.get("invocable")),
     )
 
 

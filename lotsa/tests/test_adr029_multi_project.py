@@ -770,7 +770,7 @@ class TestPromptPortability:
     """
 
     def test_review_prompt_file_uses_template(self):
-        text = (BUNDLED_PROMPTS / "build" / "review-system.md").read_text()
+        text = (BUNDLED_PROMPTS / "agents" / "review" / "system.md").read_text()
         assert "{lotsa_prompts_dir}/review/SKILL.md" in text
         assert "{lotsa_prompts_dir}/review/checklist.md" in text
         # The old repo-relative form must be gone.

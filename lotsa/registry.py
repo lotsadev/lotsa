@@ -276,6 +276,65 @@ def list_posthooks() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Prehooks (ADR-044 Phase 3) — symmetric API
+# ---------------------------------------------------------------------------
+
+# Prehooks share the tool/posthook call signature — ``async (TaskContext,
+# config) -> ToolResult`` — because they too run an orchestrator-owned
+# operation against a task's dispatch environment and report success/metadata
+# the same way. They fire *before* an agent/action step dispatches; the
+# built-in ``worktree`` prehook ensures the task's git worktree exists. The
+# registry is kept separate from ``_TOOLS`` / ``_POSTHOOKS`` so a name can't
+# collide across surfaces and so ``list_prehooks`` reports only prehooks.
+PrehookCallable = Callable[["TaskContext", dict[str, Any]], Awaitable["ToolResult"]]
+
+_PREHOOKS: dict[str, PrehookCallable] = {}
+
+
+def register_prehook(name: str, fn: PrehookCallable) -> None:
+    """Register a prehook under *name*.
+
+    Prehooks are orchestrator-run operations that fire before an agent/action
+    step dispatches (e.g. the built-in ``worktree``). Raises ``ValueError`` on
+    collision so a duplicate import side-effect or typo surfaces loudly,
+    matching ``register_posthook``.
+    """
+    if name in _PREHOOKS:
+        raise ValueError(f"Prehook {name!r} already registered")
+    _PREHOOKS[name] = fn
+
+
+def get_prehook(name: str) -> PrehookCallable:
+    """Look up a prehook by name.
+
+    Raises ``KeyError`` with the registered prehook list in the message so an
+    operator can immediately spot a typo in a process YAML's ``prehooks:``
+    declaration.
+    """
+    if name not in _PREHOOKS:
+        raise KeyError(f"Prehook {name!r} is not registered. Registered prehooks: {sorted(_PREHOOKS)}")
+    return _PREHOOKS[name]
+
+
+def is_prehook_registered(name: str) -> bool:
+    """Return ``True`` if a prehook with *name* is already registered.
+
+    Symmetric to ``is_posthook_registered`` — keeps the built-in
+    re-registration guard decoupled from ``_PREHOOKS``.
+    """
+    return name in _PREHOOKS
+
+
+def list_prehooks() -> list[str]:
+    """Return the sorted list of registered prehook names.
+
+    Symmetric to ``list_posthooks`` — used by ``flows._validate_prehook_references``
+    to surface the registered set in a build-time error message.
+    """
+    return sorted(_PREHOOKS)
+
+
+# ---------------------------------------------------------------------------
 # Snapshot / restore (test-isolation surface)
 # ---------------------------------------------------------------------------
 
@@ -293,6 +352,7 @@ def snapshot() -> dict[str, dict[str, Any]]:
         "tools": dict(_TOOLS),
         "engines": dict(_ENGINES),
         "posthooks": dict(_POSTHOOKS),
+        "prehooks": dict(_PREHOOKS),
     }
 
 
@@ -312,3 +372,7 @@ def restore(state: dict[str, dict[str, Any]]) -> None:
     # to empty so an old snapshot still restores cleanly.
     _POSTHOOKS.clear()
     _POSTHOOKS.update(state.get("posthooks", {}))
+    # ``prehooks`` is absent from snapshots captured before ADR-044 Phase 3 —
+    # same back-compat default so an old snapshot still restores cleanly.
+    _PREHOOKS.clear()
+    _PREHOOKS.update(state.get("prehooks", {}))

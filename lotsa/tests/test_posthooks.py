@@ -407,6 +407,11 @@ flows:
 
 
 def test_no_posthooks_resolves_to_empty_list(tmp_path: Path):
+    # Uses a NON-producing catalog agent (``review`` — a gate,
+    # ``produces_changes: false``) so the ADR-044 Phase 2 commit derivation
+    # is a no-op here and this stays a pure "no posthooks declared → empty
+    # list" check. (A producing agent like ``coding`` would derive ``commit``;
+    # that behaviour is pinned separately below.)
     process = _build(
         tmp_path,
         """
@@ -414,7 +419,7 @@ process: no_posthook_test
 jobs:
   - name: code
     type: agent
-    prompt: coding
+    prompt: review
     queue_state: coding
     active_state: coding
 flows:
@@ -549,3 +554,240 @@ flows:
     assert job.commit is True
     # ...and is unrelated to the ADR-024 step-posthook list.
     assert job.posthooks == ["commit"]
+
+
+# ===========================================================================
+# 4. ADR-044 Phase 2 — the ``commit`` posthook is DERIVED from the agent's
+#    ``produces_changes`` property (single source of truth), not hand-declared.
+# ===========================================================================
+
+
+def test_producing_agent_derives_commit_without_declaration(tmp_path: Path):
+    """A ``produces_changes: true`` agent (``coding``) folds ``commit`` into its
+    step's posthooks even though the YAML declares none.
+
+    RED pre-Phase-2: derivation doesn't exist, so ``coding`` with no
+    ``posthooks:`` resolves to ``[]``.
+    """
+    import lotsa.posthooks  # noqa: F401 — ensures the built-in ``commit`` exists
+
+    process = _build(
+        tmp_path,
+        """
+process: derive_producer
+jobs:
+  - name: code
+    type: agent
+    prompt: coding
+    queue_state: coding
+    active_state: coding
+flows:
+  main:
+    steps:
+      - code
+""",
+    )
+    assert _job(process, "code").posthooks == ["commit"]
+
+
+def test_non_producing_agent_derives_nothing(tmp_path: Path):
+    """A ``produces_changes: false`` agent (``review`` — a gate) derives no
+    commit. Companion negative to the producer case above."""
+    process = _build(
+        tmp_path,
+        """
+process: derive_nonproducer
+jobs:
+  - name: gate
+    type: agent
+    prompt: review
+    queue_state: reviewing
+    active_state: reviewing
+flows:
+  main:
+    steps:
+      - gate
+""",
+    )
+    assert _job(process, "gate").posthooks == []
+
+
+def test_explicit_and_derived_commit_dedups(tmp_path: Path):
+    """An explicit ``posthooks: [commit]`` on a producing agent must not double
+    up with the derived commit — the union dedups to a single ``commit``."""
+    import lotsa.posthooks  # noqa: F401
+
+    process = _build(
+        tmp_path,
+        """
+process: derive_dedup
+jobs:
+  - name: code
+    type: agent
+    prompt: coding
+    queue_state: coding
+    active_state: coding
+    posthooks: [commit]
+flows:
+  main:
+    steps:
+      - code
+""",
+    )
+    assert _job(process, "code").posthooks == ["commit"]
+
+
+def test_binding_empty_list_suppresses_derived_commit(tmp_path: Path):
+    """The override seam holds against derivation: a binding ``posthooks: []``
+    fully overrides the step, suppressing even the derived commit.
+
+    RED pre-Phase-2 in spirit — but pins that Phase 2 must NOT break the
+    documented ``[]`` suppression path for a producing agent."""
+    import lotsa.posthooks  # noqa: F401
+
+    process = _build(
+        tmp_path,
+        """
+process: derive_suppress
+jobs:
+  - name: code
+    type: agent
+    prompt: coding
+    queue_state: coding
+    active_state: coding
+flows:
+  main:
+    steps:
+      - name: code
+        posthooks: []
+""",
+    )
+    assert _job(process, "code").posthooks == []
+
+
+def test_binding_override_fully_replaces_no_derived_commit(tmp_path: Path):
+    """A binding ``posthooks:`` override fully replaces the base — the derived
+    commit is NOT folded into a binding override. A producing agent whose
+    binding lists only ``[record_hook]`` runs exactly that, no commit."""
+    from lotsa.registry import register_posthook
+    from lotsa.tools import ToolResult
+
+    async def record_hook(ctx, config):
+        return ToolResult(success=True, output="ok")
+
+    register_posthook("record_hook", record_hook)  # _isolated_registry restores
+
+    process = _build(
+        tmp_path,
+        """
+process: derive_binding_replace
+jobs:
+  - name: code
+    type: agent
+    prompt: coding
+    queue_state: coding
+    active_state: coding
+flows:
+  main:
+    steps:
+      - name: code
+        posthooks: [record_hook]
+""",
+    )
+    assert _job(process, "code").posthooks == ["record_hook"]
+
+
+# ---------------------------------------------------------------------------
+# 4b. Consistency guard — an EXPLICIT commit on a non-producing agent is drift
+#     (commit is derived), so it fails loud at build time.
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_commit_on_non_producer_fails_at_build_job_level(tmp_path: Path):
+    """A job-level ``posthooks: [commit]`` on a ``produces_changes: false``
+    agent (``review``) is a build error — the exact drift Phase 2 removes.
+
+    RED pre-Phase-2: no guard exists, so the process builds cleanly (the
+    ``pytest.raises`` does not fire)."""
+    import lotsa.posthooks  # noqa: F401 — ``commit`` must be registered so the
+    # posthook-reference validator passes and we reach the consistency guard.
+
+    with pytest.raises(ValueError, match="produces_changes"):
+        _build(
+            tmp_path,
+            """
+process: guard_job_level
+jobs:
+  - name: gate
+    type: agent
+    prompt: review
+    queue_state: reviewing
+    active_state: reviewing
+    posthooks: [commit]
+flows:
+  main:
+    steps:
+      - gate
+""",
+        )
+
+
+def test_explicit_commit_on_non_producer_fails_at_build_binding_level(tmp_path: Path):
+    """A binding-level ``posthooks: [commit]`` on a non-producing agent trips
+    the same guard — the check covers binding overrides, not just job defaults."""
+    import lotsa.posthooks  # noqa: F401
+
+    with pytest.raises(ValueError, match="produces_changes"):
+        _build(
+            tmp_path,
+            """
+process: guard_binding_level
+jobs:
+  - name: gate
+    type: agent
+    prompt: review
+    queue_state: reviewing
+    active_state: reviewing
+flows:
+  main:
+    steps:
+      - name: gate
+        posthooks: [commit]
+""",
+        )
+
+
+def test_explicit_commit_on_producer_does_not_trip_guard(tmp_path: Path):
+    """A producing agent explicitly listing ``commit`` is redundant-but-consistent
+    (not drift) — it must build cleanly and resolve to a single ``commit``."""
+    import lotsa.posthooks  # noqa: F401
+
+    process = _build(
+        tmp_path,
+        """
+process: guard_producer_ok
+jobs:
+  - name: code
+    type: agent
+    prompt: coding
+    queue_state: coding
+    active_state: coding
+    posthooks: [commit]
+flows:
+  main:
+    steps:
+      - code
+""",
+    )
+    assert _job(process, "code").posthooks == ["commit"]
+
+
+def test_bundled_processes_are_property_consistent():
+    """The bundled ``build``/``fix`` processes build without tripping the
+    consistency guard — they carry no explicit ``commit`` on a non-producer
+    after the derive-and-drop migration."""
+    from lotsa.flows import build_process
+
+    # Building is the assertion: a guard violation would raise here.
+    build_process("build")
+    build_process("fix")

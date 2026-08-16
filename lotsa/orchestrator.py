@@ -43,12 +43,14 @@ from lotsa.flows import (
     FlowStep,
     Job,
     Process,
+    PromptNotFound,
     build_process,
     build_process_from_inline,
     check_conversational_rules,
     evaluate_output_rules,
     find_step,
     resolve_output_target,
+    serialize_process_graph,
 )
 from lotsa.push_step import CC_TITLE_RE
 from lotsa.status import TaskStatusLiteral
@@ -93,27 +95,57 @@ def _summarize_agent_error(return_code: int | None, stderr: str | None) -> str:
     return msg
 
 
-def _marker_requirement_footer(rules: list) -> str:
-    """A mandatory-marker footer derived from a step's stdout output rules.
+def _marker_requirement_footer(rules: list, handoff_destinations: str = "") -> str:
+    """A marker footer derived from a step's stdout output rules.
 
-    Marker-driven steps advance only if the agent emits the literal token (e.g.
-    ``VERIFIED:``). Agents — especially on cheaper models — often write a prose
-    conclusion and omit it, stranding the task (ADR-039 records the longer-term
-    fix). This footer makes the marker non-optional, and is derived from the
-    step's own ``rules`` so it can never drift from process.yaml. Returns ``""``
-    for steps with no stdout markers.
+    Two kinds of edge get two kinds of footer, split on ``rule.target``:
+
+    * **Mandatory markers** (any non-``handoff`` target). Marker-driven steps
+      advance only if the agent emits the literal token (e.g.
+      ``AGENT_RESULT: PASSED``). Agents — especially on cheaper models — often
+      write a prose conclusion and omit it, stranding the task (ADR-039 records
+      the longer-term fix). This block makes the marker non-optional.
+    * **Handoff suggestion** (a ``handoff`` target, ADR-044 Phase 4c). The
+      COMPLETED marker names a recommended destination workflow; it is
+      **optional** and non-terminating (record-suggestion-and-park, never
+      advance/promote), so a never-completing REPL like ``chat`` must NOT be
+      told a marker is mandatory every turn. ``handoff_destinations`` (rendered
+      ``{available_processes}``) lists the valid destinations.
+
+    Both blocks are derived from the step's own ``rules`` so they can never
+    drift from process.yaml. Returns ``""`` for steps with no stdout markers.
     """
-    markers = [r.pattern.lstrip("^") for r in (rules or []) if getattr(r, "source", None) == "stdout"]
-    if not markers:
-        return ""
-    listed = "\n".join(f"- `{m}`" for m in markers)
-    return (
-        "\n\n## Required outcome marker (mandatory)\n"
-        "This step advances ONLY when your reply contains, on a line by itself, **exactly one** of:\n"
-        f"{listed}\n"
-        "Emit the one matching your conclusion as the final line. A reply with analysis but no "
-        "marker leaves the task stuck with no transition — never omit it."
-    )
+    stdout_rules = [r for r in (rules or []) if getattr(r, "source", None) == "stdout"]
+    handoff_rules = [r for r in stdout_rules if getattr(r, "target", None) == "handoff"]
+    mandatory_rules = [r for r in stdout_rules if getattr(r, "target", None) != "handoff"]
+
+    footer = ""
+    if mandatory_rules:
+        listed = "\n".join(f"- `{r.pattern.lstrip('^')}`" for r in mandatory_rules)
+        footer += (
+            "\n\n## Required outcome marker (mandatory)\n"
+            "This step advances ONLY when your reply contains, on a line by itself, **exactly one** of:\n"
+            f"{listed}\n"
+            "Emit the one matching your conclusion as the final line. A reply with analysis but no "
+            "marker leaves the task stuck with no transition — never omit it."
+        )
+    if handoff_rules:
+        # The outcome word carrying the recommendation (COMPLETED for the
+        # bundled chat edge). Derived from the rule so it never drifts.
+        outcome = handoff_rules[0].pattern.lstrip("^").removeprefix("AGENT_RESULT: ").strip()
+        dests = handoff_destinations.strip()
+        dest_block = f"\nValid destinations:\n{dests}" if dests else ""
+        footer += (
+            "\n\n## Suggesting a hand-off (optional)\n"
+            "When — and ONLY when — the conversation has reached a concrete decision, you may "
+            "suggest handing the task off by emitting, on a line by itself:\n"
+            f"`AGENT_RESULT: {outcome} <workflow>` (e.g. `AGENT_RESULT: {outcome} build`), where "
+            "`<workflow>` is one of the destinations below. This is a **suggestion only** — it does "
+            "not end the conversation or promote the task; the operator decides. Emit nothing on an "
+            "ordinary turn and keep chatting."
+            f"{dest_block}"
+        )
+    return footer
 
 
 class ApproveNotAllowed(Exception):
@@ -235,6 +267,15 @@ class ProjectNotFound(ValueError):
     """
 
 
+class WorkflowNotFound(ValueError):
+    """Raised when a workflow-graph lookup names a workflow absent from the
+    resolved catalog (bundled + the given project's repo workflows, ADR-044
+    Phase 6). Distinct from :class:`ProcessNotFound` (a task-creation error) so
+    the graph endpoint maps it to its own ``WORKFLOW_NOT_FOUND`` 404. Inherits
+    ``ValueError`` so existing ``except ValueError:`` callers keep working.
+    """
+
+
 OPERATIONAL_PREAMBLE = """\
 ## Lotsa Operational Rules (authoritative)
 
@@ -318,6 +359,14 @@ tool output) and do not redo completed work."""
 # still wedged past this bound is abandoned and recovered by the next resume sweep.
 _DRAIN_APPLY_TIMEOUT_SECONDS = 5.0
 
+# ADR-044 — the universal agent-outcome vocabulary. An agent reports one of
+# these; the flow *edge* decides what it means next. Group 1 is the outcome
+# word, group 2 the trailing same-line free-text payload (question / reason).
+_AGENT_RESULT_RE = re.compile(
+    r"^AGENT_RESULT:\s*(COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$",
+    re.MULTILINE,
+)
+# Retained alias — ``NEEDS_INPUT: <q>`` == ``AGENT_RESULT: INPUT <q>``.
 _NEEDS_INPUT_RE = re.compile(r"^NEEDS_INPUT:\s*(.+)", re.MULTILINE)
 
 _MAX_TITLE_LEN = 80
@@ -360,67 +409,106 @@ def _run_stats(result: AgentResult) -> dict | None:
 
 
 def _extract_needs_input(stdout: str) -> str | None:
-    """Extract the last NEEDS_INPUT question from agent output."""
-    matches = _NEEDS_INPUT_RE.findall(stdout)
-    return matches[-1].strip() if matches else None
+    """Extract the last blocking-question payload from agent output.
+
+    Recognises both the generic ``AGENT_RESULT: INPUT <question>`` marker and
+    the retained ``NEEDS_INPUT: <question>`` alias, returning whichever appears
+    last in the output.
+    """
+    last: str | None = None
+    for line in (stdout or "").splitlines():
+        s = line.strip()
+        m = _AGENT_RESULT_RE.match(s)
+        if m is not None and m.group(1) == "INPUT":
+            last = m.group(2).strip()
+            continue
+        alias = _NEEDS_INPUT_RE.match(s)
+        if alias is not None:
+            last = alias.group(1).strip()
+    return last
 
 
-_PR_FIX_NEEDS_DECISION_RE = re.compile(r"^PR_FIX_NEEDS_DECISION:\s*(.*)$", re.MULTILINE)
+def _extract_handoff_suggestion(stdout: str) -> str | None:
+    """Extract the recommended-workflow token from a ``COMPLETED`` marker.
+
+    ADR-044 Phase 4c — an agent on a ``→ handoff`` edge names a destination
+    workflow in the trailing payload of ``AGENT_RESULT: COMPLETED <workflow>``.
+    Returns the first whitespace token of the payload from the *last* such
+    marker (latest-wins, mirroring :func:`_extract_needs_input`), or ``None``
+    when there is no COMPLETED marker or its payload is empty (a bare
+    ``AGENT_RESULT: COMPLETED`` carries no suggestion and is inert). Validation
+    that the name is a real, ``hand-off``-invocable destination happens at the
+    call site — this parser only pulls the candidate token out.
+    """
+    last: str | None = None
+    for line in (stdout or "").splitlines():
+        m = _AGENT_RESULT_RE.match(line.strip())
+        if m is not None and m.group(1) == "COMPLETED":
+            tokens = (m.group(2) or "").strip().split(maxsplit=1)
+            last = tokens[0] if tokens else None
+    return last
 
 
 def _extract_needs_decision_question(stdout: str) -> str:
-    """Extract the question from a PR_FIX_NEEDS_DECISION: marker.
+    """Extract a pr-fix ``AGENT_RESULT: INPUT`` question (or a placeholder).
 
     Returns the trimmed question text after the marker. If the marker is
-    present but has no question text, returns a fallback placeholder so
-    the operator-facing chat input never renders an empty prompt.
+    present but has no question text, returns a fallback placeholder so the
+    operator-facing chat input never renders an empty prompt.
     """
-    m = _PR_FIX_NEEDS_DECISION_RE.search(stdout or "")
-    if m:
-        text = m.group(1).strip()
-        if text:
-            return text
-    return "Agent emitted PR_FIX_NEEDS_DECISION without a question."
+    question = _extract_needs_input(stdout or "")
+    return question or "Agent emitted AGENT_RESULT: INPUT without a question."
 
 
-_PR_FIX_MARKER_PREFIX_RE = re.compile(r"^PR_FIX_(?:DONE|SKIPPED|BLOCKED|NEEDS_DECISION):\s*(.*)$")
+_AGENT_RESULT_PREFIX_RE = re.compile(r"^AGENT_RESULT:\s*(?:COMPLETED|PASSED|FAILED|SKIPPED|INPUT)\b[:\s]*(.*)$")
 # A pr-fix dispatched right after resolve_conflicts receives that agent's stdout
 # as feedback (the rule-route carry-forward, ``feedback=result.stdout``), which
-# carries this marker. Used to recognise that "feedback" as the conflict-
-# resolution echo, not genuine reviewer input.
-_CONFLICTS_RESOLVED_RE = re.compile(r"^CONFLICTS_RESOLVED:", re.MULTILINE)
+# carries the resolve_conflicts worker's ``AGENT_RESULT: COMPLETED`` report. Used
+# to recognise that "feedback" as a benign step-completion echo, not genuine
+# reviewer input.
+#
+# Scoped to ``COMPLETED`` deliberately: under the generic vocabulary (ADR-044)
+# every terminal marker shares the ``AGENT_RESULT:`` prefix, so matching the bare
+# prefix would also swallow a ``review`` step's ``AGENT_RESULT: FAILED`` verdict
+# when it is carried forward into ``pr-fix`` (the ``review.FAILED → pr-fix`` edge
+# in the ``pr_fix`` sub-flow). A review failure is real, actionable feedback: a
+# subsequent ``SKIPPED`` must still burn ``max_consecutive_skipped``. Only the
+# ``COMPLETED`` worker echo (resolve_conflicts) is benign — a ``FAILED``/``PASSED``
+# gate verdict is not.
+_AGENT_ECHO_RE = re.compile(r"^AGENT_RESULT:\s*COMPLETED\b", re.MULTILINE)
 
 
-def _strip_pr_fix_marker_prefix(line: str) -> str:
-    """Strip a ``PR_FIX_<MARKER>:`` prefix from ``line`` if present.
+def _strip_agent_result_prefix(line: str) -> str:
+    """Strip a leading ``AGENT_RESULT: <OUTCOME>`` prefix from ``line`` if present.
 
-    The drainer captures the agent's outcome by scanning the tail of stdout
-    for the last non-empty line and writing it into the ``pr_decision``
-    audit row's ``reasoning`` field. That line typically still carries the
-    marker prefix (``PR_FIX_DONE: addressed the lint comments``), while
-    the parallel NEEDS_DECISION path uses
-    ``_extract_needs_decision_question`` which strips the marker. Without
-    this helper the audit field's format would diverge across decision
-    types, forcing display and query callers to pattern-match per
-    ``decision`` value.
+    The drainer captures the agent's outcome by scanning the tail of stdout for
+    the last non-empty line and writing it into the ``pr_decision`` audit row's
+    ``reasoning`` field. That line typically still carries the marker prefix
+    (``AGENT_RESULT: COMPLETED addressed the lint comments``). This helper keeps
+    the audit field uniform across outcome types.
 
-    Returns the substring after the marker (whitespace-trimmed) when the
-    line starts with one of the four ``PR_FIX_*`` markers; otherwise
-    returns the input unchanged. Empty/whitespace input returns ``""``.
+    Returns the substring after the marker (whitespace-trimmed) when the line
+    starts with an ``AGENT_RESULT:`` marker; otherwise returns the input
+    unchanged. Empty/whitespace input returns ``""``.
     """
     if not line:
         return ""
-    m = _PR_FIX_MARKER_PREFIX_RE.match(line.strip())
+    m = _AGENT_RESULT_PREFIX_RE.match(line.strip())
     if m:
         return m.group(1).strip()
     return line.strip()
 
 
+# Backward-compatible alias — some drainer call sites and tests reference the
+# pr-fix-specific name; the generic stripper handles every outcome.
+_strip_pr_fix_marker_prefix = _strip_agent_result_prefix
+
+
 def _feedback_is_actionable(feedback: str | None) -> bool:
     """Whether feedback delivered to a pr-fix dispatch was real.
 
-    A ``PR_FIX_SKIPPED`` only counts toward ``max_consecutive_skipped`` when
-    the agent actually had something to skip. These are benign — the agent
+    An ``AGENT_RESULT: SKIPPED`` only counts toward ``max_consecutive_skipped``
+    when the agent actually had something to skip. These are benign — the agent
     correctly had nothing to do, so such skips must not burn the cap:
 
     - Empty/whitespace feedback (an empty retry, or a dispatch with no operator
@@ -428,13 +516,19 @@ def _feedback_is_actionable(feedback: str | None) -> bool:
       ``"No specific feedback found."`` sentinel (an internal task: in-progress-
       review skips tripped the cap before the real review landed).
     - The ``resolve_conflicts`` echo: a pr-fix dispatched right after that step
-      is fed its stdout (the ``CONFLICTS_RESOLVED:`` report) as feedback via the
-      rule-route carry-forward. The conflict is already resolved, so skipping it
-      is benign (internal tasks / 04ee0735: the echo skip burned the cap and
+      is fed its stdout (its ``AGENT_RESULT: COMPLETED`` report) as feedback via
+      the rule-route carry-forward. The conflict is already resolved, so skipping
+      it is benign (internal tasks / 04ee0735: the echo skip burned the cap and
       re-blocked a conflict-resolved, review-ready PR).
+
+    Only the ``COMPLETED`` worker echo is benign. A ``review`` step's
+    ``AGENT_RESULT: FAILED`` verdict, carried into pr-fix via the
+    ``review.FAILED → pr-fix`` edge, is genuine actionable feedback — a
+    subsequent skip *must* count toward the cap. ``_AGENT_ECHO_RE`` is scoped to
+    ``COMPLETED`` so it never swallows a gate verdict.
     """
     delivered = (feedback or "").strip()
-    if _CONFLICTS_RESOLVED_RE.search(delivered):
+    if _AGENT_ECHO_RE.search(delivered):
         return False
     return bool(delivered) and delivered != "No specific feedback found."
 
@@ -466,14 +560,33 @@ async def _read_head_sha(work_dir: Path) -> str | None:
 
 
 def _strip_spec_marker(stdout: str) -> str:
-    """Remove the leading SPEC_COMPLETE: (or similar) marker line from *stdout*.
+    """Remove the leading conversational completion marker line from *stdout*.
 
-    The conversational rule's regex matches a line like ``SPEC_COMPLETE: foo``;
+    The conversational rule's regex matches a line like ``AGENT_RESULT: COMPLETED foo``;
     the persisted artifact should be everything that follows that line, with
     surrounding whitespace trimmed.
     """
     lines = stdout.split("\n", 1)
     return lines[1].strip() if len(lines) > 1 else ""
+
+
+def _strip_handoff_marker(stdout: str) -> str:
+    """Remove any ``AGENT_RESULT: COMPLETED …`` marker line(s) from a chat turn.
+
+    ADR-044 Phase 4c — a handoff turn carries its recommendation as a
+    ``COMPLETED <workflow>`` marker line; the stored/displayed chat message
+    should show only the agent's prose, not the routing marker. Cosmetic only
+    (the recommendation is captured separately into the ``handoff_suggestion``
+    artifact). Any line that is a COMPLETED marker is dropped; every other line
+    is preserved verbatim.
+    """
+    kept: list[str] = []
+    for line in (stdout or "").splitlines():
+        m = _AGENT_RESULT_RE.match(line.strip())
+        if m is not None and m.group(1) == "COMPLETED":
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 # Anchors that mark where an artifact's real content starts. Agents narrate
@@ -642,6 +755,14 @@ class OrchestratorService:
         # and so ``GET /api/processes`` / the new-task UI can surface what's
         # available without re-parsing YAML.
         self._processes: dict[str, Process] = {}
+        # ADR-044 Phase 5 — per-project repo-shipped workflows, keyed
+        # ``project_id → {workflow_name → Process}``. Built at ``start()`` from
+        # each project's ``<repo>/.lotsa/workflows`` (project-scoped, not
+        # global): a repo workflow is dispatchable/listable/promotable only
+        # within its owning project. Kept separate from ``_processes`` so the
+        # bundled catalog stays project-independent and repo names cannot leak
+        # across projects.
+        self._project_processes: dict[str, dict[str, Process]] = {}
         # Externally-visible name of the active process (the key in
         # ``_processes`` whose value is ``self.process``). For inline
         # processes this matches both the dict key and the process's
@@ -692,11 +813,15 @@ class OrchestratorService:
         # ADR-021 — the derived per-process state below replaces the former
         # singletons (``_pr_monitor`` / ``_pr_monitor_config`` /
         # ``_action_states`` / ``_monitor_state``). Each is keyed by the
-        # *catalog name* (the key in ``_processes`` / the value of a task's
-        # ``metadata['process_name']``). Since ADR-043 each bundled preset's
+        # *plumbing key* (:meth:`_plumbing_key`): a bundled/inline global process
+        # keeps its plain ``catalog_name`` (project-less, unchanged from before
+        # Phase 5), while a repo-shipped workflow (ADR-044 Phase 5) keys under the
+        # ``(project_id, catalog_name)`` tuple so two projects shipping an
+        # identically named repo workflow never overwrite each other's plumbing
+        # (str vs. tuple keys never collide). Since ADR-043 each bundled preset's
         # ``Process.name`` equals its catalog name (``build``/``fix``/``chat``);
         # inline processes may still diverge, so route every per-process lookup
-        # through ``_process_name_for(task)`` so the keying never diverges.
+        # through ``_plumbing_key_for(task)`` so the keying never diverges.
         #
         # ``_pr_monitors_by_process`` holds one engine instance per
         # monitor-bearing process (the engine declared via the ``engine:`` field
@@ -708,13 +833,13 @@ class OrchestratorService:
         # pr-fix flows) ``gather_pending_feedback``. ``_pr_monitor_tasks_by_process``
         # holds each engine's running ``run()`` poll task so shutdown can cancel
         # them all.
-        self._pr_monitors_by_process: dict[str, Any] = {}
-        self._pr_monitor_tasks_by_process: dict[str, asyncio.Task] = {}
+        self._pr_monitors_by_process: dict[str | tuple[str, str], Any] = {}
+        self._pr_monitor_tasks_by_process: dict[str | tuple[str, str], asyncio.Task] = {}
         # ``_pr_monitor_configs_by_process`` is the parsed config of each
         # process's monitor job using engine=pr_monitor (absent for processes
         # with no monitor, or whose monitor uses a different engine — the cap
         # logic is pr-fix-specific and only triggers for the built-in engine).
-        self._pr_monitor_configs_by_process: dict[str, PrMonitorConfig] = {}
+        self._pr_monitor_configs_by_process: dict[str | tuple[str, str], PrMonitorConfig] = {}
         # ``_push_tasks`` and ``_dispatching_push`` are NOT deprecated — they
         # remain load-bearing for ``_execute_push`` (the legacy ``state="pushing"``
         # dispatch path) and for surfacing / re-driving tasks persisted with
@@ -725,15 +850,15 @@ class OrchestratorService:
         # before the action task is created), which is sufficient because actions
         # are not re-entrant via user-initiated entry points the way pr-fix is.
         #
-        # ``_action_states_by_process`` maps each process's catalog name to the
-        # SET of every action job's queue_state in that process — a custom
+        # ``_action_states_by_process`` maps each plumbing key to the SET of
+        # every action job's queue_state in that process — a custom
         # ``process.yaml`` can declare more than one action job, and the
         # restart-recovery sweep must flip any of them to ``blocked``, looked up
         # against the row's OWN process (ADR-021), not a global active-process
-        # set. ``_monitor_states_by_process`` maps each process to its monitor
-        # job's queue_state (or None when the process has no monitor).
-        self._action_states_by_process: dict[str, set[str]] = {}
-        self._monitor_states_by_process: dict[str, str | None] = {}
+        # set. ``_monitor_states_by_process`` maps each plumbing key to its
+        # monitor job's queue_state (or None when the process has no monitor).
+        self._action_states_by_process: dict[str | tuple[str, str], set[str]] = {}
+        self._monitor_states_by_process: dict[str | tuple[str, str], str | None] = {}
         self._push_tasks: dict[str, asyncio.Task] = {}
         self._dispatching_pr_fix: set[str] = set()
         self._dispatching_push: set[str] = set()
@@ -983,71 +1108,20 @@ class OrchestratorService:
         # ``push_pr`` and their monitor job ``wait_for_pr_signal`` — replaces
         # the hardcoded ``pushing``/
         # ``waiting_for_pr`` synthetic states from the pre-ADR-014 model.
-        from lotsa.registry import get_engine
-
         for proc_name, process in self._processes.items():
-            action_states: set[str] = set()
-            monitor_state: str | None = None
-            for job in process.jobs:
-                if job.type == "action":
-                    action_states.add(job.queue_state)
-                if job.type == "monitor":
-                    # Engine via registry — the engine class is looked up by
-                    # name (the ``engine:`` field on the monitor job) and
-                    # instantiated with ``(orchestrator, monitor_state, config)``.
-                    # Any engine registered via ``lotsa.yaml``'s ``engines:``
-                    # block (or a built-in like ``pr_monitor``) works the same
-                    # way. The registered-name check that
-                    # ``_validate_registry_references`` ran at process-build time
-                    # guarantees ``get_engine`` resolves; we wrap defensively
-                    # anyway so a race between process load and engine teardown
-                    # surfaces a clear error here rather than an opaque
-                    # ``KeyError``.
-                    try:
-                        engine_cls = get_engine(job.engine or "")
-                    except KeyError as exc:
-                        raise RuntimeError(
-                            f"Monitor job {job.name!r} declares engine {job.engine!r} "
-                            f"which is not registered. This should have been caught at "
-                            f"process-build time by _validate_registry_references; if you "
-                            f"see this in production, the registry was mutated after build."
-                        ) from exc
-                    # Each monitor-bearing process gets its own engine instance,
-                    # scoped to its own monitor state. Processes that happen to
-                    # share a monitor_state string still dispatch correctly:
-                    # every monitor→orchestrator callback resolves the task's own
-                    # process per-task, and re-entrant dispatch is deduped by
-                    # ``_dispatching_pr_fix`` + ``_in_flight`` (each process has
-                    # at most one monitor job, so the last one wins per process).
-                    monitor_state = job.queue_state
-                    engine = engine_cls(self, job.queue_state, dict(job.config))
-                    self._pr_monitors_by_process[proc_name] = engine
-                    # The orchestrator's pr-fix cap logic
-                    # (``_completion_drainer``'s SKIPPED branch,
-                    # ``_pr_fix_round_cap_blocked``) reads
-                    # ``max_consecutive_skipped`` / ``max_pr_fix_rounds`` /
-                    # ``base_branch`` directly. These are pr_monitor-specific
-                    # fields, so we only populate the config map when the engine
-                    # is the built-in pr_monitor (the cap logic itself is
-                    # pr-fix-specific and only triggers for that engine's tasks).
-                    # A custom engine wouldn't surface here and the cap logic
-                    # short-circuits because no pr-fix sub-flow gets dispatched.
-                    #
-                    # Reach into the engine's already-parsed config rather than
-                    # calling ``parse_config`` a second time:
-                    # ``PrMonitorEngine.__init__`` ran the parser when the
-                    # instance was constructed above, so the typed dataclass
-                    # already exists. The ``pr_monitor`` branch guards the type
-                    # narrowing.
-                    if job.engine == "pr_monitor":
-                        self._pr_monitor_configs_by_process[proc_name] = engine.config
-            self._action_states_by_process[proc_name] = action_states
-            self._monitor_states_by_process[proc_name] = monitor_state
+            self._register_process_plumbing(proc_name, process)
 
         # ADR-029 — seed/sync projects (and run path-change resets + legacy
         # worktree cleanup) BEFORE the restart recovery sweep, so projects exist
         # for per-task worktree resolution and any relocation reset lands first.
         await self._sync_projects()
+
+        # ADR-044 Phase 5 — with projects synced, discover + build each
+        # project's repo-shipped workflows (``<repo>/.lotsa/workflows``) into
+        # ``self._project_processes`` and derive their PR-phase plumbing. Runs
+        # after ``_sync_projects`` (needs ``self._projects``) and before the
+        # restart sweep (so a resumed repo-workflow task resolves its process).
+        self._build_repo_processes()
 
         rows = await self.db.list_tasks()
         # Legacy synthetic states (pre-ADR-014) — pinned here so an upgrade
@@ -1084,8 +1158,7 @@ class OrchestratorService:
                 # recorded against a non-default process is checked against that
                 # process's action states (not a global active-process set, which
                 # would mis-route it).
-                row_process = self._process_name_for(row)
-                row_actions = self._action_states_by_process.get(row_process, set())
+                row_actions = self._action_states_by_process.get(self._plumbing_key_for(row), set())
                 push_state = row.state in row_actions or row.state in _legacy_push_states
                 # ``blocked`` is already terminal-for-restart (avoids duplicate
                 # recovery messages); ``archived`` is terminal full-stop and must
@@ -1104,9 +1177,13 @@ class OrchestratorService:
                 # We do NOT alias legacy names to the new catalog. Read the RAW
                 # recorded name here, not ``_process_name_for`` — that resolver
                 # silently falls back to the active process for unknown names,
-                # which would mask exactly the rows this branch must catch.
+                # which would mask exactly the rows this branch must catch. A
+                # repo-shipped workflow (ADR-044 Phase 5) lives in the row's
+                # project catalog, not ``_processes``, so consult both — else a
+                # resumed repo-workflow task would be wrongly blocked as removed.
                 recorded_process = (row.metadata or {}).get("process_name")
-                if recorded_process is not None and recorded_process not in self._processes:
+                known = recorded_process in self._processes or recorded_process in self._project_process_catalog(row)
+                if recorded_process is not None and not known:
                     await self._set_status(row.id, "blocked", row.current_step or row.state)
                     await self.db.add_message(
                         row.id,
@@ -1154,8 +1231,8 @@ class OrchestratorService:
         # job-iteration loop above (via the registry); here we just spawn each
         # ``run()`` task. Done after the recovery sweep so legacy rows are
         # already routed to ``blocked`` before any poller could see them.
-        for proc_name, engine in self._pr_monitors_by_process.items():
-            self._pr_monitor_tasks_by_process[proc_name] = asyncio.create_task(engine.run())
+        for plumbing_key, engine in self._pr_monitors_by_process.items():
+            self._pr_monitor_tasks_by_process[plumbing_key] = asyncio.create_task(engine.run())
 
     async def shutdown(self) -> None:
         """Graceful drain then cancel all background work and clean up (ADR-040 R5).
@@ -1240,7 +1317,7 @@ class OrchestratorService:
         tasks = await self.db.list_tasks()
         return self._enrich_summaries(tasks)
 
-    def list_processes_summary(self) -> list[dict[str, Any]]:
+    def list_processes_summary(self, project_id: str | None = None) -> list[dict[str, Any]]:
         """Return a summary of every loaded process for the API / UI dropdown.
 
         Each entry is a plain dict (intentionally not a Pydantic model — the
@@ -1248,7 +1325,9 @@ class OrchestratorService:
         Fields:
 
         - ``name``: the externally-visible key in ``_processes`` (an inline
-          ``lotsa.yaml`` name, or the preset name for bundled processes).
+          ``lotsa.yaml`` name, or the preset name for bundled processes) or a
+          repo-shipped workflow name (ADR-044 Phase 5) when ``project_id`` is
+          given.
         - ``is_active``: ``True`` for the *configured default* process — the
           one new tasks dispatch against when the caller doesn't pick a
           process. Per ADR-021 it is no longer "the only one that works": any
@@ -1257,10 +1336,15 @@ class OrchestratorService:
           ``default: true``. Note that ``is_active`` and ``is_default`` can
           diverge — ``--flow``/``--process`` at startup can pick a non-default.
         - ``step_names``: the ordered job names of the process's main flow.
+        - ``invocable``: ADR-044 Phase 4 — the ``start`` / ``hand-off`` options
+          the frontend picker (start) and hand-off dialog (hand-off) filter on
+          instead of hardcoding the name ``"chat"``.
 
-        Ordering is stable: the active entry first, then alphabetical. This
-        means the new-task dropdown's first item is the default selection
-        without the UI needing to sort client-side.
+        When ``project_id`` is supplied, that project's repo-shipped workflows
+        (ADR-044 Phase 5) are merged in — they are pickable/promotable only
+        within their owning project. Ordering is stable: the active entry first,
+        then alphabetical, so the new-task dropdown's first item is the default
+        selection without the UI needing to sort client-side.
         """
         inline_defaults = {
             name
@@ -1268,9 +1352,21 @@ class OrchestratorService:
             if isinstance(entry, dict) and entry.get("default") is True
         }
         active_name = self._active_process_name
+        # Bundled/inline catalog + (when scoped) the project's repo workflows.
+        # Repo names cannot shadow bundled ones, so a plain merge is unambiguous.
+        # Track the repo entries separately so each summary can carry its
+        # ADR-044 Phase 6 provenance (``source``: ``repo`` vs ``bundled``) —
+        # derived here from which catalog the process came from, never threaded
+        # onto ``Process`` (which has no such field). The same ``source`` flag the
+        # viewer badges is the signal a future editor uses to decide editability
+        # (bundled live in the wheel — read-only).
+        repo_processes = self._project_processes.get(project_id, {}) if project_id is not None else {}
+        catalog: dict[str, Process] = dict(self._processes)
+        catalog.update(repo_processes)
         summaries: list[dict[str, Any]] = []
-        for name, process in self._processes.items():
+        for name, process in catalog.items():
             flow = process.flows.get("main") or next(iter(process.flows.values()))
+            is_repo = name in repo_processes
             summaries.append(
                 {
                     "name": name,
@@ -1284,10 +1380,86 @@ class OrchestratorService:
                     "promotion_inputs": [
                         {"name": pi.name, "description": pi.description} for pi in process.promotion_inputs
                     ],
+                    # ADR-044 Phase 4 — the ``invocable`` property (start /
+                    # hand-off) so the new-task picker and the hand-off dialog
+                    # filter on it instead of hardcoding the name ``"chat"``.
+                    "invocable": list(process.invocable),
+                    # ADR-044 Phase 6 — provenance for the workflow viewer badge.
+                    # ``inline`` lotsa.yaml processes collapse into ``bundled`` for
+                    # v1 (the distinction that matters is repo-vs-not).
+                    "source": "repo" if is_repo else "bundled",
+                    "project": project_id if is_repo else None,
                 }
             )
         summaries.sort(key=lambda s: (not s["is_active"], s["name"]))
         return summaries
+
+    def _resolve_workflow(self, name: str, project_id: str | None) -> tuple[Process, str]:
+        """Resolve a workflow by name to its ``(Process, source)`` (ADR-044 Phase 6).
+
+        Precedence mirrors the task-dispatch resolution: the given project's
+        repo catalog first (``source == "repo"``), then the bundled/inline
+        catalog (``source == "bundled"``). An unknown name raises
+        :class:`WorkflowNotFound`. Repo names cannot shadow bundled ones, so the
+        project-first lookup can only ever add project-local workflows, never
+        mask a bundled one.
+        """
+        project_catalog = self._project_processes.get(project_id, {}) if project_id is not None else {}
+        if name in project_catalog:
+            return project_catalog[name], "repo"
+        if name in self._processes:
+            return self._processes[name], "bundled"
+        raise WorkflowNotFound(f"Workflow {name!r} not found")
+
+    def workflow_graph(self, name: str, project_id: str | None = None) -> dict[str, Any]:
+        """Serialize a workflow's read-only agent graph (ADR-044 Phase 6).
+
+        Resolves the workflow (project repo catalog → bundled), derives its
+        provenance, and serializes the *resolved* ``Process`` via
+        :func:`~lotsa.flows.serialize_process_graph` — so bundled, inline, and
+        repo-shipped (Phase 5) workflows all render through one source-agnostic
+        path. ``project`` is the owning project id for a repo workflow, else
+        ``None``; ``project_name`` is its human label when resolvable.
+        """
+        process, source = self._resolve_workflow(name, project_id)
+        graph = serialize_process_graph(process)
+        owning_project = project_id if source == "repo" else None
+        project_name = None
+        if owning_project is not None:
+            project_name = next(
+                (p["name"] for p in self.list_projects_summary() if p["id"] == owning_project),
+                owning_project,
+            )
+        return {
+            "name": name,
+            "source": source,
+            "project": owning_project,
+            "project_name": project_name,
+            "flows": graph["flows"],
+        }
+
+    def agent_detail(self, name: str, prompt_name: str, project_id: str | None = None) -> dict[str, Any]:
+        """Resolve one agent's declared properties + prompt bodies (ADR-044 Phase 6).
+
+        Reads through the workflow's own prompt registry so a repo-shipped agent
+        resolves the same way its workflow does (namespaced override → bundled →
+        repo). Feeds the viewer's node-detail inspector — the future agent-editor
+        form, without inputs. Raises :class:`WorkflowNotFound` when the workflow
+        is unknown or the agent is not resolvable within it.
+        """
+        process, _source = self._resolve_workflow(name, project_id)
+        agent = process.registry.load_agent_optional(prompt_name)
+        if agent is None:
+            raise WorkflowNotFound(f"Agent {prompt_name!r} not found in workflow {name!r}")
+        return {
+            "name": prompt_name,
+            "agent_class": agent.agent_class,
+            "outcomes": list(agent.outcomes),
+            "needs_worktree": agent.needs_worktree,
+            "produces_changes": agent.produces_changes,
+            "system_prompt": process.registry.load_optional(f"{prompt_name}-system"),
+            "user_prompt": process.registry.load_optional(f"{prompt_name}-user"),
+        }
 
     @staticmethod
     def _timeout_status(elapsed_s: int, step: FlowStep | None) -> Literal["ok", "warn", "over"]:
@@ -1412,11 +1584,16 @@ class OrchestratorService:
             return None, ActivityResult(events=[], supported=True)
 
         # ADR-029 — resolve the worktree against the task's project (best-effort:
-        # this method must never 500, so fall back to the namespaced on-disk path
-        # without raising when the project is unknown).
+        # this method must never 500, so fall back without raising when the
+        # project is unknown).
+        # ADR-044 Phase 3 — a worktree-less step (chat) runs in the project
+        # work_dir, so its session JSONL is keyed there, not under a namespaced
+        # worktree path. Mirror the dispatch-time work_dir resolution
+        # (``get_path`` → ``_fallback_work_dir``) so the Activity tab reads the
+        # right directory for such steps instead of a nonexistent worktree path.
         project = self._projects.get(row.project_id)
         wt_path = self._worktree_manager_for(project).get_path(task_id) if project else None
-        work_dir = wt_path or (self.config.data_dir / "worktrees" / row.project_id / task_id)
+        work_dir = wt_path or self._fallback_work_dir(row)
         try:
             result = await read(session_id, work_dir, since_index, limit)
         except Exception:
@@ -1565,26 +1742,32 @@ class OrchestratorService:
         # ``self.flow`` guard above.
         if self.process is None:
             raise RuntimeError("OrchestratorService not started")
+        # Resolve + validate the project (ADR-029) FIRST. Validation is at
+        # create time, not first dispatch, so the operator learns immediately.
+        # A repo-shipped workflow (ADR-044 Phase 5) is valid only within its
+        # owning project, so the project must be resolved before the process
+        # name is validated against that project's repo catalog.
+        resolved_project_id = self._resolve_project_id(project_id)
+
         active_name = self._active_process_name
-        # ADR-021: any loaded process is a valid dispatch target. The only
-        # error is an unknown name (not in the catalog at all).
+        project_catalog = self._project_processes.get(resolved_project_id, {})
+        # ADR-021: any loaded process is a valid dispatch target — the bundled/
+        # inline catalog OR this project's repo-shipped workflows (ADR-044
+        # Phase 5). The only error is an unknown name (in neither catalog).
         if process_name is None:
             resolved_process_name = active_name
-        elif process_name in self._processes:
+        elif process_name in project_catalog or process_name in self._processes:
             resolved_process_name = process_name
         else:
-            available = sorted(self._processes.keys())
+            available = sorted(set(self._processes) | set(project_catalog))
             raise ProcessNotFound(
-                f"Unknown process {process_name!r}. Available: {available}. "
-                f"Add it to ``lotsa.yaml``'s ``processes:`` block, or load a "
-                f"bundled process by name (chat/build/fix)."
+                f"Unknown process {process_name!r} for project {resolved_project_id!r}. "
+                f"Available: {available}. Add it to ``lotsa.yaml``'s ``processes:`` block, "
+                f"ship it under the project's ``.lotsa/workflows/``, or load a bundled "
+                f"process by name (chat/build/fix)."
             )
-        resolved_process = self._processes[resolved_process_name]
+        resolved_process = project_catalog.get(resolved_process_name) or self._processes[resolved_process_name]
         resolved_flow = resolved_process.flows.get("main") or next(iter(resolved_process.flows.values()))
-
-        # Resolve + validate the project (ADR-029). Validation is at create
-        # time, not first dispatch, so the operator learns immediately.
-        resolved_project_id = self._resolve_project_id(project_id)
 
         # Resolve title from message if not provided explicitly
         if title is None and message is not None:
@@ -1850,23 +2033,16 @@ class OrchestratorService:
         row = await self.db.get_task(task_id)
         if row is None:
             raise PromoteNotAllowed(f"Task {task_id} not found")
-        # ADR-027 §7 — no demotion. Promotion flows OUT of ``chat`` into a
-        # concrete process; a task is never promoted back INTO ``chat`` (it
-        # would muddy what the task represents). The dashboard filters ``chat``
-        # from the destination picker, but the CLI / raw API must enforce it
-        # server-side too — otherwise ``lotsa promote <id> chat`` slips through.
-        if to_process == "chat":
-            raise PromoteNotAllowed(
-                "Cannot promote to the chat process (ADR-027 §7): promotion "
-                "flows out of chat, not into it. For a fresh conversation on "
-                "related work, create a new task."
-            )
+        # ADR-044 Phase 4 (amends ADR-027 §7) — the hard "cannot promote INTO
+        # chat" rule is dropped: an operator may have a reason, so promotion is
+        # no longer name-blocked here. The ``invocable`` workflow property gates
+        # *advertising* only (the chat agent's suggest-catalog and the frontend
+        # hand-off picker filter on ``"hand-off"``, so chat — ``invocable:
+        # [start]`` — never advertises itself), not enforcement. A raw
+        # ``lotsa promote <id> chat`` therefore now proceeds like any other
+        # loaded destination, so every loaded process is listed as available.
         if to_process not in self._processes:
-            # Exclude ``chat`` from the suggested destinations: it is loaded
-            # like any other process but is never a valid promotion target (the
-            # no-demotion guard above rejects it). Listing it here would invite
-            # the operator to retry into a second confusing rejection.
-            available = sorted(p for p in self._processes if p != "chat")
+            available = sorted(self._processes)
             raise PromoteNotAllowed(
                 f"Unknown process {to_process!r}. Available: {available}. "
                 f"Promotion destinations must be loaded (active process or a "
@@ -1994,22 +2170,59 @@ class OrchestratorService:
         )
         await self._dispatch_next_step(item)
 
+    def _handoff_destinations(self) -> list[tuple[str, str]]:
+        """The ``(name, description)`` of every loaded ``hand-off``-invocable
+        process that carries a description (ADR-027 §3 / ADR-044 Phase 4).
+
+        The single source of truth for "which workflows may be suggested /
+        accepted as a hand-off destination", shared by the chat suggest-catalog
+        (:meth:`_render_available_processes`), the marker footer's destination
+        list, and the drainer's validation of an ``AGENT_RESULT: COMPLETED
+        <workflow>`` suggestion (ADR-044 Phase 4c). Keeping all three off one
+        filter guarantees the agent is never accepted for a destination it was
+        not shown. The exclusion is driven off the declared ``invocable``
+        property, not the literal name ``"chat"``: chat (``invocable: [start]``)
+        has no ``hand-off`` and so excludes itself, and the rule generalises to
+        any Think-phase / non-promotable workflow.
+        """
+        return [
+            (name, " ".join(process.description.split()))
+            for name, process in self._processes.items()
+            if "hand-off" in process.invocable and process.description
+        ]
+
     def _render_available_processes(self) -> str:
         """Render the loaded process catalog as an *available processes* block
         for the chat agent's triage prompt (ADR-027 §3).
 
-        Data-driven, not a hardcoded taxonomy: each loaded process that carries
-        a ``description`` contributes one line. Processes without a description
-        are skipped (they opt out of triage), and the ``chat`` process excludes
-        itself — the chat agent never suggests promoting to chat.
+        Data-driven, not a hardcoded taxonomy: one line per
+        :meth:`_handoff_destinations` entry (the shared ``hand-off``-invocable
+        filter).
         """
-        lines: list[str] = []
-        for name, process in self._processes.items():
-            if name == "chat" or not process.description:
-                continue
-            desc = " ".join(process.description.split())
-            lines.append(f"- {name}: {desc}")
-        return "\n".join(lines)
+        return "\n".join(f"- {name}: {desc}" for name, desc in self._handoff_destinations())
+
+    def _chat_message_metadata(self, info: InFlightStep, result: AgentResult) -> dict[str, object]:
+        """Execution metadata for a conversational step's stored chat message.
+
+        Shared by the conversational drain branch and the ADR-044 Phase 4c
+        handoff branch so a handoff turn carries the same rich stats
+        (duration, ``agent_model`` = the resolved per-step model, runner name,
+        tokens, cost) as an ordinary chat turn. ``agent_runner`` (ADR-023) is
+        the registered runner name carried on the in-flight record.
+        """
+        meta: dict[str, object] = {"duration_ms": result.duration_ms}
+        meta["agent_model"] = info.step.model or self.config.model
+        if result.model:
+            meta["model"] = result.model
+        if info.agent_runner_name is not None:
+            meta["agent_runner"] = info.agent_runner_name
+        if result.input_tokens is not None:
+            meta["input_tokens"] = result.input_tokens
+        if result.output_tokens is not None:
+            meta["output_tokens"] = result.output_tokens
+        if result.cost_usd is not None:
+            meta["cost_usd"] = result.cost_usd
+        return meta
 
     async def approve(self, task_id: str) -> None:
         """Approve a waiting (or needs_input) task — advance to next step.
@@ -2320,7 +2533,7 @@ class OrchestratorService:
         # waiting / needs_input — re-dispatch the current step. Resolve against
         # the task's ACTIVE flow first (see ``_resolve_step_for_row``): a pr_fix
         # ``review`` resolved against root gets *main's* review (success_state
-        # ``verify``), whose REVIEW_PASS auto-advance targets an edge absent from
+        # ``verify``), whose ``review`` PASSED auto-advance targets an edge absent from
         # pr_fix's SM and silently strands the task — the same failure mode
         # ``retry()`` fixes (an internal task).
         step = self._resolve_step_for_row(row)
@@ -2460,7 +2673,7 @@ class OrchestratorService:
         # Phase 2 — for pr-fix resumes, capture the round count for the
         # post-CAS counter bump. ADR-019 Commitment 5: the ``max_pr_fix_rounds``
         # cap is NOT enforced on this operator-initiated path — an operator
-        # answering a ``PR_FIX_NEEDS_DECISION`` is supervised dialogue, not an
+        # answering a pr-fix ``AGENT_RESULT: INPUT`` is supervised dialogue, not an
         # autonomous loop, so the very answer the agent requested can be
         # delivered even after the cap has fired. The counter still increments.
         is_pr_fix = step.name == "pr-fix"
@@ -3277,8 +3490,8 @@ class OrchestratorService:
             #  (b) Jumping INTO pr-fix: ``jump_to_step("pr-fix")`` previously
             #      did not write ``current_flow="pr_fix"``, so the subsequent
             #      ``review`` completion evaluated main-flow rule overrides
-            #      (``REVIEW_FAIL → code``) instead of the pr_fix-flow
-            #      overrides (``REVIEW_FAIL → pr-fix``). The
+            #      (``review FAILED → code``) instead of the pr_fix-flow
+            #      overrides (``review FAILED → pr-fix``). The
             #      ``_dispatch_pr_fix_locked`` entry point already writes
             #      ``current_flow="pr_fix"`` (see line ~1700); this brings
             #      jump_to_step's pr-fix path to the same invariant.
@@ -4091,7 +4304,7 @@ class OrchestratorService:
             return await self._handle_conflict_dispatch(item, sync_result.conflicting_files, current_rounds)
 
         # Clean merge or already-current: proceed to pr-fix dispatch.
-        # Record the round's dispatch cutoff so PR_FIX_SKIPPED: can advance
+        # Record the round's dispatch cutoff so a pr-fix ``AGENT_RESULT: SKIPPED`` can advance
         # pr_comments_since to this cursor without re-deriving it. Both the
         # monitor-driven and revise-driven entry paths land here, so this
         # is the single source of truth for "the agent saw feedback up to
@@ -4102,8 +4315,8 @@ class OrchestratorService:
         # Set ``current_flow`` here — the task has just been claimed into
         # ``pr-fixing`` and every subsequent step lookup must resolve against
         # the ``pr_fix`` flow's bindings (e.g. so ``review``'s per-flow rule
-        # override ``REVIEW_FAIL → pr-fix`` is the one the drainer evaluates,
-        # not the root flow's ``REVIEW_FAIL → code``). Reset is owned by the
+        # override ``review FAILED → pr-fix`` is the one the drainer evaluates,
+        # not the root flow's ``review FAILED → code``). Reset is owned by the
         # sub-flow exit paths: the SKIPPED drainer branch (``pr-fix →
         # wait_for_pr_signal``) and ``_execute_action_step``'s success path
         # when the next step is a monitor.
@@ -4554,12 +4767,10 @@ class OrchestratorService:
         if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
             await self._clear_interruption_markers(item)
 
-        # Create or reuse a git worktree for this task (under the task's project)
-        try:
-            wt_path = await self._worktree_manager_for_task(item).create(item.id)
-        except Exception:
-            logger.warning("Worktree creation failed for %s, using project work_dir", item.id)
-            wt_path = self._fallback_work_dir(item)
+        # Run the step's prehooks (ADR-044 Phase 3) — the built-in ``worktree``
+        # prehook creates/reuses the task's git worktree; a step that opts out
+        # (chat) runs in the project work_dir. Resolves this step's work_dir.
+        wt_path = await self._run_step_prehooks(item, step)
 
         # ADR-040 graceful drain — refuse new dispatches once shutdown has begun
         # so no fresh agent enters ``_in_flight`` while in-flight work drains.
@@ -4694,11 +4905,10 @@ class OrchestratorService:
             )
             return
 
-        try:
-            wt_path = await self._worktree_manager_for_task(item).create(item.id)
-        except Exception:
-            logger.warning("Worktree creation failed for %s during resume, using project work_dir", item.id)
-            wt_path = self._fallback_work_dir(item)
+        # Run the step's prehooks (ADR-044 Phase 3) — same as ``_dispatch_step``.
+        # A resumed chat step also skips the worktree; a needs_worktree step
+        # re-creates it idempotently.
+        wt_path = await self._run_step_prehooks(item, step)
 
         # ADR-040 graceful drain — check ``_accepting`` immediately before the
         # synchronous ``_in_flight`` mutation (after the last await), matching
@@ -5092,6 +5302,78 @@ class OrchestratorService:
             await self._dispatch_next_step(item)
             await self._cleanup_worktree_if_done(item)
 
+    async def _run_step_prehooks(self, item: Item, step: FlowStep) -> Path:
+        """Run *step*'s resolved prehooks, then resolve its work_dir (ADR-044 P3).
+
+        Replaces the former unconditional ``WorktreeManager.create`` at the two
+        dispatch sites. A step with no ``worktree`` prehook (today: only
+        ``chat``) never creates a worktree and runs in the project work_dir.
+
+        The work_dir is the path the ``worktree`` prehook reports it created
+        (``metadata['worktree']`` — authoritative, and the value ``create``
+        returned), falling back to ``get_path(item.id)`` then
+        ``_fallback_work_dir(item)``. So chat (no worktree prehook, nothing
+        created) runs in the project root, and every other step runs in its
+        freshly-created worktree.
+
+        A prehook failure is **non-fatal** — it degrades to the project work_dir
+        with a warning, preserving the pre-Phase-3 best-effort behaviour (it
+        does NOT block, unlike a posthook failure). This resilience covers the
+        WorktreeManager *resolution* too, not only the hook body: resolving the
+        manager can raise ``ProjectNotFound`` for a task on an unregistered
+        project (ADR-029 legacy rows / a project removed from ``lotsa.yaml``),
+        and the pre-Phase-3 code degraded that case to the project work_dir. It
+        must never propagate — this runs after ``_dispatch_step``'s CAS to
+        ``working`` has committed, so an escaping exception would strand the
+        task in ``working`` with no in-flight agent until the next restart.
+        """
+        from lotsa.registry import get_prehook
+        from lotsa.tools import TaskContext
+
+        try:
+            wtm = self._worktree_manager_for_task(item)
+        except Exception:  # noqa: BLE001 — an unresolvable project degrades to the project work_dir
+            logger.warning(
+                "Worktree manager resolution failed for task %s, using project work_dir",
+                item.id,
+                exc_info=True,
+            )
+            return self._fallback_work_dir(item)
+
+        created_path: Path | None = None
+        for name in step.prehooks:
+            try:
+                hook = get_prehook(name)
+                # ``worktree`` (fallback) placeholder: the real worktree doesn't
+                # exist yet — the prehook creates it via ``worktree_manager``.
+                ctx = TaskContext(
+                    task_id=item.id,
+                    worktree=self._fallback_work_dir(item),
+                    metadata=dict(item.metadata),
+                    db=self.db,
+                    process_name=self._process_for(item).name,
+                    flow_name=self._root_flow_for(item).name,
+                    current_flow=item.metadata.get("current_flow") or self._root_flow_for(item).name,
+                    last_run_step=step.name,
+                    worktree_manager=wtm,
+                )
+                result = await hook(ctx, {})
+                if not result.success:
+                    logger.warning(
+                        "Prehook %r for task %s did not succeed (%s) — using project work_dir",
+                        name,
+                        item.id,
+                        result.output,
+                    )
+                    continue
+                reported = result.metadata.get("worktree") if result.metadata else None
+                if reported:
+                    created_path = Path(reported)
+            except Exception:  # noqa: BLE001 — a prehook crash degrades to the project work_dir
+                logger.warning("Prehook %r crashed for task %s, using project work_dir", name, item.id, exc_info=True)
+
+        return created_path or wtm.get_path(item.id) or self._fallback_work_dir(item)
+
     async def _run_step_posthooks(self, item: Item, step: FlowStep, work_dir: Path) -> ToolResult | None:
         """Run *step*'s resolved posthooks in order (ADR-024).
 
@@ -5274,21 +5556,36 @@ class OrchestratorService:
 
             # Save stdout as named artifact if this step declares an output
             # (skip conversational steps — their artifact is saved in the drainer
-            # at SPEC_COMPLETE detection with cleaned content). Narration ahead
-            # of the content anchor is stripped at the source; an artifact that
-            # is unusable after stripping fails the dispatch (→ blocked, Retry
-            # re-runs the agent) instead of persisting garbage for downstream
-            # {artifact:NAME} prompt injection and the push step to consume.
-            if step.output and not step.conversational and result.stdout and result.stdout.strip():
-                cleaned = _strip_artifact_narration(result.stdout)
-                if result.success and len(cleaned) < _MIN_ARTIFACT_CHARS:
+            # at conversational-marker detection with cleaned content). Narration ahead
+            # of the content anchor is stripped at the source. A *successful*
+            # step that promised an artifact but couldn't deliver a usable one
+            # fails the dispatch (→ blocked, Retry re-runs the agent) instead of
+            # silently persisting nothing — two ways it can fail: empty/whitespace
+            # stdout, or stdout that reduces below the minimum after narration
+            # stripping. Both previously degraded silently (the empty case slipped
+            # through the old `and result.stdout.strip()` gate), letting a
+            # downstream consumer fall back to garbage — for pr_summary, a
+            # raw-prompt PR title. An *unsuccessful* result never blocks here; it
+            # routes through the normal failure path (and still persists any
+            # non-empty stdout for {artifact:NAME} prompt injection / the push step).
+            if step.output and not step.conversational:
+                raw = result.stdout or ""
+                if result.success and not raw.strip():
                     raise ArtifactCaptureError(
                         f"Declared output artifact {step.output!r} is unusable: "
-                        f"step stdout reduced to {len(cleaned)} chars after narration "
-                        f"stripping (minimum {_MIN_ARTIFACT_CHARS}). Retry re-runs the step."
+                        f"step succeeded but produced empty/whitespace stdout. "
+                        f"Retry re-runs the step."
                     )
-                artifact_meta = {"artifact_name": step.output}
-                await self.source.save_artifact(item.id, step.job_type, cleaned, metadata=artifact_meta)
+                if raw.strip():
+                    cleaned = _strip_artifact_narration(raw)
+                    if result.success and len(cleaned) < _MIN_ARTIFACT_CHARS:
+                        raise ArtifactCaptureError(
+                            f"Declared output artifact {step.output!r} is unusable: "
+                            f"step stdout reduced to {len(cleaned)} chars after narration "
+                            f"stripping (minimum {_MIN_ARTIFACT_CHARS}). Retry re-runs the step."
+                        )
+                    artifact_meta = {"artifact_name": step.output}
+                    await self.source.save_artifact(item.id, step.job_type, cleaned, metadata=artifact_meta)
 
             await self.source.append_event(
                 item.id,
@@ -5468,7 +5765,7 @@ class OrchestratorService:
                     # with no MERGE_HEAD — a different, confusing task than the
                     # one the prompt describes when the operator answers. The
                     # posthooks run on the resume pass once the agent emits its
-                    # terminal marker (``CONFLICTS_RESOLVED:`` etc.).
+                    # terminal marker (``AGENT_RESULT: COMPLETED`` etc.).
                     pending_question = _extract_needs_input(result.stdout)
                     if info.step.posthooks and pending_question is None:
                         posthook_work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
@@ -5556,6 +5853,62 @@ class OrchestratorService:
                         rule_work_dir = info.step_work_dir or self._fallback_work_dir(info.item)
                         rule_target = evaluate_output_rules(info.step.rules, result, rule_work_dir)
                     if rule_target is not None and rule_target != "next":
+                        # ADR-044 Phase 4c — an agent on a ``→ handoff`` edge
+                        # SUGGESTED a hand-off (``AGENT_RESULT: COMPLETED
+                        # <workflow>``). Record the validated destination as a
+                        # ``handoff_suggestion`` artifact (latest-wins) and PARK
+                        # — never advance, promote, or terminate the REPL
+                        # (amends ADR-027 §1: agents may suggest; the operator
+                        # gates). Handled here BEFORE the generic
+                        # ``resolve_output_target`` path, which would route the
+                        # non-state ``handoff`` target to ``blocked``. Edge-
+                        # driven: any step whose rules route an outcome →
+                        # handoff reaches here (today only ``chat``).
+                        if rule_target == "handoff":
+                            # Conversational steps store their turn as a chat
+                            # message (with the marker line stripped from the
+                            # display) so the conversation isn't lost on park.
+                            if info.step.conversational:
+                                await self.db.add_message(
+                                    item.id,
+                                    "agent",
+                                    info.step.job_type,
+                                    _strip_handoff_marker(result.stdout),
+                                    "chat",
+                                    metadata=self._chat_message_metadata(info, result),
+                                )
+                            suggestion = _extract_handoff_suggestion(result.stdout)
+                            valid = {name for name, _desc in self._handoff_destinations()}
+                            if suggestion in valid:
+                                await self.source.save_artifact(
+                                    item.id,
+                                    info.step.job_type,
+                                    suggestion,
+                                    metadata={"artifact_name": "handoff_suggestion", "source": "agent"},
+                                )
+                            elif suggestion:
+                                logger.info(
+                                    "task %s: dropping handoff suggestion %r (not a loaded "
+                                    "hand-off-invocable destination)",
+                                    item.id,
+                                    suggestion,
+                                )
+                            # Park at ``waiting`` in the SAME state (non-
+                            # terminating). Mirrors the conversational default
+                            # park below — a same-state CAS, no SM edge needed,
+                            # no _dispatch_next_step, no promotion.
+                            cas = await self.db.atomic_transition(
+                                item.id,
+                                from_status="working",
+                                from_state=item.state,
+                                to_state=item.state,
+                                to_status="waiting",
+                                to_current_step=info.step.name,
+                                audit_on_win=None,
+                            )
+                            if not cas.won:
+                                continue
+                            continue
                         # Phase 2 — pr-fix NEEDS_DECISION escalation. The
                         # flow.yaml rule targets the synthetic "needs_input"
                         # value; ``resolve_output_target`` would route it
@@ -5632,7 +5985,7 @@ class OrchestratorService:
                                 )
                             continue
 
-                        # R4: pr-fix may emit PR_FIX_SKIPPED: with a target
+                        # R4: pr-fix may emit ``AGENT_RESULT: SKIPPED`` with a target
                         # naming the monitor's state — ``waiting_for_pr`` in
                         # the legacy synthetic-state model, ``wait_for_pr_signal``
                         # (or whatever the YAML names its pr_monitor job) in
@@ -5749,12 +6102,12 @@ class OrchestratorService:
                             if result.stdout:
                                 for line in reversed(result.stdout.splitlines()):
                                     if line.strip():
-                                        # Strip the ``PR_FIX_<MARKER>:`` prefix so
+                                        # Strip the ``AGENT_RESULT: <OUTCOME>`` prefix so
                                         # the ``pr_decision.reasoning`` audit field
                                         # carries the human-readable summary in the
-                                        # same format as NEEDS_DECISION (which uses
-                                        # ``_extract_needs_decision_question``) and
-                                        # the cap-fire synthesised messages.
+                                        # same format as the ``AGENT_RESULT: INPUT`` path
+                                        # (which uses ``_extract_needs_decision_question``)
+                                        # and the cap-fire synthesised messages.
                                         # Contract documented on
                                         # ``_record_pr_decision``. The ``pr_decision``
                                         # row below is the SINGLE user-facing carrier
@@ -5908,9 +6261,9 @@ class OrchestratorService:
                         # ADR-014 Layer A — ``previous_step_name`` kwarg removed
                         # from ``resolve_output_target``. The autonomous code↔
                         # review loop is now spelled by name in the main flow's
-                        # per-binding rule override (REVIEW_FAIL → code).
+                        # per-binding rule override (review FAILED → code).
                         # Resolve against the task's *active* flow so sub-flow
-                        # rule targets (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``)
+                        # rule targets (e.g. ``pr_fix.review`` FAILED → pr-fix)
                         # find their target job in the right bindings.
                         active_flow_for_rule = self._resolve_flow(item)
                         target = resolve_output_target(
@@ -5919,7 +6272,7 @@ class OrchestratorService:
                             active_flow_for_rule,
                         )
                         # Save chat message for conversational steps so the conversation
-                        # history isn't lost when routing (e.g. NEEDS_REVIEW from verify)
+                        # history isn't lost when routing (e.g. a FAILED verdict routing back to code)
                         if info.step.conversational:
                             await self.db.add_message(
                                 item.id,
@@ -5931,7 +6284,7 @@ class OrchestratorService:
                             )
                         # Validate the rule-target transition against the *active*
                         # flow's SM, not main's. Sub-flow bindings (e.g.
-                        # pr_fix.review's REVIEW_FAIL → pr-fix) declare edges that
+                        # pr_fix.review's FAILED → pr-fix) declare edges that
                         # only exist in the sub-flow's SM — checking against main
                         # would reject the CAS and strand the task in working.
                         if (item.state, target) not in active_flow_for_rule.state_machine.transitions:
@@ -5990,7 +6343,7 @@ class OrchestratorService:
                             if result.stdout:
                                 for line in reversed(result.stdout.splitlines()):
                                     if line.strip():
-                                        # Strip ``PR_FIX_<MARKER>:`` prefix —
+                                        # Strip ``AGENT_RESULT: <OUTCOME>`` prefix —
                                         # keeps the audit field format consistent
                                         # across decision types. See
                                         # ``_strip_pr_fix_marker_prefix`` and
@@ -6042,39 +6395,22 @@ class OrchestratorService:
                             )
                         if target != "blocked":
                             # Pass the agent's output as feedback so the next step
-                            # knows why it was routed (e.g. REVIEW_FAIL summary)
+                            # knows why it was routed (e.g. a review FAILED summary)
                             await self._dispatch_next_step(item, feedback=result.stdout)
                         await self._cleanup_worktree_if_done(item)
                     else:
                         # Check for conversational step completion via rules
                         if info.step.conversational:
                             spec = check_conversational_rules(info.step, result.stdout)
-                            # Store AI response as chat message with execution metadata.
-                            # ``agent_model`` records the resolved per-step model
-                            # (ADR-022: step.model or the global default), applied
-                            # here independently against the drained ResolvedJob.
-                            chat_meta: dict[str, object] = {"duration_ms": result.duration_ms}
-                            chat_meta["agent_model"] = info.step.model or self.config.model
-                            if result.model:
-                                chat_meta["model"] = result.model
-                            # ADR-023 — the registered runner name (e.g. ``gpt``,
-                            # ``default``), carried from the dispatch body on the
-                            # in-flight record. Replaces the former class-name
-                            # ``runner`` field; the frontend reads ``agent_model``,
-                            # not ``runner``, so this is a clean swap.
-                            if info.agent_runner_name is not None:
-                                chat_meta["agent_runner"] = info.agent_runner_name
-                            if result.input_tokens is not None:
-                                chat_meta["input_tokens"] = result.input_tokens
-                            if result.output_tokens is not None:
-                                chat_meta["output_tokens"] = result.output_tokens
-                            if result.cost_usd is not None:
-                                chat_meta["cost_usd"] = result.cost_usd
+                            # Store AI response as chat message with execution
+                            # metadata (duration, resolved per-step model, runner,
+                            # tokens, cost) — see ``_chat_message_metadata``.
+                            chat_meta = self._chat_message_metadata(info, result)
                             await self.db.add_message(
                                 item.id, "agent", info.step.job_type, result.stdout, "chat", metadata=chat_meta
                             )
                             # Persist the artifact RIGHT NOW (not at approve time). The drainer is
-                            # the only place where SPEC_COMPLETE can be reliably observed; if we
+                            # the only place where the conversational completion marker can be reliably observed; if we
                             # defer to approve, closing the browser between detection and approve
                             # loses the spec content.
                             if spec is not None and info.step.output:
@@ -6159,8 +6495,8 @@ class OrchestratorService:
                         # If the step declared output rules but NONE matched,
                         # block rather than silently auto-advancing to the
                         # sequential next step.  This catches cases like a
-                        # pr-fix agent that fails to emit PR_FIX_DONE: /
-                        # PR_FIX_BLOCKED: — without this guard the task would
+                        # pr-fix agent that fails to emit ``AGENT_RESULT: COMPLETED`` /
+                        # ``AGENT_RESULT: FAILED`` — without this guard the task would
                         # fall through to whatever step happens to follow
                         # pr-fix in YAML (e.g. verify), bypassing review.
                         # ``rule_target is None`` means the rule list was
@@ -6564,16 +6900,16 @@ class OrchestratorService:
           next round.
 
         ``reasoning`` format contract: a plain human-readable summary
-        with the ``PR_FIX_<MARKER>:`` prefix already stripped — display
+        with the ``AGENT_RESULT: <OUTCOME>`` prefix already stripped — display
         and query callers can treat the field uniformly across
         ``decision`` values without per-type pattern-matching:
 
-        * DONE/SKIPPED/agent-emitted BLOCKED: the drainer extracts the
+        * COMPLETED/SKIPPED/agent-emitted FAILED: the drainer extracts the
           last non-empty stdout line and passes it through
           ``_strip_pr_fix_marker_prefix`` before calling this helper, so
-          a stdout line of ``"PR_FIX_DONE: addressed the lint comments"``
+          a stdout line of ``"AGENT_RESULT: COMPLETED addressed the lint comments"``
           arrives as ``"addressed the lint comments"``.
-        * NEEDS_DECISION: ``_extract_needs_decision_question`` strips
+        * INPUT (needs-decision): ``_extract_needs_decision_question`` strips
           the marker and returns just the question text (or a fallback
           placeholder when the marker has no trailing text).
         * Cap-fire paths: synthesised sentences with no marker prefix to
@@ -6747,19 +7083,168 @@ class OrchestratorService:
     # ``self.flow`` survive only as the active-process default these helpers
     # fall back to (legacy rows, stale names).
 
+    def _register_process_plumbing(self, proc_name: str, process: Process, project_id: str | None = None) -> None:
+        """Derive a process's PR-phase plumbing (ADR-021): action states,
+        monitor state, monitor engine, and pr_monitor config — keyed by
+        :meth:`_plumbing_key`.
+
+        Called for every bundled/inline process (``project_id=None`` — keyed by
+        its plain global name) and, since ADR-044 Phase 5, every repo-shipped
+        workflow (``project_id`` set — keyed by the ``(project_id, proc_name)``
+        tuple). So two projects shipping an identically named repo workflow (e.g.
+        both ``release``, each with its own monitor ``base_branch``) get
+        **separate** action-state sets, monitor engines, and pr_monitor configs
+        instead of silently overwriting each other's by-name entries, while
+        global names keep their pre-Phase-5 plain-string key (str vs. tuple keys
+        never collide, and a repo name can't shadow a bundled one anyway).
+        """
+        from lotsa.registry import get_engine
+
+        key = self._plumbing_key(proc_name, project_id)
+
+        action_states: set[str] = set()
+        monitor_state: str | None = None
+        for job in process.jobs:
+            if job.type == "action":
+                action_states.add(job.queue_state)
+            if job.type == "monitor":
+                # Engine via registry — the engine class is looked up by name
+                # (the ``engine:`` field on the monitor job) and instantiated
+                # with ``(orchestrator, monitor_state, config)``. The
+                # registered-name check ``_validate_registry_references`` ran at
+                # process-build time guarantees ``get_engine`` resolves; we wrap
+                # defensively anyway so a race between process load and engine
+                # teardown surfaces a clear error rather than an opaque KeyError.
+                try:
+                    engine_cls = get_engine(job.engine or "")
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Monitor job {job.name!r} declares engine {job.engine!r} "
+                        f"which is not registered. This should have been caught at "
+                        f"process-build time by _validate_registry_references; if you "
+                        f"see this in production, the registry was mutated after build."
+                    ) from exc
+                # Each monitor-bearing process gets its own engine instance,
+                # scoped to its own monitor state. Re-entrant dispatch is deduped
+                # by ``_dispatching_pr_fix`` + ``_in_flight`` (each process has at
+                # most one monitor job, so the last one wins per process).
+                monitor_state = job.queue_state
+                engine = engine_cls(self, job.queue_state, dict(job.config))
+                self._pr_monitors_by_process[key] = engine
+                # Only the built-in pr_monitor exposes the cap fields the pr-fix
+                # cap logic reads; reach into the engine's already-parsed config
+                # rather than re-parsing.
+                if job.engine == "pr_monitor":
+                    self._pr_monitor_configs_by_process[key] = engine.config
+        self._action_states_by_process[key] = action_states
+        self._monitor_states_by_process[key] = monitor_state
+
+    @staticmethod
+    def _plumbing_key(proc_name: str, project_id: str | None) -> str | tuple[str, str]:
+        """The key for the per-process plumbing dicts (ADR-044 P5).
+
+        A bundled/inline **global** process (``project_id is None``) keeps its
+        plain string name — global processes are genuinely project-less, so their
+        key is unchanged from before Phase 5. A **repo-shipped** workflow keys
+        under the ``(project_id, proc_name)`` tuple, so two projects shipping an
+        identically named repo workflow (e.g. both ``release``) never overwrite
+        each other's plumbing. A ``str`` and a ``tuple`` can never be equal, so
+        the two key spaces never collide (and a repo name can't shadow a bundled
+        one anyway).
+        """
+        return proc_name if project_id is None else (project_id, proc_name)
+
+    def _plumbing_key_for(self, item_or_row: Any) -> str | tuple[str, str]:
+        """Resolve the plumbing key for a task (ADR-044 P5).
+
+        A task whose resolved process name lives in its project's repo-workflow
+        catalog keys under the ``(project_id, name)`` tuple; every other task
+        (bundled / inline / legacy) keys under the plain ``name`` — mirroring how
+        :meth:`_register_process_plumbing` registered it.
+        """
+        name = self._process_name_for(item_or_row)
+        if name in self._project_process_catalog(item_or_row):
+            return (self._project_id_for(item_or_row), name)
+        return name
+
+    def _build_repo_processes(self) -> None:
+        """Discover + build each project's repo-shipped workflows (ADR-044 P5).
+
+        Reads ``<project.path>/.lotsa/workflows`` from the project root
+        (Decision 1 — project-scoped, build-time) through the same
+        ``build_process`` path the bundled catalog uses, so every structural rail
+        (bundled-tools-only references, rule-target validation) applies for free.
+        Fail-soft per workflow: a malformed repo ``process.yaml`` is logged and
+        skipped, never aborting ``start()``. A repo workflow whose name collides
+        with a bundled/global process is skipped (repo cannot shadow bundled).
+
+        Containment is re-checked on the literal ``process.yaml`` path before it
+        is read — the workflow analog of ``_repo_candidate_ok``'s second gate for
+        repo agents. Discovery already rejects a symlinked manifest, so this is
+        defense-in-depth against a caller-supplied path that never passed through
+        ``discover_repo_workflows``.
+        """
+        from lotsa import provenance
+
+        self._project_processes = {}
+        for pid, project in self._projects.items():
+            root = provenance.repo_lotsa_root(project.path)
+            repo_agents_dir = (root / "agents") if root is not None else None
+            built: dict[str, Process] = {}
+            for wf_name, process_yaml in provenance.discover_repo_workflows(project.path).items():
+                if wf_name in self._processes:
+                    logger.warning(
+                        "Repo workflow %r in project %r shadows a bundled/global process; skipping "
+                        "(repo names cannot shadow bundled — ADR-044 Phase 5).",
+                        wf_name,
+                        pid,
+                    )
+                    continue
+                if root is None or not provenance.is_contained(process_yaml, root):
+                    logger.error(
+                        "Skipping repo workflow %r in project %r: process.yaml escapes the .lotsa tree "
+                        "(symlink-escape guard — ADR-044 Phase 5).",
+                        wf_name,
+                        pid,
+                    )
+                    continue
+                try:
+                    process = build_process(
+                        wf_name,
+                        prompts_dir=self.config.prompts_dir,
+                        process_file=process_yaml,
+                        repo_agents_dir=repo_agents_dir,
+                    )
+                except (ValueError, FileNotFoundError, PromptNotFound) as exc:
+                    logger.error(
+                        "Skipping malformed repo workflow %r in project %r: %s",
+                        wf_name,
+                        pid,
+                        exc,
+                    )
+                    continue
+                built[wf_name] = process
+                self._register_process_plumbing(wf_name, process, project_id=pid)
+            self._project_processes[pid] = built
+
+    def _project_process_catalog(self, item_or_row: Any) -> dict[str, Process]:
+        """Return the repo-workflow catalog for the task's project (ADR-044 P5)."""
+        return self._project_processes.get(self._project_id_for(item_or_row), {})
+
     def _process_name_for(self, item_or_row: Any) -> str:
         """Return the catalog name of the process that owns this task.
 
         Reads ``metadata['process_name']`` (Item or TaskRow both expose
-        ``metadata``). Falls back to the active process name for tasks created
-        before multi-process support, or whose recorded name no longer
-        resolves (e.g. the process was removed from lotsa.yaml between
-        restarts). The returned name is always a valid key into
-        ``_processes`` and the per-process collections.
+        ``metadata``). Resolves against the task's project repo-workflow catalog
+        first (ADR-044 Phase 5), then the global bundled/inline catalog. Falls
+        back to the active process name for tasks created before multi-process
+        support, or whose recorded name no longer resolves (e.g. the process was
+        removed from lotsa.yaml between restarts). The returned name is always a
+        valid key into the resolved catalog and the per-process collections.
         """
         metadata = getattr(item_or_row, "metadata", None) or {}
         name = metadata.get("process_name")
-        if name and name in self._processes:
+        if name and (name in self._project_process_catalog(item_or_row) or name in self._processes):
             return name
         return self._active_process_name
 
@@ -6768,12 +7253,17 @@ class OrchestratorService:
 
         This is the canonical per-task process accessor (ADR-021): every
         routing decision resolves the task's own process here rather than
-        reading the ``self.process`` singleton. Legacy rows and stale names
-        fall back to the active process.
+        reading the ``self.process`` singleton. A repo-shipped workflow resolves
+        from the task's project catalog first (ADR-044 Phase 5), then the global
+        catalog. Legacy rows and stale names fall back to the active process.
         """
         if self.process is None:
             raise RuntimeError("_process_for called before start()")
-        return self._processes.get(self._process_name_for(item_or_row), self.process)
+        name = self._process_name_for(item_or_row)
+        project_catalog = self._project_process_catalog(item_or_row)
+        if name in project_catalog:
+            return project_catalog[name]
+        return self._processes.get(name, self.process)
 
     def _root_flow_for(self, item_or_row: Any) -> FlowConfig:
         """Return the root (``main``) flow of the task's own process."""
@@ -6791,15 +7281,15 @@ class OrchestratorService:
 
     def _monitor_state_for(self, item_or_row: Any) -> str | None:
         """Return the monitor queue_state of the task's process (or None)."""
-        return self._monitor_states_by_process.get(self._process_name_for(item_or_row))
+        return self._monitor_states_by_process.get(self._plumbing_key_for(item_or_row))
 
     def _monitor_engine_for(self, item_or_row: Any) -> Any:
         """Return the monitor engine for the task's process (or None)."""
-        return self._pr_monitors_by_process.get(self._process_name_for(item_or_row))
+        return self._pr_monitors_by_process.get(self._plumbing_key_for(item_or_row))
 
     def _pr_monitor_config_for(self, item_or_row: Any) -> PrMonitorConfig | None:
         """Return the pr_monitor config for the task's process (or None)."""
-        return self._pr_monitor_configs_by_process.get(self._process_name_for(item_or_row))
+        return self._pr_monitor_configs_by_process.get(self._plumbing_key_for(item_or_row))
 
     def _resolve_flow(self, item: Item) -> FlowConfig:
         """Return the flow currently driving ``item``'s dispatch.
@@ -6841,7 +7331,7 @@ class OrchestratorService:
         ``success_state`` differs from the same-named root job (pr_fix
         ``review`` → ``push_pr`` vs main ``review`` → ``verify``). Resolving
         only against root dispatches *main's* job on a sub-flow task; the
-        REVIEW_PASS auto-advance then targets ``(reviewing → verify)`` — an
+        ``review`` PASSED auto-advance then targets ``(reviewing → verify)`` — an
         edge absent from pr_fix's SM — so the completion is silently dropped
         and the task stalls at ``reviewing/working`` (an internal task's multi-day
         stall, confirmed via the drainer strand-warning).
@@ -6872,7 +7362,7 @@ class OrchestratorService:
 
         When ``item`` is supplied, the lookup runs against the item's
         currently-active flow (see ``_resolve_flow``); this is what makes
-        sub-flow rule overrides (e.g. ``pr_fix.review.REVIEW_FAIL → pr-fix``)
+        sub-flow rule overrides (e.g. ``pr_fix.review`` FAILED → pr-fix)
         take effect at dispatch time. Callers that don't have an item
         (e.g. dispatch-table sanity checks) fall back to the root flow.
         """
@@ -7158,8 +7648,9 @@ class OrchestratorService:
         if "{available_processes}" in base:
             base = base.replace("{available_processes}", self._render_available_processes())
         # ADR-029 §6 — prompt portability: ``{lotsa_prompts_dir}`` resolves to the
-        # installed bundled prompts directory so a prompt (e.g. review-system.md)
-        # can address its workflow files by an absolute path that works on every
+        # installed bundled prompts directory so a prompt (e.g. the catalog's
+        # ``agents/review/system.md``) can address its workflow files by an
+        # absolute path (``{lotsa_prompts_dir}/review/checklist.md``) that works on every
         # repo, not just the Lotsa repo. Done before the conversational return so
         # every step prompt (conversational or not) can use it.
         if "{lotsa_prompts_dir}" in base:
@@ -7173,10 +7664,13 @@ class OrchestratorService:
                 base = base.replace("{project_name}", project.name).replace("{project_path}", str(project.path))
             except ProjectNotFound:
                 pass
-        # Make any stdout-marker requirement non-optional (ADR-039). Appended
-        # BEFORE the conversational early-return below, because the marker steps
-        # (spec, verify) are themselves conversational.
-        base += _marker_requirement_footer(step.rules)
+        # Make any stdout-marker requirement non-optional (ADR-039), and — for a
+        # step routing ``→ handoff`` (ADR-044 Phase 4c) — advertise the optional
+        # hand-off suggestion marker with the valid destinations. Appended BEFORE
+        # the conversational early-return below, because the marker steps (spec,
+        # verify, chat) are themselves conversational. The destinations are the
+        # same ``hand-off``-invocable catalog the chat suggest-block renders.
+        base += _marker_requirement_footer(step.rules, handoff_destinations=self._render_available_processes())
         # Skip preamble for conversational steps — it instructs file writing
         # which conflicts with spec-style prompts that say "do not create files"
         if step.conversational:

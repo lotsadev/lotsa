@@ -40,9 +40,10 @@ async def commit_posthook(ctx: TaskContext, config: dict[str, Any]) -> ToolResul
     step — making "commit ⟹ the pushed PR branch reflects the worktree" an
     invariant enforced at the single place the orchestrator lands agent
     commits, rather than a separately-routable ``push_pr`` step that only the
-    ``PR_FIX_DONE`` route reaches. The push fires whenever a PR exists, **not**
-    only when *this* step committed, so drift stranded by an earlier round (a
-    ``PR_FIX_SKIPPED`` round, or a sync-merge commit) converges on the next
+    pr-fix ``AGENT_RESULT: COMPLETED`` route reaches. The push fires whenever a
+    PR exists, **not** only when *this* step committed, so drift stranded by an
+    earlier round (an ``AGENT_RESULT: SKIPPED`` pr-fix round, or a sync-merge
+    commit) converges on the next
     posthook run; a push of an already-current branch is a cheap remote no-op.
     Pre-PR (``pr_number`` unset) the main pipeline's ``push_pr`` still owns the
     first push and PR creation, so PR-description timing is unchanged.

@@ -42,7 +42,7 @@ contract:
 2. As the **last line** of your output, emit exactly:
 
    ```
-   REVIEW_PASS
+   AGENT_RESULT: PASSED
    ```
 
    This advances the task to the verify step.
@@ -56,13 +56,13 @@ INTENT drift):**
 3. As the **last line** of your output, emit exactly:
 
    ```
-   REVIEW_FAIL: <one-line summary of the blocking issues>
+   AGENT_RESULT: FAILED: <one-line summary of the blocking issues>
    ```
 
    This sends the task back to the previous step for fixing.
 
 The marker MUST be the last line. The Lotsa orchestrator only inspects
-the final newline-terminated marker; anything after `REVIEW_FAIL:`
+the final newline-terminated marker; anything after `AGENT_RESULT: FAILED:`
 becomes the feedback payload routed back to the previous step.
 
 ---

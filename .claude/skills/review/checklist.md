@@ -137,7 +137,7 @@ INTENT findings do not block merge automatically — surface them so the user ca
 #### LLM Prompt Issues
 - 0-indexed lists in prompts (LLMs reliably return 1-indexed).
 - Prompt text listing tools/capabilities that don't match what's wired up.
-- `process.yaml` step markers (`SPEC_COMPLETE:`, `VERIFIED:`, `REVIEW_PASS`/`FAIL`, `PR_FIX_*`) or rule targets changed without updating the orchestrator code that parses them.
+- `process.yaml` step markers (the generic `AGENT_RESULT:` vocabulary — `COMPLETED`/`PASSED`/`FAILED`/`SKIPPED`/`INPUT` — plus the retained `NEEDS_INPUT:` alias) or rule targets changed without updating the orchestrator code that parses them.
 - Structured-output schema changes without updating the parser that consumes them.
 
 #### Test Gaps

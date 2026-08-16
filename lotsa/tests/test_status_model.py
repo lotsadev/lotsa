@@ -168,7 +168,13 @@ def test_agent_failure_sets_blocked_status(tmp_path, _loop, run):
 
 def test_auto_advance_to_complete_sets_status_complete(tmp_path, _loop, run):
     flow_yaml = tmp_path / "flow.yaml"
-    flow_yaml.write_text("name: t\njobs:\n  - name: coding\n")  # no evaluate -> auto-advance
+    # binding ``posthooks: []`` suppresses ADR-044 Phase 2's derived ``commit``
+    # (``coding`` produces changes); this step only exercises auto-advance, not
+    # commit behaviour, and the test work_dir is not a git repo.
+    flow_yaml.write_text(
+        "name: t\njobs:\n  - name: coding\n"  # no evaluate -> auto-advance
+        "flows:\n  main:\n    steps:\n      - name: coding\n        posthooks: []\n"
+    )
     config = LotsaConfig(
         data_dir=tmp_path / "data",
         work_dir=tmp_path,
@@ -349,7 +355,12 @@ def test_retry_rejects_rebasing_with_revise_hint(tmp_path, _loop, run):
 
 def test_retry_blocked_re_dispatches_same_step(tmp_path, _loop, run):
     flow_yaml = tmp_path / "f.yaml"
-    flow_yaml.write_text("name: t\njobs:\n  - name: coding\n    evaluate: true\n")
+    # ``posthooks: []`` suppresses ADR-044 Phase 2's derived ``commit`` on the
+    # generic ``coding`` step (non-git test work_dir; not testing commit).
+    flow_yaml.write_text(
+        "name: t\njobs:\n  - name: coding\n    evaluate: true\n"
+        "flows:\n  main:\n    steps:\n      - name: coding\n        posthooks: []\n"
+    )
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,
@@ -384,7 +395,12 @@ def test_retry_from_drainer_blocked_state_does_not_raise(tmp_path, _loop, run):
     edge is the one being walked.
     """
     flow_yaml = tmp_path / "f.yaml"
-    flow_yaml.write_text("name: t\njobs:\n  - name: coding\n    evaluate: true\n")
+    # ``posthooks: []`` suppresses ADR-044 Phase 2's derived ``commit`` on the
+    # generic ``coding`` step (non-git test work_dir; not testing commit).
+    flow_yaml.write_text(
+        "name: t\njobs:\n  - name: coding\n    evaluate: true\n"
+        "flows:\n  main:\n    steps:\n      - name: coding\n        posthooks: []\n"
+    )
     config = LotsaConfig(
         data_dir=tmp_path / "d",
         work_dir=tmp_path,

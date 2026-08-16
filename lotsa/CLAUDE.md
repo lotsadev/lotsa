@@ -73,14 +73,14 @@ lotsa/
 │   ├── schemas.py      — Pydantic models for dashboard requests
 │   └── static/dist/    — built frontend output (**gitignored** — run `npm run build` in `lotsa/frontend/` before `lotsa serve`)
 ├── frontend/           — Vite + React + shadcn/ui dashboard (ADR-012)
-├── prompts/            — bundled process presets and standalone prompts:
-│                         build/, fix/ — each carries a process.yaml +
-│                         {step}-system.md + {step}-user.md (ADR-014/043
-│                         process catalog); build/ also holds the generic
-│                         review/pr-fix/resolve_conflicts/pr_summary prompts
-│                         that fix/ reuses. chat/ holds the Think-phase
-│                         prompt; review/ holds the /review skill (SKILL.md +
-│                         checklist.md), not a process.
+├── prompts/            — bundled agent catalog, process presets, and skills:
+│                         agents/<name>/ — the shared, process-independent
+│                         agent catalog (ADR-044): each holds agent.yaml +
+│                         system.md + user.md. build/, fix/, chat/ — process
+│                         presets, each just a process.yaml that wires catalog
+│                         agents by name (chat/ also carries its
+│                         task-creation-system.md). review/ holds the /review
+│                         skill (SKILL.md + checklist.md), not a process.
 ├── tests/              — pytest, mirrors module layout
 ├── Dockerfile.agent    — base image for --docker mode
 └── README.md           — user-facing quickstart and CLI reference
@@ -237,24 +237,36 @@ stdout, stderr = await proc.communicate()
 This satisfies both injection prevention (Constitution §1.1) and async
 hygiene (§2.1) in one rule.
 
-### Agent output markers (the orchestrator's structured-output contract)
+### Agent output markers — the generic outcome vocabulary (ADR-044)
 
-Agents communicate exit conditions to the orchestrator via single-line
-markers in stdout. The orchestrator scans for the **last** matching marker.
+Agents communicate exit conditions to the orchestrator via one single-line
+`AGENT_RESULT:` marker in stdout. The orchestrator scans for the **last**
+matching marker. **Semantics live on the flow edge, not the marker name:** the
+same outcome routes differently depending on which step is active (a `review`
+`FAILED` and a `pr-fix` `FAILED` route to different targets), because rules are
+evaluated against the active step. The closed vocabulary:
 
-| Marker                          | Meaning                                                                       |
-|---------------------------------|-------------------------------------------------------------------------------|
-| `NEEDS_INPUT: <question>`       | Agent paused; orchestrator collects the answer and resumes the same session   |
-| `SPEC_COMPLETE: <title>`        | Generic conversational-completion marker (strip + persist artifact); no bundled process emits it since ADR-043 dissolved the `spec` step — retained for custom/inline conversational steps |
-| `PR_FIX_DONE: <reasoning>`      | pr-fix made changes; advance to push                                          |
-| `PR_FIX_SKIPPED: <reasoning>`   | pr-fix declined feedback as non-actionable                                    |
-| `PR_FIX_BLOCKED: <reasoning>`   | pr-fix cannot proceed; mark task blocked                                      |
-| `PR_FIX_NEEDS_DECISION: <q>`    | pr-fix needs an operator answer before continuing                             |
-| `CONFLICTS_RESOLVED: <summary>` | resolve_conflicts resolved all markers; advance through output rule to pr-fix |
+| Marker                          | Emitted by | Meaning / default route                                   |
+|---------------------------------|------------|-----------------------------------------------------------|
+| `AGENT_RESULT: COMPLETED [<reason>]` | workers | did the work, no verdict → next                       |
+| `AGENT_RESULT: PASSED [<reason>]`    | gates   | evaluated, good → next                                  |
+| `AGENT_RESULT: FAILED [<reason>]`    | gates   | evaluated, not good → blocked (edge-overridable)        |
+| `AGENT_RESULT: SKIPPED [<reason>]`   | workers/monitors | nothing to do → next (edge-overridable)        |
+| `AGENT_RESULT: INPUT <question>`     | any     | blocking question; pause → `needs_input` (orchestrator-handled) |
 
-Parser regexes live at module scope in `lotsa/orchestrator.py`. If you add
-a marker, add the regex next to its sibling and update the dispatch logic
-in one PR — never let an emitter ship without a parser.
+`NEEDS_INPUT: <question>` is retained as an accepted alias for `AGENT_RESULT:
+INPUT`. The payload is the trailing same-line free text (question / reason),
+threaded into the next agent via the needs-input-question and feedback channels.
+An agent declares its emittable set in the catalog `agent.yaml` (`class:
+worker|gate` + `outcomes:`); `pr-fix` is the canonical worker declaring a wider
+set (`COMPLETED`/`SKIPPED`/`FAILED`/`INPUT`).
+
+Parser (`_AGENT_RESULT_RE`, `_extract_needs_input`, `_strip_agent_result_prefix`)
+lives at module scope in `lotsa/orchestrator.py`.
+The vocabulary constant `AGENT_OUTCOMES` lives in `lotsa/agents.py`. If you add
+a routing rule, express it as an `AGENT_RESULT:`-pattern edge in `process.yaml`
+and update the dispatch logic in one PR — never let an emitter ship without a
+parser.
 
 ### Conversational rules vs. structured markers
 
@@ -289,7 +301,7 @@ a single state.
 |---------|-------|----------|
 | `chat`  | **Think** — interactive, never writes code | one conversational REPL step; can distill a spec on request; ends by handoff or abandon |
 | `build` | **Execute (full depth)** | `plan → testing → coding → reviewing → verifying → summarizing → push → wait_for_pr_signal` |
-| `fix`   | **Execute (shallow depth)** | `coding → reviewing → push → wait_for_pr_signal` |
+| `fix`   | **Execute (shallow depth)** | `coding → reviewing → summarizing → push → wait_for_pr_signal` |
 
 `build` and `fix` both include `pr_fix` as a sub-flow that handles inbound PR
 feedback, and both end in a push + `pr_monitor` watch (ADR-030). `build`'s
@@ -310,30 +322,58 @@ not regenerate.
 
 ### Output rules
 
-Each step can declare `OutputRule`s for automatic routing:
+Each step can declare routing. The concise, preferred form is `routes:`
+(ADR-044 Phase 4) — a `{OUTCOME: target}` map over the closed `AGENT_RESULT:`
+vocabulary that desugars into `OutputRule`s at process-build time:
+
+```yaml
+- name: review
+  prompt: review
+  routes: { PASSED: next, FAILED: code }   # → ^AGENT_RESULT: PASSED / FAILED
+```
+
+`routes:` is the whole "routing lives on the edge" thesis in syntax: each key
+is an outcome, each value a target. It desugars to
+`OutputRule(source="stdout", pattern="^AGENT_RESULT: <OUTCOME>", target=...)`,
+so the drainer / state-machine / validators are untouched. Keys must be in
+`AGENT_OUTCOMES` (`lotsa/agents.py`); an unknown key fails the build.
+
+The verbose `rules:` form remains the escape hatch for the file-artifact
+`source:` and raw-regex patterns:
 
 ```yaml
 - name: test
   prompt: testing
-  resume: true
   rules:
     - source: stdout
       pattern: "FAILED"
       target: code
-    - source: stdout
+    - source: .lotsa/test.md
       pattern: "passed"
       target: next
 ```
 
-Rules are evaluated in order, first-match wins. `target` can be `next`
-(default success), `blocked`, or a sibling job name.
+A step declares **`routes:` OR `rules:`, not both** (build-time error). Rules
+are evaluated in order, first-match wins. `target` can be `next` (default
+success), `blocked`, `needs_input`, or a sibling job name.
+
+**Derived `FAILED → blocked` default (gate steps).** When a *gate* agent
+(`class: gate`) step already routes at least one outcome but omits `FAILED`,
+the build folds in `FAILED → blocked` — the ADR-044 default-route table's
+safety net against a gate silently auto-advancing past a failed verdict. It is
+scoped to *non-evaluate, already-routing* gates: an `evaluate` gate (human-
+approval) and a gate with no rules at all are left untouched (deriving there
+would flip auto-advance to block via the drainer's "no recognized marker →
+block" guard). Purely additive today — every bundled gate routes `FAILED`
+explicitly.
 
 ### Per-flow rule overrides
 
 When the same job appears in two flows with different routing (e.g.
-`review` in `main` vs. `pr_fix`), the `FlowStep` carries per-flow rule
-overrides that take precedence over the job's defaults. Implemented as
-lookup-then-fallback at evaluation time — not a YAML merge at load time.
+`review` in `main` vs. `pr_fix`), the `FlowStep` carries per-flow routing
+overrides (`routes:` or `rules:`) that take precedence over the job's defaults.
+Implemented as lookup-then-fallback at evaluation time — not a YAML merge at
+load time. A binding override fully replaces the job's rules (it does not merge).
 
 ---
 
@@ -349,7 +389,10 @@ PR title/body are **not** synthesized here. `execute_push` takes a ready
 `build_pr_text`: parse the `pr_description` artifact (the `pr_summary` agent's
 Conventional Commits summary) when present, else a deterministic diff/commit-driven
 fallback (`parse_pr_description` → `_build_fallback_title`/`_build_fallback_body`),
-then append the `_Generated by Lotsa · task <id> · flow <name>_` trailer. The
+then append the `_Generated by Lotsa · task <id> · process <build|fix> · flow <name>_`
+trailer (`process_name` threads through `push_pr` → `build_pr_text` →
+`append_lotsa_trailer`; `flow_name` alone is always `main`/`pr_fix` and can't
+tell the processes apart). The
 fallback is diff/commit-driven (not the spec's first line) and guards the
 historical `feat: ---` bug. Generation happens only at PR creation
 (`pr_number is None`); a re-push passes `title=None`/`body=None`.
@@ -377,9 +420,9 @@ public — do not regress to duck-typed `getattr` lookups.
 ### What counts as "FEEDBACK"
 
 Bot comments are included by default. The `pr_fix` agent triages — it can
-emit `PR_FIX_SKIPPED:` to decline non-actionable bot chatter without
-producing a push. Operators opt **out** of bot comments via `lotsa.yaml`
-only if they want the old narrow behaviour.
+emit `AGENT_RESULT: SKIPPED` (ADR-044) to decline non-actionable bot chatter
+without producing a push. Operators opt **out** of bot comments via
+`lotsa.yaml` only if they want the old narrow behaviour.
 
 ### APPROVED is not COMPLETE
 
@@ -411,7 +454,11 @@ parked status.
 `lotsa/server/` is a FastAPI app that exposes the dashboard:
 
 - **API:** `/api/tasks`, `/api/tasks/{id}/messages`, `/api/tasks/{id}/events`
-  (SSE), plus action endpoints (approve, retry, revise, etc.).
+  (SSE), plus action endpoints (approve, retry, revise, etc.). ADR-044 Phase 6
+  adds the read-only workflow-viewer reads `/api/workflows/{name}/graph` and
+  `/api/workflows/{name}/agents/{prompt_name}` (both `?project=`-scoped); the
+  frontend viewer lives under `frontend/src/components/workflows/` and uses React
+  Flow + Dagre (two frontend deps added in that PR).
 - **Static frontend:** `lotsa/server/static/dist/` holds the built React
   app — **gitignored build artifact**, not committed. Run `npm run build`
   in `lotsa/frontend/` before `lotsa serve` (see *Dev workflow* below).
@@ -572,9 +619,12 @@ Common `lotsa serve` flags:
 
 Tasks get an isolated git worktree at
 `{data_dir}/worktrees/{project_id}/{task_id}/` (namespaced per project since
-ADR-029). Created lazily on first dispatch by `WorktreeManager`
-(`rigg.git.WorktreeManager`). The orchestrator switches into it for
-agent dispatch, push, and rebase operations.
+ADR-029). Created lazily by `WorktreeManager` (`rigg.git.WorktreeManager`) via
+the `worktree` **prehook** the orchestrator runs before dispatching a step
+(ADR-044 Phase 3) — every step derives it EXCEPT an agent declaring
+`needs_worktree: false` (only `chat`), which runs in the project work_dir
+instead. The orchestrator switches into the worktree for agent dispatch, push,
+and rebase operations.
 
 ### Restart is resumptive, not destructive (ADR-040)
 
@@ -790,8 +840,8 @@ operator had already framed.
 If the full scope is genuinely unworkable in one session, the right
 move is to surface that via `NEEDS_INPUT` (planner) or report a
 scope gap (coder), not to ship a quietly narrowed result. See
-`lotsa/prompts/build/planning-system.md` Step 1-2 and
-`lotsa/prompts/build/coding-system.md` Step 4.5 for the prompt-level
+`lotsa/prompts/agents/planning/system.md` Step 1-2 and
+`lotsa/prompts/agents/coding/system.md` Step 4.5 for the prompt-level
 rules.
 
 ---
@@ -872,3 +922,98 @@ rules.
   names route to `blocked` on restart (clean break). Supersedes ADR-014's
   catalog; amends ADR-027 (handoff framing), ADR-030 (mark-complete terminal),
   ADR-034 (chat is the entry mode).
+- ADR-044 — Workflows for agents (**Implemented — Phases 1, 2, 3, partial 4 & 5**). Generic
+  `AGENT_RESULT:` outcome vocabulary (`COMPLETED`/`PASSED`/`FAILED`/`SKIPPED`/
+  `INPUT`, with `NEEDS_INPUT:` a retained alias) replaces every bespoke marker;
+  routing lives on the flow edge (rules matched against the active step), not the
+  marker name. Prompts are hoisted into a shared, process-independent agent
+  catalog (`lotsa/prompts/agents/<name>/` with `agent.yaml` + `system.md` +
+  `user.md`); `build`/`fix`/`chat` reference agents by name and the old
+  `fix→build` prompt fallback is gone (`fix` keeps its own `fix_coding` agent).
+  `lotsa/agents.py` loads + validates the catalog (`class: worker|gate`,
+  `outcomes:`, reserved `needs_worktree`/`produces_changes` slots);
+  `AgentPromptRegistry` (`lotsa/flows.py`) resolves prompts from the catalog with
+  the operator `--prompts-dir` override still highest priority. **Phase 2** wires
+  the `produces_changes` property: `_resolve_jobs` (`lotsa/flows.py`) derives the
+  built-in `commit` posthook onto a `type: agent` step at process-build time when
+  the agent (resolved for `job.prompt` via `AgentPromptRegistry.load_agent_optional`,
+  operator-override-first → bundled-catalog) declares `produces_changes: true` —
+  so `agent.yaml` is the single source of truth and the bundled `build`/`fix`
+  workflows no longer hand-declare `posthooks: [commit]`. The per-binding
+  `posthooks:` override seam is preserved exactly (a binding value, including
+  `[]`, fully replaces the derived base). `_validate_posthook_property_consistency`
+  fails the build loudly if a step explicitly lists `commit` on a
+  `produces_changes: false` agent (drift). `verify` (a gate) no longer commits —
+  it observes and routes `FAILED → code`, which commits. **Phase 3** wires the
+  `needs_worktree` property: a prehook registry in `lotsa/registry.py` (symmetric
+  with posthooks) + a built-in `worktree` prehook (`lotsa/prehooks/`) that invokes
+  the task's `WorktreeManager` (injected via `TaskContext.worktree_manager`).
+  `_resolve_jobs` (`lotsa/flows.py`) derives the `worktree` prehook onto every
+  dispatched step (`agent` + `action`) EXCEPT the one opt-out — an agent whose
+  `agent.yaml` sets `needs_worktree: false` (only `chat`); monitor steps derive
+  none. This is the *inverse* polarity to Phase 2's opt-in commit derivation
+  (worktree is the pre-existing universal default; deriving it opt-in would strip
+  it from `push_pr`/`resolve_conflicts`/inline steps). The per-binding `prehooks:`
+  override seam (incl. `[]`) is preserved, and `_validate_prehook_property_consistency`
+  rejects an explicit `worktree` on a `needs_worktree: false` agent. The
+  orchestrator's two dispatch sites (`_dispatch_step`, `_redispatch_current_step`)
+  run `_run_step_prehooks(item, step)` instead of an unconditional `.create()`; a
+  prehook failure is **non-fatal** (falls back to the project work_dir, unlike a
+  blocking posthook failure), and `get_activity`'s work_dir resolution is aligned
+  so a worktree-less chat step's Activity tab still populates. **Phase 4**
+  (partial) ships the `routes:` routing sugar (`{OUTCOME: target}` desugared into
+  `^AGENT_RESULT: <OUTCOME>` `OutputRule`s in `flows.py` — job-level and per-flow
+  binding, `routes:`-XOR-`rules:`, unknown-outcome build error; the bundled
+  `build`/`fix` are migrated behaviour-identically) plus the gate-only derived
+  `FAILED → blocked` default, and the `chat` de-special-casing (option ii): a
+  declared `invocable: [start | hand-off]` workflow property replaces the
+  hardcoded `name == "chat"` checks (the chat-agent suggest-catalog and the
+  frontend hand-off picker filter on `hand-off`; `chat` is `invocable: [start]`).
+  The hard "cannot promote into chat" rule is **dropped** (amends ADR-027 §7 —
+  `invocable` gates advertising, not enforcement). Phase 4's promotion-payload
+  formalization is deferred to its own task. **Phase 5** lands git-native
+  `.lotsa/` provenance: a project's repo may ship agents
+  (`<repo>/.lotsa/agents/<name>/`) and workflows
+  (`<repo>/.lotsa/workflows/<name>/process.yaml`), discovered from the **project
+  root** by `lotsa/provenance.py` (project-scoped, build-time — the ADR's
+  "worktree under operation" is narrowed to the project root for v1, deferring
+  branch-sensitivity) with hardened rails (name charset `[a-z0-9_-]{1,64}`,
+  real-dir-only `.lotsa`, `.lotsa`-containment / symlink-escape guard).
+  `AgentPromptRegistry` (`flows.py`) gains a `repo_agents_dir` and is
+  namespace-aware: unqualified names resolve **operator-override → `lotsa:`
+  (bundled) → `repo:` (repo-local)** (repo lowest-trust, shadows neither);
+  `lotsa:`/`repo:` qualifiers bind explicitly. `build_process` takes a
+  `repo_agents_dir`; the orchestrator builds each project's workflows into
+  `self._project_processes` (keyed `project_id → {name → Process}`) after
+  `_sync_projects`, deriving each one's PR-phase plumbing via the extracted
+  `_register_process_plumbing`. Repo workflows are **project-isolated** (a task
+  resolves them via project-aware `_process_name_for`/`_process_for`,
+  `create_task` validation, and `list_processes_summary(project_id=...)`),
+  **fail-soft** (one malformed `process.yaml` is logged + skipped, never aborting
+  `start()`), and **cannot shadow a bundled name** (skipped with a warning).
+  Rails are structural: the operational preamble is always injected, push stays a
+  deterministic orchestrator step, and a repo definition can reference only
+  *bundled* tools/hooks (the existing build validators reject anything else). Repo
+  agent `produces_changes`/`needs_worktree` are honoured — they only opt work
+  *into* orchestrator-owned deterministic hooks; `agents._parse_repo_agent` is
+  the seam for any future operator-owned-property tightening. Deferred:
+  task-scoped/branch-sensitive resolution, build-time review-before-push graph
+  validation, cross-repo sharing (ADR-035). **Phase 6 (viewer)** ships a
+  read-only workflow graph viewer: `flows.serialize_process_graph(process)`
+  serializes a *resolved* `Process` into per-flow nodes (jobs → resolved agent +
+  `class`/`outcomes`/hooks) + edges (per-binding `routes:`/`rules:` targets, an
+  implicit forward edge for the happy path, and materialized `blocked`/
+  `needs_input`/`complete` terminal sinks) — source-agnostic, so bundled/inline/
+  repo workflows all render through one path. `OrchestratorService.workflow_graph`
+  / `agent_detail` resolve the workflow (project repo catalog → bundled) and
+  derive provenance (`source`: `repo` vs `bundled`) from the `_processes` vs
+  `_project_processes` split — never threaded onto `Process`; the same `source`/
+  `project` now rides `list_processes_summary`. `GET /api/workflows/{name}/graph`
+  + `/agents/{prompt_name}` (both `?project=`-scoped) serve the viewer. The
+  frontend adds React Flow (`@xyflow/react`) + Dagre (`@dagrejs/dagre`) — two new
+  MIT/self-hostable deps — a header-launched viewer (workflow list + provenance
+  badge, Dagre-laid-out board of shadcn nodes, node-click agent inspector,
+  main/pr_fix flow selector), read-only (`nodesDraggable`/`nodesConnectable`/
+  `elementsSelectable` off + hidden handles = the editor seam). The **editor**
+  (write affordances, DB-backed workflow storage, agent authoring surface) stays
+  deferred. Amends ADR-043/039/014/027.

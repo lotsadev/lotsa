@@ -195,6 +195,53 @@ class TestServiceGetAgentActivity:
 
         run(_test())
 
+    def test_worktreeless_task_reads_from_project_work_dir(self, app_with_service, run):
+        """ADR-044 Phase 3 — a worktree-less step (chat) runs in the project
+        work_dir, so its session JSONL is keyed there, not under a namespaced
+        worktree path. ``get_agent_activity`` must resolve the read directory the
+        same way dispatch does (``get_path`` → ``_fallback_work_dir``) so the
+        Activity tab reads the right directory instead of a nonexistent worktree.
+
+        RED against the pre-Phase-3 fallback, which hardcoded
+        ``data_dir/worktrees/<project>/<task_id>`` — with no worktree on disk
+        ``get_path`` returns ``None``, so the read would target that nonexistent
+        namespaced path instead of the project root the chat agent actually ran in.
+        """
+        from rigg.models import ActivityResult
+
+        _, service = app_with_service
+
+        async def _test():
+            recorded: dict[str, Path] = {}
+
+            class RecordingRunner:
+                def dispatch_shape_prompt(self) -> str:
+                    return ""
+
+                async def run(self, *a, **k):  # pragma: no cover - unused
+                    raise AssertionError
+
+                async def read_activity(self, session_id, work_dir, since_index, limit):
+                    recorded["work_dir"] = work_dir
+                    return ActivityResult(events=[], supported=True)
+
+            service.runner = RecordingRunner()
+            # A dispatched task with a session but no worktree ever created (the
+            # chat / needs_worktree=false shape).
+            task = await service.db.create_task("Chatty", metadata={"session_id": SESSION_ID})
+            row = await service.db.get_task(task.id)
+
+            result = await service.get_agent_activity(task.id, 0, 100)
+            assert result is not None
+
+            # The read targets the project work_dir (fallback), NOT a namespaced
+            # worktree path that no chat task ever populates.
+            assert recorded["work_dir"] == service._fallback_work_dir(row)
+            namespaced = service.config.data_dir / "worktrees" / row.project_id / task.id
+            assert recorded["work_dir"] != namespaced
+
+        run(_test())
+
 
 class TestDockerRunnerActivity:
     def test_read_activity_supported_reads_persisted_home(self, run, tmp_path):

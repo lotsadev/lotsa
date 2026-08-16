@@ -24,7 +24,7 @@ def test_build_planning_user_injects_draft_spec_artifact():
     """The spec carried from chat only reaches the build agent if the planning
     user template references it via the ``{artifact:NAME}`` injection mechanism
     (orchestrator artifact substitution)."""
-    text = (BUNDLED_PROMPTS / "build" / "planning-user.md").read_text()
+    text = (BUNDLED_PROMPTS / "agents" / "planning" / "user.md").read_text()
     assert "{artifact:draft_spec}" in text
 
 
@@ -34,13 +34,13 @@ def test_build_planning_user_injects_draft_spec_artifact():
 
 
 def _chat_system() -> str:
-    path = BUNDLED_PROMPTS / "chat" / "chat-system.md"
+    path = BUNDLED_PROMPTS / "agents" / "chat" / "system.md"
     return path.read_text()
 
 
 def test_chat_system_file_exists():
     """Fails pre-fix: the bundled chat process prompt does not exist."""
-    assert (BUNDLED_PROMPTS / "chat" / "chat-system.md").is_file()
+    assert (BUNDLED_PROMPTS / "agents" / "chat" / "system.md").is_file()
 
 
 def test_chat_system_renders_available_processes_block():
@@ -75,12 +75,12 @@ def test_chat_system_carries_operational_rules():
 
 
 def test_fix_coding_prompts_exist():
-    assert (BUNDLED_PROMPTS / "fix" / "coding-system.md").is_file()
-    assert (BUNDLED_PROMPTS / "fix" / "coding-user.md").is_file()
+    assert (BUNDLED_PROMPTS / "agents" / "fix_coding" / "system.md").is_file()
+    assert (BUNDLED_PROMPTS / "agents" / "fix_coding" / "user.md").is_file()
 
 
 def test_fix_coder_injects_seeded_instruction():
     """The operator's handed-off ``instruction`` reaches the fix coder via the
     ``{artifact:instruction}`` injection (mirrors draft_spec)."""
-    text = (BUNDLED_PROMPTS / "fix" / "coding-user.md").read_text()
+    text = (BUNDLED_PROMPTS / "agents" / "fix_coding" / "user.md").read_text()
     assert "{artifact:instruction}" in text

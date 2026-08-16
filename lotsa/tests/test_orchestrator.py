@@ -102,9 +102,15 @@ def service(tmp_path, _loop, run):
     """
     data_dir = tmp_path / "tasks"
     data_dir.mkdir()
-    # Single-step flow with evaluate gate — task waits for human approval after agent runs
+    # Single-step flow with evaluate gate — task waits for human approval after agent runs.
+    # The binding ``posthooks: []`` suppresses ADR-044 Phase 2's derived ``commit``
+    # (``coding`` produces changes); these tests exercise approve/revise/retry/
+    # attachment flow, not commit behaviour, and the work_dir is not a git repo.
     flow_yaml = tmp_path / "test_flow.yaml"
-    flow_yaml.write_text("name: test\njobs:\n  - name: coding\n    evaluate: true\n")
+    flow_yaml.write_text(
+        "name: test\njobs:\n  - name: coding\n    evaluate: true\n"
+        "flows:\n  main:\n    steps:\n      - name: coding\n        posthooks: []\n"
+    )
     config = LotsaConfig(
         data_dir=data_dir,
         work_dir=data_dir.parent,
@@ -398,6 +404,82 @@ class TestArtifactCapture:
         row = run(service.db.get_task(task.id))
         assert row.status == "blocked"
 
+    def test_artifact_capture_blocks_on_empty_output(self, service, run):
+        """A successful step that promised an artifact but produced only
+        whitespace must block (→ Retry re-runs the step), not silently save
+        nothing and let a downstream consumer (push_pr) fall back to a
+        raw-prompt PR title.
+
+        Regression: pre-fix the capture block was gated on
+        ``result.stdout.strip()``, so an empty/whitespace result skipped the
+        whole block — no raise, no artifact — and the successful completion
+        advanced the task instead of blocking. Against the pre-fix code the
+        task is NOT blocked (it advances out of the single step), so the
+        ``row.status == "blocked"`` assertion fails.
+        """
+        from lotsa.flows import build_process
+
+        flow_yaml = service.config.work_dir / "empty_artifact_flow.yaml"
+        flow_yaml.write_text("name: empty-test\njobs:\n  - name: coding\n    output: pr_description\n")
+        proc = build_process("custom", process_file=flow_yaml)
+        service.process = proc
+        service._processes[service._active_process_name] = proc
+        service.flow = proc.flows.get("main") or next(iter(proc.flows.values()))
+
+        service.runner = FakeRunner(
+            AgentResult(
+                success=True,
+                stdout="   \n  \n",
+                stderr="",
+                return_code=0,
+                duration_ms=100,
+            )
+        )
+        task = run(service.create_task("Empty artifact test"))
+        run(asyncio.sleep(0.3))
+
+        messages = run(service.db.get_messages(task.id, msg_type="artifact"))
+        assert len(messages) == 0, "an empty artifact must not be persisted"
+        row = run(service.db.get_task(task.id))
+        assert row.status == "blocked"
+
+    def test_artifact_capture_saves_when_failed_step_has_usable_output(self, service, run):
+        """The empty-output guard must remain gated on ``result.success`` — an
+        UNSUCCESSFUL step with usable stdout still persists its artifact and is
+        NOT diverted through the artifact-capture raise.
+
+        Companion invariant to the empty-output guard: the restructure must not
+        start gating artifact capture (or the new empty-raise) on the failure
+        path. (This preserves existing behaviour, so it passes both pre- and
+        post-fix — it guards against a regression in the restructure rather
+        than pinning the new behaviour.)
+        """
+        from lotsa.flows import build_process
+
+        flow_yaml = service.config.work_dir / "failed_artifact_flow.yaml"
+        flow_yaml.write_text("name: failed-test\njobs:\n  - name: coding\n    output: pr_description\n")
+        proc = build_process("custom", process_file=flow_yaml)
+        service.process = proc
+        service._processes[service._active_process_name] = proc
+        service.flow = proc.flows.get("main") or next(iter(proc.flows.values()))
+
+        service.runner = FakeRunner(
+            AgentResult(
+                success=False,
+                stdout="feat(x): a usable summary\n\nThe body has real content.",
+                stderr="boom",
+                return_code=1,
+                duration_ms=100,
+            )
+        )
+        task = run(service.create_task("Failed but usable artifact test"))
+        run(asyncio.sleep(0.3))
+
+        messages = run(service.db.get_messages(task.id, msg_type="artifact"))
+        assert len(messages) >= 1
+        assert messages[-1].metadata.get("artifact_name") == "pr_description"
+        assert "a usable summary" in messages[-1].content
+
 
 class TestArtifactInputValidation:
     def test_missing_input_blocks_task(self, service, run):
@@ -536,7 +618,7 @@ class TestApprove:
             run(service.approve(task.id))
 
     def test_approve_advances_conversational_verify_gate(self, service, run):
-        """Regression: verify is conversational with a forward (^VERIFIED:→next)
+        """Regression: verify is conversational with a forward (^AGENT_RESULT: PASSED→next)
         rule but no output artifact and is not an evaluate gate. The Accept-on-chat
         fix narrowed the gate test to ``output or evaluate``, which dropped verify's
         Accept button and made approve() reject it. A conversational step with a
@@ -553,7 +635,7 @@ class TestApprove:
             active_state="coding",
             success_state="complete",
             conversational=True,
-            rules=[OutputRule(source="stdout", pattern="^VERIFIED:", target="next")],
+            rules=[OutputRule(source="stdout", pattern="^AGENT_RESULT: PASSED", target="next")],
             # no output artifact — gates on the forward rule alone
         )
         service.flow.jobs.append(step)
@@ -1042,7 +1124,7 @@ class TestFeedbackIsActionable:
 
     def test_conflicts_resolved_echo_is_benign(self):
         """A pr-fix dispatched right after resolve_conflicts is fed that agent's
-        stdout (the CONFLICTS_RESOLVED report) as feedback via the rule-route
+        stdout (the AGENT_RESULT: COMPLETED report) as feedback via the rule-route
         carry-forward (feedback=result.stdout). Skipping that echo is benign —
         the conflict is already resolved, nothing new for pr-fix to do — so it
         must not count toward max_consecutive_skipped (internal tasks / 04ee0735).
@@ -1051,9 +1133,28 @@ class TestFeedbackIsActionable:
 
         echo = (
             "Resolved the conflict in `CLAUDE.md` — merged the two adjacent ADR-index rows.\n"
-            "CONFLICTS_RESOLVED: merged ADR index rows"
+            "AGENT_RESULT: COMPLETED: merged ADR index rows"
         )
         assert _feedback_is_actionable(echo) is False
+
+    def test_review_failed_verdict_carried_into_pr_fix_is_actionable(self):
+        """A ``review`` FAILED verdict routed into pr-fix (the ``review.FAILED →
+        pr-fix`` edge in the pr_fix sub-flow) is carried as feedback via the same
+        rule-route carry-forward. Unlike the resolve_conflicts COMPLETED echo,
+        this is genuine, actionable reviewer feedback — a subsequent pr-fix skip
+        must still count toward max_consecutive_skipped.
+
+        RED against the pre-fix code: ``_AGENT_ECHO_RE`` matched the bare
+        ``^AGENT_RESULT:`` prefix, so this FAILED verdict was misclassified as a
+        benign echo and returned False, silently letting the skip dodge the cap.
+        """
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        verdict = (
+            "Found a real correctness bug in the retry path that must be fixed.\n"
+            "AGENT_RESULT: FAILED: retry path double-increments the counter"
+        )
+        assert _feedback_is_actionable(verdict) is True
 
 
 class TestGatherPendingPrFeedback:
@@ -1238,12 +1339,15 @@ class TestWorktreeLifecycle:
 
 
 class TestOutputRuleRouting:
-    """Test that output rules route tasks correctly (e.g. REVIEW_FAIL → code)."""
+    """Test that output rules route tasks correctly (e.g. AGENT_RESULT: FAILED → code)."""
 
     @pytest.fixture()
     def rule_service(self, tmp_path, _loop, run):
-        """Service with a two-step flow: code → review (with REVIEW_FAIL → code rule)."""
+        """Service with a two-step flow: code → review (with AGENT_RESULT: FAILED → code rule)."""
         flow_yaml = tmp_path / "rule_flow.yaml"
+        # ``posthooks: []`` on ``code`` suppresses ADR-044 Phase 2's derived
+        # ``commit`` (``coding`` produces changes); this fixture exercises
+        # output-rule routing, not commit, against a non-git test work_dir.
         flow_yaml.write_text(
             "name: rule-test\njobs:\n"
             "  - name: code\n    prompt: coding\n    resume: true\n"
@@ -1251,8 +1355,11 @@ class TestOutputRuleRouting:
             "  - name: review\n    prompt: review\n"
             "    queue_state: reviewing\n    active_state: reviewing\n"
             "    rules:\n"
-            "      - source: stdout\n        pattern: '^REVIEW_PASS'\n        target: next\n"
-            "      - source: stdout\n        pattern: '^REVIEW_FAIL'\n        target: code\n"
+            "      - source: stdout\n        pattern: '^AGENT_RESULT: PASSED'\n        target: next\n"
+            "      - source: stdout\n        pattern: '^AGENT_RESULT: FAILED'\n        target: code\n"
+            "flows:\n  main:\n    steps:\n"
+            "      - name: code\n        posthooks: []\n"
+            "      - review\n"
         )
         # Create stub prompt files for the custom flow
         prompts_dir = tmp_path / "prompts"
@@ -1280,42 +1387,50 @@ class TestOutputRuleRouting:
         run(db.close())
 
     def test_review_fail_routes_to_code(self, rule_service, run):
-        """REVIEW_FAIL output should re-dispatch the code step."""
+        """AGENT_RESULT: FAILED output should re-dispatch the code step."""
         svc = rule_service
         # Sequence: code runs (plain output), auto-advances to review,
-        # review outputs REVIEW_FAIL → routes back to code (3rd call)
+        # review outputs AGENT_RESULT: FAILED → routes back to code (3rd call)
         outputs = [
             AgentResult(success=True, stdout="Code done", stderr="", return_code=0, duration_ms=100),
             AgentResult(
-                success=True, stdout="Issues found\nREVIEW_FAIL: fix the bug", stderr="", return_code=0, duration_ms=100
+                success=True,
+                stdout="Issues found\nAGENT_RESULT: FAILED: fix the bug",
+                stderr="",
+                return_code=0,
+                duration_ms=100,
             ),
-            AgentResult(success=True, stdout="Code fixed\nREVIEW_PASS", stderr="", return_code=0, duration_ms=100),
+            AgentResult(
+                success=True, stdout="Code fixed\nAGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=100
+            ),
         ]
         runner = SequentialFakeRunner(outputs)
         svc.runner = runner
         run(svc.create_task("Route test"))
         run(asyncio.sleep(1.0))
 
-        # code → review (REVIEW_FAIL) → code → review (REVIEW_PASS) → complete
+        # code → review (AGENT_RESULT: FAILED) → code → review (AGENT_RESULT: PASSED) → complete
         assert len(runner.calls) >= 3
         tasks = run(svc.db.list_tasks())
         assert tasks[0].state == "complete"
 
     def test_review_pass_advances(self, rule_service, run):
-        """REVIEW_PASS output should advance past review to complete."""
+        """AGENT_RESULT: PASSED output should advance past review to complete."""
         svc = rule_service
         # Sequence: code runs (plain output), auto-advances to review,
-        # review outputs REVIEW_PASS → auto-advances to complete
+        # review outputs AGENT_RESULT: PASSED → auto-advances to complete
         outputs = [
             AgentResult(success=True, stdout="Code done", stderr="", return_code=0, duration_ms=100),
-            AgentResult(success=True, stdout="All good\nREVIEW_PASS", stderr="", return_code=0, duration_ms=100),
+            AgentResult(
+                success=True, stdout="All good\nAGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=100
+            ),
         ]
         runner = SequentialFakeRunner(outputs)
         svc.runner = runner
         run(svc.create_task("Pass test"))
         run(asyncio.sleep(0.5))
 
-        # code → review (REVIEW_PASS) → complete
+        # code → review (AGENT_RESULT: PASSED) → complete
         assert len(runner.calls) == 2
         tasks = run(svc.db.list_tasks())
         assert tasks[0].state == "complete"
@@ -1491,7 +1606,7 @@ class TestJumpToStep:
 @pytest.mark.skip(
     reason="ADR-014 Layer A — ``target: previous`` and the ``previous_step`` "
     "metadata it tracked were removed. The autonomous code↔review loop is now "
-    "spelled by name in the main flow's per-binding REVIEW_FAIL → code override."
+    "spelled by name in the main flow's per-binding AGENT_RESULT: FAILED → code override."
 )
 class TestPreviousStepTracking:
     """Test that previous_step is stored in metadata after step completion."""
@@ -1507,8 +1622,8 @@ class TestPreviousStepTracking:
             "  - name: review\n    prompt: review\n"
             "    queue_state: reviewing\n    active_state: reviewing\n"
             "    rules:\n"
-            "      - source: stdout\n        pattern: '^REVIEW_PASS'\n        target: next\n"
-            "      - source: stdout\n        pattern: '^REVIEW_FAIL'\n        target: previous\n"
+            "      - source: stdout\n        pattern: '^AGENT_RESULT: PASSED'\n        target: next\n"
+            "      - source: stdout\n        pattern: '^AGENT_RESULT: FAILED'\n        target: previous\n"
         )
         prompts_dir = tmp_path / "prompts"
         prompts_dir.mkdir()
@@ -1538,18 +1653,20 @@ class TestPreviousStepTracking:
         """After code step completes, previous_step='code' is stored in metadata."""
         svc = two_step_service
         # code runs (plain output), auto-advances to review,
-        # review outputs REVIEW_FAIL → should route back to code via "previous"
+        # review outputs AGENT_RESULT: FAILED → should route back to code via "previous"
         outputs = [
             AgentResult(success=True, stdout="Code done", stderr="", return_code=0, duration_ms=100),
-            AgentResult(success=True, stdout="Issues\nREVIEW_FAIL: fix it", stderr="", return_code=0, duration_ms=100),
-            AgentResult(success=True, stdout="Fixed\nREVIEW_PASS", stderr="", return_code=0, duration_ms=100),
+            AgentResult(
+                success=True, stdout="Issues\nAGENT_RESULT: FAILED: fix it", stderr="", return_code=0, duration_ms=100
+            ),
+            AgentResult(success=True, stdout="Fixed\nAGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=100),
         ]
         runner = SequentialFakeRunner(outputs)
         svc.runner = runner
         run(svc.create_task("Previous step test"))
         run(asyncio.sleep(1.0))
 
-        # Should have gone: code → review (REVIEW_FAIL) → code → review (REVIEW_PASS) → complete
+        # Should have gone: code → review (AGENT_RESULT: FAILED) → code → review (AGENT_RESULT: PASSED) → complete
         assert len(runner.calls) >= 3
         tasks = run(svc.db.list_tasks())
         assert tasks[0].state == "complete"
@@ -1563,7 +1680,9 @@ class TestPreviousStepTracking:
         svc = two_step_service
         outputs = [
             AgentResult(success=True, stdout="Code done", stderr="", return_code=0, duration_ms=100),
-            AgentResult(success=True, stdout="All good\nREVIEW_PASS", stderr="", return_code=0, duration_ms=100),
+            AgentResult(
+                success=True, stdout="All good\nAGENT_RESULT: PASSED", stderr="", return_code=0, duration_ms=100
+            ),
         ]
         runner = SequentialFakeRunner(outputs)
         svc.runner = runner
@@ -2020,17 +2139,17 @@ class TestPrPhaseStates:
         assert called["state"] == "pushing"
 
     # ------------------------------------------------------------------
-    # Phase 1 — R4: PR_FIX_SKIPPED: returns to waiting_for_pr (no push)
+    # Phase 1 — R4: AGENT_RESULT: SKIPPED: returns to waiting_for_pr (no push)
     # ------------------------------------------------------------------
 
     @pytest.fixture()
     def pr_fix_skipped_service(self, tmp_path, _loop, run):
-        """Service whose pr-fix step has the PR_FIX_SKIPPED: rule wired.
+        """Service whose pr-fix step has the AGENT_RESULT: SKIPPED: rule wired.
 
         Mirrors ``pr_fix_service`` but adds the rule under test. The
         existing ``pr_fix_service`` fixture's flow YAML omits rules
         entirely (it predates Phase 1), so reusing it would never match
-        ``PR_FIX_SKIPPED:`` regardless of agent output.
+        ``AGENT_RESULT: SKIPPED:`` regardless of agent output.
         """
         flow_yaml = tmp_path / "pr_fix_skipped_flow.yaml"
         flow_yaml.write_text(
@@ -2041,15 +2160,15 @@ class TestPrPhaseStates:
             "  - name: pr-fix\n"
             "    rules:\n"
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_DONE:"\n'
+            '        pattern: "^AGENT_RESULT: COMPLETED:"\n'
             "        target: coding\n"
             # BLOCKED before SKIPPED — matches production flow.yaml ordering
             # and the prompt's Phase 1 precedence DONE > BLOCKED > SKIPPED.
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_BLOCKED:"\n'
+            '        pattern: "^AGENT_RESULT: FAILED:"\n'
             "        target: blocked\n"
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_SKIPPED:"\n'
+            '        pattern: "^AGENT_RESULT: SKIPPED:"\n'
             "        target: waiting_for_pr\n"
             "pr: {}\n"
         )
@@ -2077,7 +2196,7 @@ class TestPrPhaseStates:
         run(db.close())
 
     def test_pr_fix_skipped_returns_to_waiting_for_pr(self, pr_fix_skipped_service, run):
-        """PR_FIX_SKIPPED: agent output flips the task back to waiting_for_pr.
+        """AGENT_RESULT: SKIPPED: agent output flips the task back to waiting_for_pr.
 
         Behavioural invariants enforced by the drainer's special-case:
         - state and status both land on waiting_for_pr
@@ -2091,11 +2210,11 @@ class TestPrPhaseStates:
         from unittest.mock import AsyncMock, patch
 
         svc = pr_fix_skipped_service
-        # Configure the runner to emit PR_FIX_SKIPPED: from the pr-fix step.
+        # Configure the runner to emit AGENT_RESULT: SKIPPED: from the pr-fix step.
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Triaged feedback.\nPR_FIX_SKIPPED: reviewer approved, no actionable items\n",
+                stdout="Triaged feedback.\nAGENT_RESULT: SKIPPED: reviewer approved, no actionable items\n",
                 stderr="",
                 return_code=0,
                 duration_ms=200,
@@ -2135,7 +2254,7 @@ class TestPrPhaseStates:
         assert updated.current_step is None, f"current_step must be cleared on SKIPPED, got {updated.current_step!r}"
 
     def test_pr_fix_skipped_advances_comments_since(self, pr_fix_skipped_service, run):
-        """PR_FIX_SKIPPED: advances pr_comments_since to this round's cutoff.
+        """AGENT_RESULT: SKIPPED: advances pr_comments_since to this round's cutoff.
 
         Otherwise the monitor's next poll would re-deliver the very feedback
         the agent just declined to act on, producing an immediate redispatch
@@ -2150,7 +2269,7 @@ class TestPrPhaseStates:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Nothing actionable here.\nPR_FIX_SKIPPED: bot chatter only\n",
+                stdout="Nothing actionable here.\nAGENT_RESULT: SKIPPED: bot chatter only\n",
                 stderr="",
                 return_code=0,
                 duration_ms=200,
@@ -2192,7 +2311,7 @@ class TestPrPhaseStates:
         dispatched_at = updated.metadata.get("pr_fix_dispatched_at")
         since = updated.metadata.get("pr_comments_since")
         assert dispatched_at is not None, "_dispatch_pr_fix_locked must record pr_fix_dispatched_at"
-        assert since is not None, "PR_FIX_SKIPPED: must persist pr_comments_since"
+        assert since is not None, "AGENT_RESULT: SKIPPED: must persist pr_comments_since"
         assert since == dispatched_at, (
             f"pr_comments_since must equal pr_fix_dispatched_at ({dispatched_at!r}), got {since!r}"
         )
@@ -2208,7 +2327,7 @@ class TestPrPhaseStates:
 )
 class TestPrFixPhase2:
     """Phase 2: round counter + budget caps, pr_decision audit writes,
-    PR_FIX_NEEDS_DECISION → needs_input escalation.
+    AGENT_RESULT: INPUT → needs_input escalation.
 
     Spec: docs/superpowers/specs/2026-05-12-autonomous-pr-fix-loop-design.md
     Plan: Tasks 5, 6, 7 of the autonomous PR-fix loop.
@@ -2232,16 +2351,16 @@ class TestPrFixPhase2:
             "  - name: pr-fix\n"
             "    rules:\n"
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_DONE:"\n'
+            '        pattern: "^AGENT_RESULT: COMPLETED:"\n'
             "        target: coding\n"
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_NEEDS_DECISION:"\n'
+            '        pattern: "^AGENT_RESULT: INPUT:"\n'
             "        target: needs_input\n"
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_BLOCKED:"\n'
+            '        pattern: "^AGENT_RESULT: FAILED:"\n'
             "        target: blocked\n"
             "      - source: stdout\n"
-            '        pattern: "^PR_FIX_SKIPPED:"\n'
+            '        pattern: "^AGENT_RESULT: SKIPPED:"\n'
             "        target: waiting_for_pr\n"
             "pr:\n"
             "  max_pr_fix_rounds: 0\n"  # caps disabled by default; specific tests override
@@ -2308,7 +2427,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: nothing actionable\n",
+                stdout="AGENT_RESULT: SKIPPED: nothing actionable\n",
                 stderr="",
                 return_code=0,
                 duration_ms=100,
@@ -2350,7 +2469,9 @@ class TestPrFixPhase2:
 
         async def counting_run(*args, **kwargs):
             agent_calls["n"] += 1
-            return AgentResult(success=True, stdout="PR_FIX_DONE: x\n", stderr="", return_code=0, duration_ms=10)
+            return AgentResult(
+                success=True, stdout="AGENT_RESULT: COMPLETED: x\n", stderr="", return_code=0, duration_ms=10
+            )
 
         svc.runner.run = counting_run  # type: ignore[assignment]
 
@@ -2409,7 +2530,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: bot chatter\n",
+                stdout="AGENT_RESULT: SKIPPED: bot chatter\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2435,14 +2556,14 @@ class TestPrFixPhase2:
     # ------------------------------------------------------------------
 
     def test_consecutive_skipped_increments_on_skip(self, pr_fix_phase2_service, run):
-        """Each PR_FIX_SKIPPED outcome bumps ``pr_fix_consecutive_skipped``."""
+        """Each AGENT_RESULT: SKIPPED outcome bumps ``pr_fix_consecutive_skipped``."""
         from unittest.mock import AsyncMock, patch
 
         svc = pr_fix_phase2_service
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: nothing actionable\n",
+                stdout="AGENT_RESULT: SKIPPED: nothing actionable\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2476,7 +2597,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: not actionable\n",
+                stdout="AGENT_RESULT: SKIPPED: not actionable\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2519,7 +2640,7 @@ class TestPrFixPhase2:
         )
 
     def test_done_resets_consecutive_skipped(self, pr_fix_phase2_service, run):
-        """PR_FIX_DONE resets ``pr_fix_consecutive_skipped`` to 0.
+        """AGENT_RESULT: COMPLETED resets ``pr_fix_consecutive_skipped`` to 0.
 
         A successful fix means the agent acted on feedback; the previous
         skip streak is no longer evidence the agent is "dismissing
@@ -2531,7 +2652,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Fixed the issue.\nPR_FIX_DONE: addressed the brittle test\n",
+                stdout="Fixed the issue.\nAGENT_RESULT: COMPLETED: addressed the brittle test\n",
                 stderr="",
                 return_code=0,
                 duration_ms=200,
@@ -2545,12 +2666,11 @@ class TestPrFixPhase2:
             self._drain(run, svc, task.id)
 
         updated = run(svc.db.get_task(task.id))
-        assert updated.metadata.get("pr_fix_consecutive_skipped") == 0, (
-            f"PR_FIX_DONE must reset consecutive_skipped, got {updated.metadata.get('pr_fix_consecutive_skipped')!r}"
-        )
+        got = updated.metadata.get("pr_fix_consecutive_skipped")
+        assert got == 0, f"AGENT_RESULT: COMPLETED must reset consecutive_skipped, got {got!r}"
 
     def test_blocked_does_not_reset_consecutive_skipped(self, pr_fix_phase2_service, run):
-        """PR_FIX_BLOCKED must NOT reset the consecutive-skip counter.
+        """AGENT_RESULT: FAILED must NOT reset the consecutive-skip counter.
 
         Design decision flagged in the Phase 2 plan: a manual unblock
         followed by another skip should still count toward the cap.
@@ -2562,7 +2682,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_BLOCKED: missing credentials\n",
+                stdout="AGENT_RESULT: FAILED: missing credentials\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2590,7 +2710,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: still nothing\n",
+                stdout="AGENT_RESULT: SKIPPED: still nothing\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2614,7 +2734,7 @@ class TestPrFixPhase2:
     # ------------------------------------------------------------------
 
     def test_pr_decision_written_on_done(self, pr_fix_phase2_service, run):
-        """PR_FIX_DONE: produces a pr_decision row with decision=done and a commit_sha.
+        """AGENT_RESULT: COMPLETED: produces a pr_decision row with decision=done and a commit_sha.
 
         ``commit_sha`` is read via ``git rev-parse HEAD`` in the worktree.
         The fixture's ``work_dir`` is a plain temp directory (not a git repo)
@@ -2629,7 +2749,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Applied fixes.\nPR_FIX_DONE: addressed the lint comments\n",
+                stdout="Applied fixes.\nAGENT_RESULT: COMPLETED: addressed the lint comments\n",
                 stderr="",
                 return_code=0,
                 duration_ms=345,
@@ -2644,7 +2764,7 @@ class TestPrFixPhase2:
             self._drain(run, svc, task.id)
 
         decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
-        assert decisions, "PR_FIX_DONE must write a pr_decision row"
+        assert decisions, "AGENT_RESULT: COMPLETED must write a pr_decision row"
         row = decisions[-1]
         assert row.metadata.get("decision") == "done"
         assert row.metadata.get("round") == 1
@@ -2660,14 +2780,14 @@ class TestPrFixPhase2:
         )
 
     def test_pr_decision_written_on_skipped(self, pr_fix_phase2_service, run):
-        """PR_FIX_SKIPPED: produces a pr_decision row with decision=skipped and commit_sha=None."""
+        """AGENT_RESULT: SKIPPED: produces a pr_decision row with decision=skipped and commit_sha=None."""
         from unittest.mock import AsyncMock, patch
 
         svc = pr_fix_phase2_service
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Read the feedback.\nPR_FIX_SKIPPED: reviewer approved\n",
+                stdout="Read the feedback.\nAGENT_RESULT: SKIPPED: reviewer approved\n",
                 stderr="",
                 return_code=0,
                 duration_ms=88,
@@ -2682,7 +2802,7 @@ class TestPrFixPhase2:
             self._drain(run, svc, task.id)
 
         decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
-        assert decisions, "PR_FIX_SKIPPED must write a pr_decision row"
+        assert decisions, "AGENT_RESULT: SKIPPED must write a pr_decision row"
         row = decisions[-1]
         assert row.metadata.get("decision") == "skipped"
         assert row.metadata.get("commit_sha") is None, "SKIPPED produces no commit"
@@ -2690,14 +2810,14 @@ class TestPrFixPhase2:
         assert row.metadata.get("cost_usd") == 0.003
 
     def test_pr_decision_written_on_agent_blocked(self, pr_fix_phase2_service, run):
-        """PR_FIX_BLOCKED: produces a pr_decision row with decision=blocked."""
+        """AGENT_RESULT: FAILED: produces a pr_decision row with decision=blocked."""
         from unittest.mock import AsyncMock, patch
 
         svc = pr_fix_phase2_service
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Cannot proceed.\nPR_FIX_BLOCKED: GITHUB_TOKEN is missing\n",
+                stdout="Cannot proceed.\nAGENT_RESULT: FAILED: GITHUB_TOKEN is missing\n",
                 stderr="",
                 return_code=0,
                 duration_ms=42,
@@ -2711,7 +2831,7 @@ class TestPrFixPhase2:
             self._drain(run, svc, task.id)
 
         decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
-        assert decisions, "PR_FIX_BLOCKED must write a pr_decision row"
+        assert decisions, "AGENT_RESULT: FAILED must write a pr_decision row"
         row = decisions[-1]
         assert row.metadata.get("decision") == "blocked"
         assert row.metadata.get("commit_sha") is None
@@ -2849,7 +2969,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: noise\n",
+                stdout="AGENT_RESULT: SKIPPED: noise\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2882,7 +3002,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: noise\n",
+                stdout="AGENT_RESULT: SKIPPED: noise\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2911,7 +3031,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: noise\n",
+                stdout="AGENT_RESULT: SKIPPED: noise\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -2944,9 +3064,9 @@ class TestPrFixPhase2:
         from unittest.mock import AsyncMock, patch
 
         scenarios = [
-            ("PR_FIX_DONE: addressed the lint comments\n", "done", "addressed the lint comments"),
-            ("PR_FIX_SKIPPED: reviewer approved\n", "skipped", "reviewer approved"),
-            ("PR_FIX_BLOCKED: GITHUB_TOKEN is missing\n", "blocked", "GITHUB_TOKEN is missing"),
+            ("AGENT_RESULT: COMPLETED: addressed the lint comments\n", "done", "addressed the lint comments"),
+            ("AGENT_RESULT: SKIPPED: reviewer approved\n", "skipped", "reviewer approved"),
+            ("AGENT_RESULT: FAILED: GITHUB_TOKEN is missing\n", "blocked", "GITHUB_TOKEN is missing"),
         ]
         for stdout, expected_decision, expected_reasoning in scenarios:
             svc = pr_fix_phase2_service
@@ -2973,11 +3093,11 @@ class TestPrFixPhase2:
             )
 
     # ------------------------------------------------------------------
-    # Task 7 — PR_FIX_NEEDS_DECISION escalation
+    # Task 7 — AGENT_RESULT: INPUT escalation
     # ------------------------------------------------------------------
 
     def test_pr_fix_needs_decision_flips_status_to_needs_input(self, pr_fix_phase2_service, run):
-        """PR_FIX_NEEDS_DECISION: flips status=needs_input, state stays at pr-fixing.
+        """AGENT_RESULT: INPUT: flips status=needs_input, state stays at pr-fixing.
 
         Phase 2 replaces the Phase 1 "alias for blocked" workaround with a
         real escalation: the operator can ``answer()`` the question and
@@ -2989,7 +3109,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="Thinking...\nPR_FIX_NEEDS_DECISION: should I also touch module X?\n",
+                stdout="Thinking...\nAGENT_RESULT: INPUT: should I also touch module X?\n",
                 stderr="",
                 return_code=0,
                 duration_ms=120,
@@ -3031,7 +3151,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_NEEDS_DECISION: rewrite this in Rust per the comment?\n",
+                stdout="AGENT_RESULT: INPUT: rewrite this in Rust per the comment?\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -3058,7 +3178,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_NEEDS_DECISION: should I also touch X?\n",
+                stdout="AGENT_RESULT: INPUT: should I also touch X?\n",
                 stderr="",
                 return_code=0,
                 duration_ms=44,
@@ -3090,7 +3210,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_NEEDS_DECISION:\n",
+                stdout="AGENT_RESULT: INPUT:\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -3121,7 +3241,7 @@ class TestPrFixPhase2:
         # Step 1: drive the task into needs_input via NEEDS_DECISION.
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: should I touch module X?\n",
+            stdout="AGENT_RESULT: INPUT: should I touch module X?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3129,7 +3249,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="Applied per operator decision.\nPR_FIX_DONE: touched module X\n",
+            stdout="Applied per operator decision.\nAGENT_RESULT: COMPLETED: touched module X\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3174,7 +3294,7 @@ class TestPrFixPhase2:
         svc = pr_fix_phase2_service
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: should I touch X?\n",
+            stdout="AGENT_RESULT: INPUT: should I touch X?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3182,7 +3302,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: touched X\n",
+            stdout="AGENT_RESULT: COMPLETED: touched X\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3221,7 +3341,7 @@ class TestPrFixPhase2:
         svc.flow.pr_config.max_pr_fix_rounds = 3
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: a question?\n",
+            stdout="AGENT_RESULT: INPUT: a question?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3230,7 +3350,7 @@ class TestPrFixPhase2:
         # Second result should never run — at-cap answer must short-circuit.
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: should not happen\n",
+            stdout="AGENT_RESULT: COMPLETED: should not happen\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3278,7 +3398,7 @@ class TestPrFixPhase2:
         svc.flow.pr_config.max_pr_fix_rounds = 3
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: a question?\n",
+            stdout="AGENT_RESULT: INPUT: a question?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3287,7 +3407,7 @@ class TestPrFixPhase2:
         # Second result must never run — answer() short-circuits at cap.
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: should not happen\n",
+            stdout="AGENT_RESULT: COMPLETED: should not happen\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3335,7 +3455,7 @@ class TestPrFixPhase2:
 
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: clarify?\n",
+            stdout="AGENT_RESULT: INPUT: clarify?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3343,7 +3463,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: applied\n",
+            stdout="AGENT_RESULT: COMPLETED: applied\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3380,7 +3500,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_NEEDS_DECISION: ambiguous request, how to proceed?\n",
+                stdout="AGENT_RESULT: INPUT: ambiguous request, how to proceed?\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -3481,9 +3601,9 @@ class TestPrFixPhase2:
 
         # ── Non-DONE half — each branch produces commit_sha=None ───────
         non_done_cases = [
-            ("PR_FIX_SKIPPED: bot chatter\n", "skipped"),
-            ("PR_FIX_BLOCKED: missing tool\n", "blocked"),
-            ("PR_FIX_NEEDS_DECISION: clarify?\n", "needs_decision"),
+            ("AGENT_RESULT: SKIPPED: bot chatter\n", "skipped"),
+            ("AGENT_RESULT: FAILED: missing tool\n", "blocked"),
+            ("AGENT_RESULT: INPUT: clarify?\n", "needs_decision"),
         ]
         for stdout, expected_decision in non_done_cases:
             svc.runner = FakeRunner(
@@ -3573,7 +3693,7 @@ class TestPrFixPhase2:
         svc = pr_fix_phase2_service
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: what should I do?\n",
+            stdout="AGENT_RESULT: INPUT: what should I do?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3581,7 +3701,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: applied per operator decision\n",
+            stdout="AGENT_RESULT: COMPLETED: applied per operator decision\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3622,7 +3742,7 @@ class TestPrFixPhase2:
         svc.flow.pr_config.max_pr_fix_rounds = 3
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: clarify?\n",
+            stdout="AGENT_RESULT: INPUT: clarify?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3631,7 +3751,7 @@ class TestPrFixPhase2:
         # Second result must never run — revise at cap must short-circuit.
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: should not happen\n",
+            stdout="AGENT_RESULT: COMPLETED: should not happen\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3833,7 +3953,7 @@ class TestPrFixPhase2:
         svc = pr_fix_phase2_service
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: what should I do?\n",
+            stdout="AGENT_RESULT: INPUT: what should I do?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3841,7 +3961,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: applied per operator chat\n",
+            stdout="AGENT_RESULT: COMPLETED: applied per operator chat\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3883,7 +4003,7 @@ class TestPrFixPhase2:
         svc.flow.pr_config.max_pr_fix_rounds = 3
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: clarify?\n",
+            stdout="AGENT_RESULT: INPUT: clarify?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3892,7 +4012,7 @@ class TestPrFixPhase2:
         # Second result must never run — send_message at cap must short-circuit.
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: should not happen\n",
+            stdout="AGENT_RESULT: COMPLETED: should not happen\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -3957,7 +4077,7 @@ class TestPrFixPhase2:
 
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: clarify?\n",
+            stdout="AGENT_RESULT: INPUT: clarify?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -3965,7 +4085,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: applied\n",
+            stdout="AGENT_RESULT: COMPLETED: applied\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -4013,7 +4133,7 @@ class TestPrFixPhase2:
 
         first_result = AgentResult(
             success=True,
-            stdout="PR_FIX_NEEDS_DECISION: clarify?\n",
+            stdout="AGENT_RESULT: INPUT: clarify?\n",
             stderr="",
             return_code=0,
             duration_ms=10,
@@ -4021,7 +4141,7 @@ class TestPrFixPhase2:
         )
         second_result = AgentResult(
             success=True,
-            stdout="PR_FIX_DONE: applied\n",
+            stdout="AGENT_RESULT: COMPLETED: applied\n",
             stderr="",
             return_code=0,
             duration_ms=20,
@@ -4125,7 +4245,7 @@ class TestPrFixPhase2:
 
         Closes the Medium review finding: even when retry() is on a task
         that isn't at the cap (e.g. retrying after a transient block from
-        agent-emitted ``PR_FIX_BLOCKED:``), the resumed dispatch must
+        agent-emitted ``AGENT_RESULT: FAILED:``), the resumed dispatch must
         increment the round counter so the resulting ``pr_decision`` row
         reports the round that actually ran — not the stale pre-retry value.
         Mirrors the post-CAS counter bump in ``answer()``/``revise()``/
@@ -4241,7 +4361,7 @@ class TestPrFixPhase2:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="PR_FIX_SKIPPED: nothing actionable\n",
+                stdout="AGENT_RESULT: SKIPPED: nothing actionable\n",
                 stderr="",
                 return_code=0,
                 duration_ms=10,
@@ -4421,7 +4541,7 @@ class TestConversationalAutoAdvanceDuringPrFix:
             "  - name: verifylike\n    prompt: verify\n    conversational: true\n"
             "    queue_state: backlog\n    active_state: verifylike\n"
             "    rules:\n"
-            '      - source: stdout\n        pattern: "^VERIFIED:"\n        target: next\n'
+            '      - source: stdout\n        pattern: "^AGENT_RESULT: PASSED"\n        target: next\n'
             "  - name: nextstep\n    prompt: code\n"
             "    queue_state: nextstep_q\n    active_state: nextstep\n"
         )
@@ -4447,7 +4567,7 @@ class TestConversationalAutoAdvanceDuringPrFix:
         svc.runner = FakeRunner(
             AgentResult(
                 success=True,
-                stdout="VERIFIED: tests pass, lint clean",
+                stdout="AGENT_RESULT: PASSED tests pass, lint clean",
                 stderr="",
                 return_code=0,
                 duration_ms=500,
@@ -4798,14 +4918,16 @@ class TestPromote:
         assert after.state == before.state
         assert after.status == before.status
 
-    def test_unknown_destination_error_omits_chat_from_available(self, service, run):
-        """The "unknown process" suggestion list must not include ``chat``:
-        even though ``chat`` is loaded, the no-demotion guard rejects it, so
-        listing it here would invite a second confusing rejection.
+    def test_unknown_destination_error_lists_chat_as_available(self, service, run):
+        """ADR-044 Phase 4 — the hard "can't promote into chat" rule is gone, so
+        ``chat`` is now a listable destination in the unknown-process suggestion
+        list like any other loaded process (advertising is property-driven, not
+        name-blocked).
 
-        Regression: pre-fix the list was ``sorted(self._processes.keys())``,
-        which includes ``chat`` whenever it is loaded — this assertion fails
-        against that code with ``'chat' in "... Available: ['chat', 'full']"``.
+        Regression: pre-Phase-4 the list was
+        ``sorted(p for p in self._processes if p != "chat")``, which filtered
+        ``chat`` out — this assertion fails against that code because ``chat``
+        is absent from the ``Available: [...]`` list.
         """
         from lotsa.orchestrator import PromoteNotAllowed
 
@@ -4818,34 +4940,34 @@ class TestPromote:
             run(service.promote_task(task.id, "no_such_process"))
 
         msg = str(excinfo.value)
-        assert "chat" not in msg, f"chat must not be offered as a promotion destination: {msg!r}"
+        assert "chat" in msg, f"chat is a loaded process and must be listed as available: {msg!r}"
         # A genuinely valid destination is still surfaced.
         assert "build" in msg
 
-    def test_promote_to_chat_rejected_and_unmutated(self, service, run):
-        """ADR-027 §7 — no demotion. Even with ``chat`` loaded as a valid
-        process, promoting *into* it is refused server-side (the dashboard
-        filters it from the picker, but the CLI / raw API must enforce it too).
+    def test_promote_into_chat_no_longer_hard_blocked(self, service, run):
+        """ADR-044 Phase 4 amends ADR-027 §7 — the hard "cannot promote into
+        chat" rule is dropped (an operator may have a reason). With ``chat``
+        loaded, promoting *into* it now succeeds and lands the process switch;
+        ``invocable`` only gates *advertising* (the picker / suggest-catalog),
+        not enforcement.
 
-        Regression: pre-fix there was no destination guard, so with ``chat``
-        in the catalog this promotion would *succeed* and mutate the row to
-        ``process_name='chat'`` — the test would fail to raise.
+        Regression: pre-Phase-4 ``promote_task`` raised ``PromoteNotAllowed``
+        at the hard chat guard, so this call raises against the pre-fix tree
+        rather than switching the process.
         """
-        from lotsa.orchestrator import PromoteNotAllowed
-
         _load_chat_destination(service)
         task = run(service.create_task("Explore an idea"))
         _wait_until_waiting(service, run, task.id)
-        before = run(service.db.get_task(task.id))
 
-        with pytest.raises(PromoteNotAllowed):
-            run(service.promote_task(task.id, "chat"))
+        # Must NOT raise — the hard block is gone.
+        run(service.promote_task(task.id, "chat"))
+        run(asyncio.sleep(0.1))
 
         after = run(service.db.get_task(task.id))
-        assert after.metadata.get("process_name") == before.metadata.get("process_name")
-        assert after.metadata.get("process_name") != "chat"
-        assert after.state == before.state
-        assert after.status == before.status
+        assert after is not None
+        assert after.metadata.get("process_name") == "chat", (
+            "promoting into chat must now land the process switch (ADR-044 Phase 4)"
+        )
 
     def test_terminal_source_rejected_and_unmutated(self, service, run):
         from lotsa.orchestrator import PromoteNotAllowed
@@ -4958,20 +5080,56 @@ class TestAvailableProcessesRendering:
         # of its own.
         assert "- build:" not in rendered
 
-    def test_excludes_the_chat_process_itself(self, service, run, tmp_path):
-        from lotsa.flows import build_process_from_inline
+    def test_excludes_the_chat_process_itself(self, service, run):
+        """ADR-044 Phase 4 — chat still isn't offered as a hand-off target, but
+        the exclusion is now driven by the declared ``invocable`` property
+        (``chat`` is ``invocable: [start]``, no ``hand-off``), not the literal
+        name ``"chat"``. Build the real bundled chat process so the property
+        path is exercised."""
+        from lotsa.flows import build_process
 
-        chat = build_process_from_inline(
-            "chat",
-            {"steps": [{"name": "chat", "conversational": True}]},
-            base_dir=tmp_path,
-        )
-        chat.description = "Exploration and triage."
+        chat = build_process("chat")
         service._processes["chat"] = chat
 
         rendered = service._render_available_processes()
         # The chat agent should not be offered the option of promoting to chat.
-        assert "Exploration and triage" not in rendered
+        assert chat.description is None or chat.description.strip() not in rendered
+        assert "- chat:" not in rendered
+
+    def test_excludes_non_handoff_process_by_property(self, service, run, tmp_path):
+        """ADR-044 Phase 4 (option ii) — a workflow that is not ``hand-off``
+        invocable is excluded from the suggest-catalog *regardless of its name*.
+
+        This discriminates the property-driven rule from the old name-based one:
+        a process named ``explore`` (not ``chat``) with a description but
+        ``invocable: [start]`` is EXCLUDED under the new rule. Pre-Phase-4 the
+        filter was ``if name == "chat"``, so ``explore`` — with a name != "chat"
+        and a description — is *included*, and this assertion fails against the
+        pre-fix tree.
+        """
+        from lotsa.flows import build_process_from_inline
+
+        explore = build_process_from_inline(
+            "explore",
+            {"invocable": ["start"], "steps": [{"name": "explore", "conversational": True}]},
+            base_dir=tmp_path,
+        )
+        explore.description = "A non-hand-off exploration workflow."
+        service._processes["explore"] = explore
+
+        rendered = service._render_available_processes()
+        assert "A non-hand-off exploration workflow." not in rendered
+        assert "- explore:" not in rendered
+
+    def test_includes_handoff_process_with_description(self, service, run):
+        """Positive control: a ``hand-off``-invocable process with a description
+        IS surfaced to the chat agent's triage block."""
+        full = _load_build_destination(service)
+        full.description = "Full SDLC: plan, test, code, review, verify, push."
+
+        rendered = service._render_available_processes()
+        assert "- build:" in rendered
+        assert "Full SDLC" in rendered
 
 
 class TestListProcessesSummaryPromotionFields:
@@ -4998,6 +5156,32 @@ class TestListProcessesSummaryPromotionFields:
         assert full_summary["promotion_inputs"] == [
             {"name": "draft_spec", "description": "A spec to verify rather than re-elicit."}
         ]
+
+
+class TestListProcessesSummaryInvocable:
+    """ADR-044 Phase 4 — ``list_processes_summary`` carries the ``invocable``
+    property so the new-task picker and the hand-off dialog can filter on it
+    instead of hardcoding the name ``"chat"``.
+
+    Fails pre-Phase-4: the summary dict has no ``invocable`` key (``KeyError``).
+    """
+
+    def test_summary_includes_invocable(self, service, run):
+        _load_build_destination(service)
+        _load_chat_destination(service)
+
+        summaries = service.list_processes_summary()
+        by_name = {s["name"]: s for s in summaries}
+
+        # Every entry carries the property as a list of options.
+        for s in summaries:
+            assert isinstance(s["invocable"], list)
+            assert all(isinstance(opt, str) for opt in s["invocable"])
+
+        # chat advertises only for start; build advertises as a hand-off target.
+        assert "hand-off" not in by_name["chat"]["invocable"]
+        assert "start" in by_name["chat"]["invocable"]
+        assert "hand-off" in by_name["build"]["invocable"]
 
 
 # ---------------------------------------------------------------------------
@@ -5888,21 +6072,26 @@ class TestBenignSkipDrainerIntegration:
     def test_benign_skip_empty_feedback_does_not_increment_or_block(self, full_service, tmp_path, run, monkeypatch):
         svc = full_service
         task = self._arm(
-            svc, tmp_path, run, monkeypatch, pr_number=88, skipped_stdout="PR_FIX_SKIPPED: review still in progress\n"
+            svc,
+            tmp_path,
+            run,
+            monkeypatch,
+            pr_number=88,
+            skipped_stdout="AGENT_RESULT: SKIPPED: review still in progress\n",
         )
         # Empty feedback (e.g. an empty retry / in-progress review) → benign.
         run(svc.dispatch_pr_fix(task.id, ""))
         run(asyncio.sleep(0.6))
         row = run(svc.db.get_task(task.id))
         assert row.metadata.get("pr_fix_consecutive_skipped", 0) == 0, (
-            "a PR_FIX_SKIPPED with no feedback delivered must not increment the cap counter at the drainer"
+            "a AGENT_RESULT: SKIPPED with no feedback delivered must not increment the cap counter at the drainer"
         )
         assert row.status != "blocked", "a benign skip must never trip max_consecutive_skipped"
 
     def test_actionable_skip_with_feedback_increments(self, full_service, tmp_path, run, monkeypatch):
         svc = full_service
         task = self._arm(
-            svc, tmp_path, run, monkeypatch, pr_number=89, skipped_stdout="PR_FIX_SKIPPED: reviewer approved\n"
+            svc, tmp_path, run, monkeypatch, pr_number=89, skipped_stdout="AGENT_RESULT: SKIPPED: reviewer approved\n"
         )
         # Real feedback delivered but the agent skipped → counts (the cap's
         # actual target: skipping despite real feedback).
@@ -5910,7 +6099,7 @@ class TestBenignSkipDrainerIntegration:
         run(asyncio.sleep(0.6))
         row = run(svc.db.get_task(task.id))
         assert row.metadata.get("pr_fix_consecutive_skipped", 0) == 1, (
-            "a PR_FIX_SKIPPED against actionable feedback must increment the cap counter at the drainer"
+            "a AGENT_RESULT: SKIPPED against actionable feedback must increment the cap counter at the drainer"
         )
 
 
@@ -6067,7 +6256,7 @@ class TestPrLifetimeMonitoringDeferredCompletion:
 
         info = InFlightStep(item=item, step=pr_fix_step, feedback=None, step_work_dir=tmp_path)
         info.agent_result = AgentResult(
-            success=True, stdout="PR_FIX_SKIPPED: nothing to address", stderr="", return_code=0, duration_ms=1
+            success=True, stdout="AGENT_RESULT: SKIPPED: nothing to address", stderr="", return_code=0, duration_ms=1
         )
         svc._in_flight[item.id] = info
         svc._completions.put_nowait(info)

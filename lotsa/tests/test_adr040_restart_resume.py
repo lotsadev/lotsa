@@ -392,12 +392,19 @@ def test_resume_count_resets_when_task_advances_past_interrupted_step(tmp_path, 
     from lotsa.config import LotsaConfig
 
     flow_yaml = tmp_path / "reset_flow.yaml"
+    # ``code`` uses ``prompt: coding`` only to exercise a resumable agent step;
+    # the binding ``posthooks: []`` suppresses ADR-044 Phase 2's derived
+    # ``commit`` (which would otherwise fail against the non-git test work_dir
+    # and block the task before it can advance past the interrupted step).
     flow_yaml.write_text(
         "name: reset-test\njobs:\n"
         "  - name: code\n    prompt: coding\n    resume: true\n"
         "    queue_state: backlog\n    active_state: coding\n"
         "  - name: review\n    prompt: review\n"
         "    queue_state: reviewing\n    active_state: reviewing\n"
+        "flows:\n  main:\n    steps:\n"
+        "      - name: code\n        posthooks: []\n"
+        "      - review\n"
     )
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
@@ -474,12 +481,18 @@ def test_resume_count_resets_when_forward_progress_lands_in_a_monitor_state(tmp_
     from lotsa.config import LotsaConfig
 
     flow_yaml = tmp_path / "monitor_reset_flow.yaml"
+    # ``posthooks: []`` on ``code`` suppresses ADR-044 Phase 2's derived
+    # ``commit`` (see the sibling agent→agent test) so the resumed step can
+    # advance into the monitor state instead of blocking on a failed commit.
     flow_yaml.write_text(
         "name: monitor-reset\njobs:\n"
         "  - name: code\n    prompt: coding\n    resume: true\n"
         "    queue_state: backlog\n    active_state: coding\n"
         "  - name: watch\n    type: monitor\n    engine: pr_monitor\n"
         "    config:\n      poll_interval_seconds: 30\n"
+        "flows:\n  main:\n    steps:\n"
+        "      - name: code\n        posthooks: []\n"
+        "      - watch\n"
     )
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()

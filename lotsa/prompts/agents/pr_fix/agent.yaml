@@ -1,0 +1,5 @@
+name: pr_fix
+class: worker
+outcomes: [COMPLETED, SKIPPED, FAILED, INPUT]
+needs_worktree: true
+produces_changes: true
