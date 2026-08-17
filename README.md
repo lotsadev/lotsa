@@ -6,6 +6,8 @@
 
 <p align="center"><strong>Describe a task, walk away, come back to a PR that followed your rules.</strong></p>
 
+<p align="center">Built by <a href="https://andrewcrookston.com/?ref=lotsa">Andrew Crookston</a></p>
+
 <p align="center">
   <img src="docs/assets/dashboard.png" alt="The Lotsa dashboard — tasks running across repos, every step visible" width="820">
 </p>
@@ -681,3 +683,7 @@ Issues and pull requests are welcome. Before submitting, skim [CONSTITUTION.md](
 ## License
 
 [Apache-2.0](LICENSE).
+
+---
+
+Built by [Andrew Crookston](https://andrewcrookston.com/?ref=lotsa).

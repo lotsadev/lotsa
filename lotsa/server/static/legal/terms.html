@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terms of Use — Lotsa</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --link: #0f766e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f0e;
+      --fg: #e7e9e8;
+      --muted: #9aa0a6;
+      --border: #262b2a;
+      --link: #5eead4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.875rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header a {
+    color: var(--fg);
+    text-decoration: none;
+    font-weight: 600;
+  }
+  header nav a {
+    color: var(--muted);
+    font-weight: 400;
+    margin-left: 1rem;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.125rem; margin-top: 2rem; }
+  p, li { font-size: 0.9375rem; }
+  p.subtitle { color: var(--muted); font-size: 0.8125rem; margin-top: 0; }
+  a { color: var(--link); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+  ul, ol { padding-left: 1.25rem; }
+  code { background: var(--border); padding: 0.1em 0.35em; border-radius: 3px; font-size: 0.875em; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← Back to Lotsa</a>
+  <nav><a href="/privacy">Privacy Policy</a></nav>
+</header>
+<main>
+<h1>Terms of Use</h1>
+<p class="subtitle"><strong>Effective date:</strong> 2026-07-13 · <strong>Last updated:</strong> 2026-07-13</p>
+<p>These terms govern your use of Lotsa, open-source software available at
+<a href="https://github.com/lotsadev/lotsa">github.com/lotsadev/lotsa</a> (the
+"Software"). By running or using the Software, you agree to them. If you
+don't agree, don't use it.</p>
+<p>The Software is authored and maintained by Andrew Crookston. It is
+licensed to you under the <a href="LICENSE">Apache License 2.0</a>; these terms are
+additional usage terms about running an AI agent against your own code —
+they don't replace or narrow the license.</p>
+<h2>1. What Lotsa is</h2>
+<p>Lotsa is a local task runner and dashboard that dispatches an AI coding
+agent (Claude Code, or another provider you configure) against git
+repositories you register, following a process you define. It runs
+entirely on your own machine or infrastructure. There is no hosted
+service, no account, and no central server operated by the author.</p>
+<h2>2. Acceptable use</h2>
+<p>Use Lotsa only for lawful purposes, and only against repositories you own
+or have permission to modify. You must not use it to create or distribute
+illegal content, or to attempt to disrupt or gain unauthorized access to
+systems you don't control.</p>
+<h2>3. Your code and content</h2>
+<p>Your code, tasks, and everything Lotsa produces while working on them
+remain entirely yours. Neither the Software nor its author claims any
+rights in your code, collects it, or uses it for any purpose other than
+running the task you gave it, on your own machine.</p>
+<h2>4. Agent access and risk — read this before pointing Lotsa at a repo you care about</h2>
+<p>Running Lotsa means granting an AI coding agent read/write access to the
+repositories you register. Within its worktree, the agent can:</p>
+<ul>
+<li>read, create, edit, and delete files;</li>
+<li>commit changes;</li>
+<li>push branches and open or update pull requests (when GitHub push/PR
+  features are enabled).</li>
+</ul>
+<p>This is the core of what Lotsa does, and it carries real risk. A bug in
+Lotsa, a mistake by the underlying model, a misconfigured process, or
+simple misuse can result in <strong>unwanted file changes, lost or overwritten
+work, unintended commits, or unintended pull requests</strong>. Lotsa's design
+(isolated worktrees, orchestrator-owned git state, PR-based review)
+reduces this risk but cannot eliminate it.</p>
+<p><strong>You are responsible for:</strong></p>
+<ul>
+<li>reviewing agent output and PRs before merging;</li>
+<li>keeping your own backups and using version control as a safety net;</li>
+<li>never pointing Lotsa at a repository, branch, or credential you can't
+  afford to have modified;</li>
+<li>understanding that a task, once dispatched, can commit and push before
+  you've reviewed every line.</li>
+</ul>
+<h2>5. Costs</h2>
+<p>Running Lotsa dispatches calls to whichever LLM provider (and, optionally,
+GitHub API) you've configured. <strong>You are solely responsible for any usage
+costs or charges those services bill you.</strong> Lotsa's <code>--budget</code> setting is
+a soft cap enforced on a best-effort basis by the runner in use — it is
+not a guarantee against unexpected charges, and not every runner shape
+enforces it (see the README's Agent runners section).</p>
+<h2>6. No warranty</h2>
+<p>The Software is provided <strong>"as is"</strong>, without warranty of any kind,
+express or implied, to the fullest extent permitted by law — echoing (and
+not replacing) the warranty disclaimer already in the Apache License 2.0,
+§7. Lotsa does not warrant that it will be error-free, secure, or fit for
+any particular purpose.</p>
+<h2>7. Limitation of liability</h2>
+<p>To the fullest extent the law allows, neither the Software's author nor
+its contributors are liable for any loss or damage arising from your use
+of it — including lost, corrupted, or unintended changes to your code,
+unintended commits or pull requests, or costs incurred from services you
+configured. This is free software; to the extent liability cannot be
+excluded, it is limited to zero. This section supplements, and does not
+narrow, the liability limitation already in the Apache License 2.0, §8.</p>
+<h2>8. Changes</h2>
+<p>These terms may be updated from time to time. The current version always
+lives at <a href="https://github.com/lotsadev/lotsa/blob/main/TERMS.md"><code>TERMS.md</code></a>
+in the repository, with the date above. Continued use after a change means
+you accept it.</p>
+<h2>9. Governing law</h2>
+<p>These terms are governed by the laws of Sweden. Any dispute arising from
+them is subject to the exclusive jurisdiction of the Swedish courts, to
+the extent mandatory consumer-protection law in your own country of
+residence doesn't provide otherwise.</p>
+<h2>10. Contact</h2>
+<p>Questions about these terms: open an issue at
+<a href="https://github.com/lotsadev/lotsa/issues">github.com/lotsadev/lotsa/issues</a>.</p>
+</main>
+</body>
+</html>

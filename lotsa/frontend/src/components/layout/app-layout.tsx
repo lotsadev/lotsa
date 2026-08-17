@@ -29,6 +29,7 @@ import { RightPanel } from '@/components/right-panel/right-panel'
 import { WorkflowsButton } from '@/components/workflows/workflows-button'
 import { readSidebarOpen } from '@/lib/sidebar-state'
 import { ThemeToggle } from './theme-toggle'
+import { InfoMenu } from './info-menu'
 
 interface AppLayoutProps {
   selectedTaskId: string | null
@@ -101,6 +102,7 @@ function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
             )}
           </Button>
           <WorkflowsButton />
+          <InfoMenu />
           <ThemeToggle />
         </div>
       </header>
@@ -211,6 +213,7 @@ function MobileShellInner({
             <PanelRight className="size-4" />
           </Button>
           <WorkflowsButton />
+          <InfoMenu />
           <ThemeToggle />
         </div>
       </header>
