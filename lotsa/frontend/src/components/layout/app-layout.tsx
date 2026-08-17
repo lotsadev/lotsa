@@ -27,6 +27,7 @@ import { EmptyState } from '@/components/empty-state'
 import { ChatPanel } from '@/components/chat/chat-panel'
 import { RightPanel } from '@/components/right-panel/right-panel'
 import { WorkflowsButton } from '@/components/workflows/workflows-button'
+import { readSidebarOpen } from '@/lib/sidebar-state'
 import { ThemeToggle } from './theme-toggle'
 
 interface AppLayoutProps {
@@ -47,16 +48,6 @@ export function AppLayout(props: AppLayoutProps) {
 // collapsed state (0%) — to localStorage. In react-resizable-panels v4 the
 // `useDefaultLayout` hook is the replacement for the old `autoSaveId` prop.
 const DESKTOP_LAYOUT_ID = 'lotsa-desktop-layout'
-
-// shadcn's SidebarProvider writes the open/closed choice to the
-// `sidebar_state` cookie but only *reads* it during SSR. The dashboard is a
-// pure client SPA, so we read the cookie here and seed `defaultOpen` to make
-// the left task-list collapse survive a reload.
-function readSidebarOpenCookie(): boolean {
-  if (typeof document === 'undefined') return true
-  const match = document.cookie.match(/(?:^|;\s*)sidebar_state=(true|false)/)
-  return match ? match[1] === 'true' : true
-}
 
 function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
   // v4 exposes the imperative collapse/expand API via a dedicated `panelRef`
@@ -79,7 +70,7 @@ function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
 
   return (
     <SidebarProvider
-      defaultOpen={readSidebarOpenCookie()}
+      defaultOpen={readSidebarOpen()}
       style={{ '--sidebar-width': '18rem' } as CSSProperties}
       className="h-screen flex-col overflow-hidden min-h-0!"
     >
@@ -88,7 +79,7 @@ function DesktopShell({ selectedTaskId, onSelectTask }: AppLayoutProps) {
       <header className="z-20 flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
         <div className="flex items-center gap-2">
           {/* Left task-list toggle — mirrors the mobile shell (⌘/Ctrl+B for
-              free). Collapse state persists via the `sidebar_state` cookie. */}
+              free). Collapse state persists to localStorage. */}
           <SidebarTrigger />
           <h1 className="text-lg font-bold tracking-tight">Lotsa</h1>
         </div>
