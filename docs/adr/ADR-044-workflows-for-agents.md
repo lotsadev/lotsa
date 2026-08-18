@@ -1,6 +1,6 @@
 # ADR-044 — Workflows for agents
 
-**Status:** Implemented (Phases 1, 2, 3, 5 & 6-viewer; Phase 4 partial) — Phase 6 editor deferred
+**Status:** Implemented (Phases 1–5 & 6-viewer) — Phase 6 editor deferred
 
 **Scope:** CE (with a shared-catalog concept that later reaches `rigg`)
 
@@ -145,8 +145,8 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    prehook failure is non-fatal (falls back to the project work_dir, preserving
    the pre-Phase-3 best-effort behaviour). Activity-tab work_dir resolution is
    aligned so a worktree-less chat step's session log is still read.
-4. **Workflow-model cleanup** (**Partially implemented**) — two of three
-   sub-parts shipped. (a) The routing sugar, renamed `edges:` → **`routes:`**
+4. **Workflow-model cleanup** (**Implemented**) — all three sub-parts shipped.
+   (a) The routing sugar, renamed `edges:` → **`routes:`**
    (the name says what it is — a `{OUTCOME: target}` map): `flows.py` desugars it
    into `^AGENT_RESULT: <OUTCOME>` `OutputRule`s at build time (job-level and
    per-flow binding, `routes:`-XOR-`rules:`, unknown-outcome build error), so the
@@ -159,9 +159,18 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    hand-off picker filter on `hand-off`, and `chat` (`invocable: [start]`) never
    self-refers; the hard "cannot promote into chat" rule is **dropped**
    (`invocable` gates advertising, not enforcement — amends §"Two connection
-   levels"/ADR-027 §7). (c) Formalizing the promotion payload
-   (recommended-workflow + distilled spec) is **deferred** to its own task —
-   today's prose recommendation + hand-off button stay.
+   levels"/ADR-027 §7). (c) The promotion payload's two halves **shipped**: the
+   recommended-workflow rides the `handoff` edge — the chat agent emits
+   `AGENT_RESULT: COMPLETED <workflow>`, which `_extract_handoff_suggestion`
+   captures into a latest-wins `handoff_suggestion` artifact (non-terminating
+   park — never self-promotes; the promote dialog pre-selects it), with valid
+   targets gated off the `invocable` property — and the distilled spec carries
+   to Execute as `draft_spec` via `promotion_inputs` (`build`'s planning step
+   reads it). Promotion *itself* stays operator-driven (the dashboard button,
+   ADR-027) — inter-workflow transitions are operator-gated by design, not
+   agent-computed. The only thing **declined** as an unnecessary nicety is a
+   single *formalized* payload struct bundling {recommended-workflow, spec}
+   into one object; both halves already exist functionally.
 5. **In-repo agents *and* workflows** (**Implemented**) — git-native `.lotsa/`
    discovery + namespaces + rails (one mechanism serves both). A project's repo
    may ship agents under `<repo>/.lotsa/agents/<name>/` and workflows under

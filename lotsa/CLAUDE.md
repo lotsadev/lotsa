@@ -922,7 +922,7 @@ rules.
   names route to `blocked` on restart (clean break). Supersedes ADR-014's
   catalog; amends ADR-027 (handoff framing), ADR-030 (mark-complete terminal),
   ADR-034 (chat is the entry mode).
-- ADR-044 — Workflows for agents (**Implemented — Phases 1, 2, 3, partial 4 & 5**). Generic
+- ADR-044 — Workflows for agents (**Implemented — Phases 1–5 & 6-viewer; Phase 6 editor deferred**). Generic
   `AGENT_RESULT:` outcome vocabulary (`COMPLETED`/`PASSED`/`FAILED`/`SKIPPED`/
   `INPUT`, with `NEEDS_INPUT:` a retained alias) replaces every bespoke marker;
   routing lives on the flow edge (rules matched against the active step), not the
@@ -961,7 +961,7 @@ rules.
   prehook failure is **non-fatal** (falls back to the project work_dir, unlike a
   blocking posthook failure), and `get_activity`'s work_dir resolution is aligned
   so a worktree-less chat step's Activity tab still populates. **Phase 4**
-  (partial) ships the `routes:` routing sugar (`{OUTCOME: target}` desugared into
+  ships the `routes:` routing sugar (`{OUTCOME: target}` desugared into
   `^AGENT_RESULT: <OUTCOME>` `OutputRule`s in `flows.py` — job-level and per-flow
   binding, `routes:`-XOR-`rules:`, unknown-outcome build error; the bundled
   `build`/`fix` are migrated behaviour-identically) plus the gate-only derived
@@ -970,8 +970,16 @@ rules.
   hardcoded `name == "chat"` checks (the chat-agent suggest-catalog and the
   frontend hand-off picker filter on `hand-off`; `chat` is `invocable: [start]`).
   The hard "cannot promote into chat" rule is **dropped** (amends ADR-027 §7 —
-  `invocable` gates advertising, not enforcement). Phase 4's promotion-payload
-  formalization is deferred to its own task. **Phase 5** lands git-native
+  `invocable` gates advertising, not enforcement). Phase 4c's promotion payload
+  shipped too: the chat agent emits `AGENT_RESULT: COMPLETED <workflow>` on the
+  `handoff` edge, `_extract_handoff_suggestion` captures it into a latest-wins
+  `handoff_suggestion` artifact (non-terminating park — never self-promotes; the
+  promote dialog pre-selects it, valid targets gated off `invocable`), and the
+  distilled spec carries to Execute as `draft_spec` via `promotion_inputs`
+  (`build`'s planning step reads it). Promotion itself stays operator-driven
+  (the dashboard button, ADR-027); only a single *formalized* payload struct
+  bundling {recommended-workflow, spec} was declined as unnecessary. **Phase 5**
+  lands git-native
   `.lotsa/` provenance: a project's repo may ship agents
   (`<repo>/.lotsa/agents/<name>/`) and workflows
   (`<repo>/.lotsa/workflows/<name>/process.yaml`), discovered from the **project
