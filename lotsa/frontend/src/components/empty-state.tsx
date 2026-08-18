@@ -156,6 +156,40 @@ export function EmptyState({ onTaskCreated }: EmptyStateProps) {
           </Button>
         </div>
       </form>
+
+      <p className="text-xs text-muted-foreground">
+        By using Lotsa, you agree to the{' '}
+        <a
+          href="/terms"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          Terms of Use
+        </a>{' '}
+        and{' '}
+        <a
+          href="/privacy"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          Privacy Policy
+        </a>
+        .
+      </p>
+
+      <p className="text-xs text-muted-foreground">
+        Built by{' '}
+        <a
+          href="https://andrewcrookston.com/?ref=lotsa"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          Andrew Crookston
+        </a>
+      </p>
     </div>
   )
 }
