@@ -296,6 +296,11 @@ def aggregate_feedback(
     # ── Review Comments (body text from COMMENTED/APPROVED reviews) ───────
     # Reviewers may submit substantive feedback as a COMMENTED or APPROVED
     # review body.  These do not appear in the comments endpoints.
+    # NOTE: the orchestrator's ``_feedback_is_approval_only`` keys off this exact
+    # header ("### Review Body Comments") and the "(APPROVED)"/"(COMMENTED)"
+    # state markers rendered below to decide whether a repeatedly-skipped pr-fix
+    # dispatch is benign for cap accounting — keep them in sync (see
+    # lotsa/orchestrator.py).
     other_reviews = [
         r
         for r in reviews
