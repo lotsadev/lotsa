@@ -801,6 +801,14 @@ class OrchestratorService:
         self._worktree_managers: dict[str, WorktreeManager] = {
             "default": WorktreeManager(config.work_dir, config.data_dir / "worktrees" / "default")
         }
+        # Detected default branch per project id (``_detect_default_branch``,
+        # populated by ``_sync_projects``). ``_worktree_manager_for`` reads this
+        # when constructing a project's ``WorktreeManager`` so the worktree is
+        # based on ``origin/<real default branch>`` rather than a hardcoded
+        # ``main``. Absent/empty → ``main`` (the pre-detection default and the
+        # pre-``start()`` pre-seed above), so a lookup miss can only preserve the
+        # prior behaviour, never regress it.
+        self._project_default_branches: dict[str, str] = {}
 
         self._completions: asyncio.Queue[InFlightStep] = asyncio.Queue()
         self._in_flight: dict[str, InFlightStep] = {}
@@ -7376,24 +7384,67 @@ class OrchestratorService:
 
     # ── Per-project worktree resolution (ADR-029) ──────────────────────
 
+    async def _detect_default_branch(self, repo: Path) -> str:
+        """Best-effort, local-only read of a repo's default branch (no fetch).
+
+        Reads the local ``origin/HEAD`` symbolic ref — set at clone time —
+        exactly as ``lotsa/diff.py`` does, and strips the ``origin/`` prefix so
+        the bare branch name can feed ``WorktreeManager(default_branch=...)``
+        (which prepends ``origin/`` itself when it fetches/bases). Falls back to
+        ``main`` on any failure: an unset ``origin/HEAD`` (a ``git init`` +
+        ``git remote add`` repo that was never cloned), a non-git path (the
+        lenient ``default`` project seeded from a non-repo ``work_dir``), or git
+        being absent. Never raises — the fallback is the pre-plumbing behaviour,
+        so detection can only improve upstream-sync correctness, never regress
+        it.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "-C",
+                str(repo),
+                "rev-parse",
+                "--abbrev-ref",
+                "origin/HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await proc.communicate()
+        except (OSError, ValueError):
+            return "main"
+        if proc.returncode == 0:
+            ref = stdout.decode().strip()
+            # ``origin/HEAD`` resolves to ``origin/<branch>``; strip the prefix.
+            if ref.startswith("origin/"):
+                branch = ref[len("origin/") :]
+                if branch:
+                    return branch
+        return "main"
+
     def _worktree_manager_for(self, project: ProjectRow) -> WorktreeManager:
         """Return (building + caching on first use) the WorktreeManager for a
         project. Worktrees are namespaced under ``worktrees/<project_id>/``.
 
-        Reconciles the cache against the project's resolved repo path: the
-        ``default`` manager is pre-seeded from ``config.work_dir`` at
-        ``__init__`` time, but an explicit ``projects: default: {path: X}`` (no
-        ``work_dir:``) resolves ``default`` to ``X`` instead. A plain
-        "build-on-first-use" cache would keep returning the stale pre-seed and
-        silently branch tasks off ``work_dir``/CWD rather than ``X`` — the
-        wrong-repo dispatch ADR-029's singleton removal set out to prevent. So
-        when a cached manager's repo no longer matches the project's resolved
-        path, rebuild it.
+        Reconciles the cache against the project's resolved repo path AND its
+        detected default branch: the ``default`` manager is pre-seeded from
+        ``config.work_dir`` at ``__init__`` time (with the hardcoded ``main``
+        default), but an explicit ``projects: default: {path: X}`` (no
+        ``work_dir:``) resolves ``default`` to ``X`` instead, and the project's
+        real default branch (``_project_default_branches``, filled by
+        ``_sync_projects``) may not be ``main``. A plain "build-on-first-use"
+        cache would keep returning the stale pre-seed and silently branch tasks
+        off ``work_dir``/CWD or off ``origin/main`` rather than ``X`` /
+        ``origin/<real branch>`` — the wrong-repo/stale-upstream dispatch. So
+        when a cached manager's repo or default branch no longer matches the
+        project's resolved values, rebuild it.
         """
         repo = Path(project.path).resolve()
+        branch = self._project_default_branches.get(project.id, "main")
         cached = self._worktree_managers.get(project.id)
-        if cached is None or cached.repo != repo:
-            self._worktree_managers[project.id] = WorktreeManager(repo, self.config.data_dir / "worktrees" / project.id)
+        if cached is None or cached.repo != repo or cached.default_branch != branch:
+            self._worktree_managers[project.id] = WorktreeManager(
+                repo, self.config.data_dir / "worktrees" / project.id, default_branch=branch
+            )
         return self._worktree_managers[project.id]
 
     def _project_id_for(self, item_or_row: Item | TaskRow) -> str:
@@ -7532,9 +7583,14 @@ class OrchestratorService:
 
         self._projects = {p.id: p for p in await self.db.list_projects()}
         self._yaml_project_ids = {s.id for s in specs}
-        # Pre-warm the manager cache so the per-project resolution is a drop-in
-        # replacement for the former singleton at every dispatch/test seam.
+        # Detect each project's real default branch, then pre-warm the manager
+        # cache so the per-project resolution is a drop-in replacement for the
+        # former singleton at every dispatch/test seam. Detection runs first so
+        # the warm loop rebuilds each manager with the detected branch (the
+        # pre-seeded ``default`` manager starts on the hardcoded ``main``;
+        # ``_worktree_manager_for`` reconciles the branch mismatch).
         for project in self._projects.values():
+            self._project_default_branches[project.id] = await self._detect_default_branch(Path(project.path))
             self._worktree_manager_for(project)
 
     async def _cleanup_legacy_worktrees(self) -> None:
@@ -7575,6 +7631,9 @@ class OrchestratorService:
         # path and must not stall the event loop (Constitution §2.1).
         await asyncio.to_thread(shutil.rmtree, self.config.data_dir / "worktrees" / project_id, ignore_errors=True)
         self._worktree_managers.pop(project_id, None)
+        # Drop the cached default branch too — the new path may be a different
+        # repo with a different default branch; ``_sync_projects`` re-detects it.
+        self._project_default_branches.pop(project_id, None)
         terminal = ("complete", "abandoned", "archived")
         for row in await self.db.list_tasks():
             if row.project_id != project_id or row.status in terminal:
