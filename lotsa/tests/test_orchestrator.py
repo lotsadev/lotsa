@@ -6842,3 +6842,244 @@ class TestAttachmentMessageLinkage:
         chats = run(service.db.get_messages(task.id, msg_type="chat"))
         mine = [m for m in chats if m.role == "user" and m.content == "Ship the mockup"]
         assert len(mine) == 0, "a caller that lost the release claim must not insert the first message"
+
+
+# ---------------------------------------------------------------------------
+# Kickoff must sync the worktree to origin/<default_branch> before the first
+# agent dispatch.
+#
+# Task title bug: the "sync to origin/<default_branch>" step exists inside
+# ``WorktreeManager.create()`` (rigg/git.py) but the orchestrator constructs
+# every ``WorktreeManager`` WITHOUT plumbing the project's real default branch,
+# so it hardcodes ``default_branch="main"`` (orchestrator.py:802 pre-seed and
+# :7396 per-project). On any repo whose default branch is not ``main``
+# (``master``/``develop``/``trunk``/...), ``_resolve_default_base_ref`` fetches a
+# nonexistent ``origin/main``, logs a warning, and silently falls back to the
+# STALE local ``HEAD`` — so kickoff never actually syncs to upstream.
+#
+# These tests set up a project whose upstream default branch is ``trunk`` (the
+# NON-``main`` case that exposes the bug). The plumbing + end-to-end tests fail
+# against the pre-fix tree; the fallback + mid-task-exclusion tests are
+# characterization guards that pass both pre- and post-fix (see the report).
+# ---------------------------------------------------------------------------
+
+
+def _run_git(*args, cwd=None):
+    """Run a git command, raising on failure. Returns stripped stdout."""
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _make_repo_with_origin(tmp_path: Path, default_branch: str) -> tuple[Path, Path]:
+    """Create an ``origin`` repo whose default branch is *default_branch*, then
+    ``git clone`` it to a local repo.
+
+    Cloning is what sets the clone's ``refs/remotes/origin/HEAD`` symbolic ref
+    to ``origin/<default_branch>`` — the exact local ref a default-branch
+    detector reads (mirrors ``lotsa/diff.py``'s ``origin/HEAD`` probe). Returns
+    ``(origin, local)``; ``local`` is registered as the orchestrator's project.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _run_git("init", str(origin))
+    _run_git("config", "user.email", "origin@test.com", cwd=origin)
+    _run_git("config", "user.name", "Origin", cwd=origin)
+    (origin / "README.md").write_text("# upstream\n")
+    _run_git("add", ".", cwd=origin)
+    _run_git("commit", "-m", "init", cwd=origin)
+    # ``git init``'s default branch is version/config dependent (main vs master);
+    # rename it to the requested branch and move HEAD onto it so the clone's
+    # origin/HEAD (and thus detection) resolves to <default_branch>.
+    _run_git("branch", "-M", default_branch, cwd=origin)
+
+    local = tmp_path / "local"
+    _run_git("clone", str(origin), str(local))
+    # A fresh clone leaves user identity unset; set it so a test that commits
+    # inside the worktree (the ADR-018 mid-task-exclusion guard) has an author.
+    _run_git("config", "user.email", "local@test.com", cwd=local)
+    _run_git("config", "user.name", "Local", cwd=local)
+    return origin, local
+
+
+def _advance_origin(origin: Path, branch: str) -> str:
+    """Add one commit to *origin* on *branch*; return its new HEAD sha.
+
+    ``origin`` is non-bare with *branch* checked out, so a plain commit here
+    advances the upstream tip the local clone will see on its next fetch.
+    """
+    (origin / f"ADVANCE_{branch}.md").write_text("upstream advanced\n")
+    _run_git("add", ".", cwd=origin)
+    _run_git("commit", "-m", f"advance {branch}", cwd=origin)
+    return _run_git("rev-parse", "HEAD", cwd=origin)
+
+
+def _start_kickoff_service(tmp_path: Path, run, repo: Path, flow: str = "build"):
+    """Build + start an ``OrchestratorService`` whose sole ``default`` project is
+    *repo*, wired with a ``FakeRunner``. Returns ``(svc, db)``; the caller owns
+    shutdown (``svc.shutdown()`` then ``db.close()``)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = LotsaConfig(
+        data_dir=data_dir,
+        work_dir=repo,
+        flow=flow,
+        model="sonnet",
+        budget=5.0,
+    )
+    db = TaskDB(data_dir / "lotsa.db")
+    run(db.initialize())
+    svc = OrchestratorService(config, db)
+    svc.runner = FakeRunner()
+    run(svc.start())
+    return svc, db
+
+
+class TestKickoffUpstreamSync:
+    """Task kickoff must run against fresh ``origin/<default_branch>``.
+
+    The live defect is the hardcoded ``default_branch="main"`` (the diagnosis's
+    secondary bug ④, which is the one that actually breaks "sync to
+    origin/<default_branch>"). Under ADR-044 Phase 3 the worktree is created
+    fresh at the first ``needs_worktree`` step — including across a chat→build
+    promotion — so the only thing left broken is that CE never tells the
+    ``WorktreeManager`` the project's real default branch.
+    """
+
+    @pytest.fixture()
+    def trunk_kit(self, tmp_path, _loop, run):
+        """A started service whose ``default`` project's upstream default branch
+        is ``trunk`` (a NON-``main`` default). Yields ``(svc, origin, local)``."""
+        origin, local = _make_repo_with_origin(tmp_path, "trunk")
+        svc, db = _start_kickoff_service(tmp_path, run, local, flow="build")
+        yield svc, origin, local
+        run(svc.shutdown())
+        run(db.close())
+
+    def test_worktree_manager_uses_project_default_branch(self, trunk_kit, run):
+        """The project's real default branch (``trunk``) must be plumbed into its
+        ``WorktreeManager``.
+
+        Fail-first: pre-fix both ``WorktreeManager(...)`` constructions omit
+        ``default_branch=``, so the manager reports the hardcoded ``main``.
+        """
+        svc, _origin, _local = trunk_kit
+        mgr = svc._worktree_manager_for(svc._projects["default"])
+        assert mgr.default_branch == "trunk", (
+            "expected the detected upstream default branch 'trunk' to be plumbed "
+            f"through, got {mgr.default_branch!r} (pre-fix hardcodes 'main')"
+        )
+
+    def test_first_dispatch_worktree_based_on_current_origin(self, trunk_kit, run):
+        """Kickoff (first ``needs_worktree`` step) must base the worktree on the
+        CURRENT ``origin/trunk``, not a stale local snapshot.
+
+        Fail-first: pre-fix the manager fetches a nonexistent ``origin/main``,
+        falls back to the local ``HEAD`` (never advanced), and the worktree sits
+        on the old sha.
+        """
+        svc, origin, _local = trunk_kit
+        # Upstream moves after the project (and its stale local trunk) is set up.
+        new_sha = _advance_origin(origin, "trunk")
+
+        task = run(svc.create_task("do the thing", process_name="build"))
+        run(asyncio.sleep(0.3))
+
+        wt = svc.config.data_dir / "worktrees" / "default" / task.id
+        assert (wt / ".git").exists(), "the first build step must materialize a worktree"
+        head = _run_git("rev-parse", "HEAD", cwd=wt)
+        assert head == new_sha, (
+            "kickoff worktree must be based on the current origin/trunk "
+            f"({new_sha}); got {head} (pre-fix falls back to stale local HEAD)"
+        )
+
+    def test_promotion_from_chat_kicks_off_on_current_origin(self, trunk_kit, run):
+        """The first REAL agent dispatch after a chat→build promotion must run
+        against the current ``origin/trunk`` — not the snapshot from chat time.
+
+        Also asserts chat materializes NO worktree (ADR-044 Phase 3
+        ``needs_worktree: false``), so there is no stale worktree carried across
+        the promotion boundary.
+
+        Fail-first: same stale-``HEAD`` fallback as the direct-dispatch case; the
+        worktree the promotion creates sits on the old sha.
+        """
+        svc, origin, _local = trunk_kit
+
+        task = run(svc.create_task("explore an idea", process_name="chat"))
+        run(asyncio.sleep(0.2))
+
+        wt = svc.config.data_dir / "worktrees" / "default" / task.id
+        assert not wt.exists(), "chat (needs_worktree: false) must not materialize a worktree"
+
+        # Upstream advances during the Think phase.
+        new_sha = _advance_origin(origin, "trunk")
+
+        run(svc.promote_task(task.id, "build"))
+        run(asyncio.sleep(0.3))
+
+        assert (wt / ".git").exists(), "promotion into build must materialize the worktree"
+        head = _run_git("rev-parse", "HEAD", cwd=wt)
+        assert head == new_sha, (
+            "post-promotion kickoff must run against the current origin/trunk "
+            f"({new_sha}); got {head} (pre-fix runs against the chat-time snapshot)"
+        )
+
+    def test_working_to_working_promotion_preserves_worktree(self, trunk_kit, run):
+        """ADR-018 mid-task exclusion: a promotion between two EXECUTION
+        processes (build → fix) must NOT reset/rebuild the worktree.
+
+        Characterization guard (passes pre- and post-fix): it fences off any
+        remove-then-recreate at a promotion boundary that isn't strictly guarded
+        to a chat-origin worktree with no committed work.
+        """
+        svc, _origin, _local = trunk_kit
+
+        task = run(svc.create_task("build it", process_name="build"))
+        run(asyncio.sleep(0.3))
+        wt = svc.config.data_dir / "worktrees" / "default" / task.id
+        assert (wt / ".git").exists()
+
+        # Committed work living in the worktree — the thing a naive reset destroys.
+        (wt / "OPERATOR_WORK.md").write_text("do not discard me\n")
+        _run_git("add", ".", cwd=wt)
+        _run_git("commit", "-m", "operator work", cwd=wt)
+        marked_head = _run_git("rev-parse", "HEAD", cwd=wt)
+
+        run(svc.promote_task(task.id, "fix"))
+        run(asyncio.sleep(0.3))
+
+        assert (wt / "OPERATOR_WORK.md").exists(), "working→working promotion must not discard worktree state"
+        assert _run_git("rev-parse", "HEAD", cwd=wt) == marked_head
+
+    def test_default_branch_falls_back_to_main_without_origin(self, tmp_path, _loop, run):
+        """Detection must degrade to ``main`` (never raise) when ``origin/HEAD``
+        is unresolvable — here a repo with no ``origin`` remote at all.
+
+        Characterization guard (passes pre- and post-fix): locks the graceful
+        degradation contract (req 5) so the fix can't regress the no-remote /
+        non-git ``default``-project case to an error.
+        """
+        repo = tmp_path / "plain"
+        repo.mkdir()
+        _run_git("init", str(repo))
+        _run_git("config", "user.email", "t@test.com", cwd=repo)
+        _run_git("config", "user.name", "T", cwd=repo)
+        (repo / "README.md").write_text("# plain\n")
+        _run_git("add", ".", cwd=repo)
+        _run_git("commit", "-m", "init", cwd=repo)
+
+        svc, db = _start_kickoff_service(tmp_path, run, repo, flow="build")
+        try:
+            mgr = svc._worktree_manager_for(svc._projects["default"])
+            assert mgr.default_branch == "main"
+        finally:
+            run(svc.shutdown())
+            run(db.close())
