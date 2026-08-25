@@ -554,18 +554,22 @@ def test_partially_unwound_stack_is_reconstructable_from_db(tmp_path, run):
     the task's own root flow (no ``pr-fix`` job).
     """
     runner = RecordingRunner(supports_resume=True)
+    # Seed the top frame at ``pr-fix`` (a worker) — the resumed worker advances on
+    # its default COMPLETED, so the reconstruction is observable without the
+    # incidental gate-no-marker block a resumed gate would produce under a stub
+    # runner (that block is a separate mechanism, not what this test pins).
     seeded_stack = [
         {"workflow": "build", "step": "push_pr", "called_from": None},
-        {"workflow": "pr-monitor", "step": "review", "called_from": "push_pr"},
+        {"workflow": "pr-monitor", "step": "pr-fix", "called_from": "push_pr"},
     ]
     with restart_with_seed(
         run,
         tmp_path,
         runner=runner,
         title="mid-unwind",
-        state="reviewing",
+        state="pr-fixing",
         status="working",
-        current_step="review",
+        current_step="pr-fix",
         metadata={"process_name": "build", "call_stack": seeded_stack},
     ) as (svc, db, task):
 

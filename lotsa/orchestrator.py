@@ -36,9 +36,19 @@ from lotsa.db import (
     TaskRow,
 )
 from lotsa.diff import compute_branch_diff
+from lotsa.call_stack import (
+    CALL_STACK_KEY,
+    get_stack,
+    is_legacy_flow_row,
+    make_frame,
+    pop_frame,
+    push_frame,
+    stack_top,
+)
 from lotsa.flows import (
     BUNDLED_PROMPTS,
     PRESET_NAMES,
+    TERMINATE_TARGET,
     FlowConfig,
     FlowStep,
     Job,
@@ -49,8 +59,11 @@ from lotsa.flows import (
     check_conversational_rules,
     evaluate_output_rules,
     find_step,
+    is_call_target,
+    parse_call_target,
     resolve_output_target,
     serialize_process_graph,
+    validate_call_graph,
 )
 from lotsa.pr_monitor import (
     FEEDBACK_HEADER_FAILING_CHECKS,
@@ -1183,6 +1196,12 @@ class OrchestratorService:
         for proc_name, process in self._processes.items():
             self._register_process_plumbing(proc_name, process)
 
+        # ADR-045 — validate the cross-workflow call graph once the full catalog
+        # is loaded (a single ``build_process`` cannot see its siblings): an
+        # unknown ``call <workflow>`` target or a call cycle fails startup, not a
+        # task. Repo workflows join the graph after ``_build_repo_processes``.
+        validate_call_graph(self._processes)
+
         # ADR-029 — seed/sync projects (and run path-change resets + legacy
         # worktree cleanup) BEFORE the restart recovery sweep, so projects exist
         # for per-task worktree resolution and any relocation reset lands first.
@@ -1868,6 +1887,14 @@ class OrchestratorService:
         # ``Item`` dispatch path resolves the task's worktree manager without a
         # DB round-trip (same pattern as ``process_name``).
         metadata = {"process_name": resolved_process_name, "project_id": resolved_project_id}
+        # ADR-045 — seed the root call-stack frame: the task's active workflow is
+        # the top frame, and a fresh task's active workflow is its own process.
+        # ``called_from`` is None (nothing called the root); ``vars`` is absent
+        # (reserved). This replaces the single ``current_flow`` metadata slot.
+        if first_step is not None:
+            metadata[CALL_STACK_KEY] = [
+                make_frame(workflow=resolved_process_name, step=first_step.name, called_from=None)
+            ]
 
         # Conversational first step: store message as chat, dispatch spec step
         if first_step and first_step.conversational:
@@ -2142,7 +2169,12 @@ class OrchestratorService:
         # destination's first step is a fresh agent dispatch, not a resume.
         new_meta = dict(row.metadata or {})
         new_meta["process_name"] = to_process
-        new_meta["current_flow"] = "main"
+        # ADR-045 — promotion re-roots the task in the destination workflow: reset
+        # the call stack to a fresh single-frame root (replacing the old
+        # ``current_flow="main"`` slot). ``current_flow`` is dropped so the row
+        # isn't mistaken for a legacy pre-stack shape.
+        new_meta.pop("current_flow", None)
+        new_meta[CALL_STACK_KEY] = [make_frame(workflow=to_process, step=first.name, called_from=None)]
         new_meta.pop("session_id", None)
 
         # Single CAS. This is a DELIBERATE cross-state-machine jump: the target
@@ -3951,61 +3983,124 @@ class OrchestratorService:
         feedback: str | None = None,
         target_job: str | None = None,
     ) -> bool:
-        """Forward-compatible sub-flow entry point (ADR-014 Layer B prep).
+        """Dispatch into a named workflow — ADR-045 Layer B (completes ADR-014).
 
-        Engines (see ``lotsa.engines.pr_monitor.PrMonitorEngine``) call this
-        instead of the legacy ``dispatch_pr_fix`` so the orchestrator can
-        eventually dispatch into any named sub-flow. Today only ``pr_fix``
-        is wired with a dispatch body; other names that ARE present in the
-        loaded process but lack wiring also warn-and-return rather than
-        silently no-op. Names that don't appear in the process at all are
-        rejected the same way — catches an engine renaming its target flow
-        without the orchestrator's matching update.
+        ``flow_name`` names a top-level **workflow** in the catalog (bundled,
+        inline, or the task's project repo catalog), not a sub-flow of the task's
+        own process. Two shapes:
 
-        Returns ``True`` on a dispatched sub-flow and ``False`` if the
-        underlying dispatch declined (CAS lost, cap fired, or task no
-        longer in a dispatchable state).
+        * **Re-entry** — ``flow_name`` is the task's current active workflow (the
+          top call-stack frame). ``target_job`` names the step to dispatch within
+          it. This is the pr_monitor engine's feedback path: a task parked in
+          ``pr-monitor``'s monitor state re-enters at ``pr-fix`` (an intra-workflow
+          edge, no new frame). Delegates to :meth:`dispatch_pr_fix`.
+        * **Call** — ``flow_name`` is a different workflow. Pushes a frame and
+          transitions the task into the callee's entry (used by the ``push_pr →
+          call pr-monitor`` edge, primarily driven from ``_execute_action_step``).
+
+        Returns ``True`` on a dispatched workflow and ``False`` if the request was
+        unknown or the underlying dispatch declined (CAS lost, cap fired, or the
+        task is no longer in a dispatchable state).
         """
-        # ADR-021: validate the requested sub-flow against the task's OWN
-        # process's flows, not a global active process.
         row = await self.db.get_task(task_id)
-        known_flows = set(self._process_for(row).flows.keys()) if self.process is not None else set()
-        if flow_name not in known_flows:
+        if row is None or self.process is None:
+            return False
+        # Validate against the whole catalog (global + this task's project repo
+        # catalog) — a workflow call crosses processes, so the old "flows of the
+        # task's own process" check no longer applies (ADR-045).
+        known = set(self._processes) | set(self._project_process_catalog(row))
+        if flow_name not in known:
             logger.warning(
-                "dispatch_sub_flow: unknown flow %r for task %s (known flows: %s)",
+                "dispatch_sub_flow: unknown workflow %r for task %s (known: %s)",
                 flow_name,
                 task_id,
-                sorted(known_flows),
+                sorted(known),
             )
             return False
-        # Layer A: only ``pr_fix`` has dispatch wiring. The signature accepts
-        # any ``flow_name`` for forward compatibility with Layer B (which will
-        # dispatch into any named sub-flow); until that lands, every other
-        # name is rejected with a warning rather than silently no-op'd so a
-        # mis-typed engine target surfaces immediately.
-        if flow_name != "pr_fix":
-            logger.warning(
-                "dispatch_sub_flow: flow %r is declared in the process but has no "
-                "dispatch wiring in Layer A (only 'pr_fix' is wired); task %s stays put",
-                flow_name,
-                task_id,
-            )
-            return False
-        # ``target_job`` is accepted for forward compatibility; pr_fix has a
-        # single entry point (pr-fix) so the parameter is currently unused.
-        # Log a debug line when a caller passes it so the silent-discard isn't
-        # invisible — a Layer B engine that starts routing to a named target
-        # job will then see the parameter being ignored and either advocate
-        # for Layer B wiring or stop passing it.
-        if target_job is not None:
-            logger.debug(
-                "dispatch_sub_flow: target_job=%r ignored in Layer A "
-                "(pr_fix has a single entry point); Layer B will route to the named job",
-                target_job,
-            )
+
+        active_workflow = self._active_workflow_name_for(row)
         if feedback is None:
             feedback = ""
-        return await self.dispatch_pr_fix(task_id, feedback)
+
+        # Re-entry into the active workflow at ``target_job``. Phase 1's only
+        # re-entry point is ``pr-fix`` (the engine's feedback path and the
+        # ``call pr-monitor@pr-fix`` re-entry); delegate to the intra-workflow
+        # pr-fix dispatch, which resolves ``pr-fix`` against the active workflow.
+        if flow_name == active_workflow:
+            if target_job in (None, "pr-fix"):
+                return await self.dispatch_pr_fix(task_id, feedback)
+            logger.warning(
+                "dispatch_sub_flow: re-entry target_job=%r is not wired for workflow %r (task %s)",
+                target_job,
+                flow_name,
+                task_id,
+            )
+            return False
+
+        # Cross-workflow call — push a frame and dispatch the callee's entry.
+        return await self._dispatch_call(row, flow_name, target_job=target_job, feedback=feedback)
+
+    async def _dispatch_call(
+        self,
+        row: Any,
+        workflow: str,
+        *,
+        target_job: str | None = None,
+        feedback: str = "",
+    ) -> bool:
+        """Push a call frame and transition the task into ``workflow``'s entry
+        (ADR-045). A workflow call is a DELIBERATE cross-workflow jump (like a
+        promotion): the CAS is not gated on a state-machine edge — the callee's
+        entry state belongs to the callee's SM, not the caller's.
+
+        The callee's entry is ``target_job`` when given (``call <wf>@<step>``),
+        else its first step. A monitor entry parks the task at
+        ``status="waiting_for_pr"`` so the engine picks it up; any other entry is
+        dispatched through the normal step path.
+        """
+        callee = self._processes.get(workflow) or self._project_process_catalog(row).get(workflow)
+        if callee is None:
+            return False
+        callee_flow = callee.flows.get("main") or next(iter(callee.flows.values()))
+        entry = None
+        if target_job is not None:
+            entry = next((rj for rj in callee_flow.jobs if rj.name == target_job), None)
+        if entry is None:
+            entry = callee_flow.jobs[0] if callee_flow.jobs else None
+        if entry is None:
+            return False
+
+        frame = make_frame(workflow=workflow, step=entry.name, called_from=row.current_step)
+        pushed_meta = push_frame(row.metadata, frame)
+        to_status: TaskStatusLiteral = "waiting_for_pr" if entry.type == "monitor" else "working"
+        result = await self.db.atomic_transition(
+            row.id,
+            from_status=row.status,
+            from_state=row.state,
+            to_status=to_status,
+            to_state=entry.queue_state,
+            to_current_step=entry.name,
+            to_metadata=pushed_meta,
+            audit_on_win=AuditRow(
+                role="system",
+                step_name=entry.name,
+                content=f"Calling workflow {workflow!r} (entry {entry.name!r})",
+                msg_type="status_change",
+                metadata={"from_step": row.current_step or row.state, "to_step": entry.name},
+            ),
+        )
+        if not result.won:
+            return False
+        if entry.type == "monitor":
+            # The engine drives the monitor from here (it now resolves against the
+            # active workflow's plumbing — the pushed frame makes ``workflow`` active).
+            return True
+        fresh = await self.db.get_task(row.id)
+        item = Item(id=fresh.id, state=fresh.state, title=fresh.title, body=fresh.body, metadata=fresh.metadata)
+        step = next((s for s in callee_flow.steps if s.name == entry.name), None)
+        if step is not None:
+            await self._dispatch_step(item, step, feedback=feedback or None)
+        return True
 
     async def _sync_branch_to_main(self, task_id: str) -> SyncResult:
         """Sync the task's worktree branch to ``origin/<default_branch>`` (ADR-015).
@@ -4153,7 +4248,9 @@ class OrchestratorService:
         custom processes): delegates to ``_block_after_sync``. Returns
         ``False``.
         """
-        resolve_step = next((s for s in self._process_for(item).jobs if s.name == "resolve_conflicts"), None)
+        # ADR-045 — ``resolve_conflicts`` lives in the active workflow
+        # (``pr-monitor`` once called), not the creation process.
+        resolve_step = next((s for s in self._active_process_for(item).jobs if s.name == "resolve_conflicts"), None)
         if resolve_step is None:
             files = ", ".join(conflicting_files) or "(unknown)"
             return await self._block_after_sync(
@@ -4167,12 +4264,12 @@ class OrchestratorService:
                 ),
             )
         dispatched_at = datetime.now(UTC).isoformat()
+        # ADR-045 — resolve_conflicts is intra-workflow (no sub-flow entry).
         await self._merge_task_metadata(
             item,
             {
                 "pr_fix_dispatched_at": dispatched_at,
                 "pr_fix_round_count": current_rounds + 1,
-                "current_flow": "pr_fix",
             },
         )
         await self.db.add_message(
@@ -4294,11 +4391,11 @@ class OrchestratorService:
         task = await self.db.get_task(task_id)
         if task is None or task.status != "waiting_for_pr":
             return False
-        # ADR-014 Layer A / ADR-021 — pr-fix lives in the ``pr_fix`` sub-flow's
-        # bindings, never in the root flow, so scan the whole job catalog of
-        # the task's OWN process directly. ``Process.jobs`` is a superset of
-        # every flow's bindings.
-        pr_fix_step = next((s for s in self._process_for(task).jobs if s.name == "pr-fix"), None)
+        # ADR-045 — ``pr-fix`` lives in the ``pr-monitor`` workflow's main flow.
+        # Resolve against the task's ACTIVE workflow (the top call-stack frame),
+        # which is ``pr-monitor`` once ``push_pr`` called it — not the creation
+        # process (``build``/``fix``), which no longer carries a pr-fix step.
+        pr_fix_step = next((s for s in self._active_process_for(task).jobs if s.name == "pr-fix"), None)
         if pr_fix_step is None:
             logger.warning("dispatch_pr_fix: no pr-fix step in flow for task %s", task_id)
             return False
@@ -4384,20 +4481,15 @@ class OrchestratorService:
         # concurrent writes (e.g. PrMonitor advancing pr_comments_since on
         # an in-flight write).
         dispatched_at = datetime.now(UTC).isoformat()
-        # Set ``current_flow`` here — the task has just been claimed into
-        # ``pr-fixing`` and every subsequent step lookup must resolve against
-        # the ``pr_fix`` flow's bindings (e.g. so ``review``'s per-flow rule
-        # override ``review FAILED → pr-fix`` is the one the drainer evaluates,
-        # not the root flow's ``review FAILED → code``). Reset is owned by the
-        # sub-flow exit paths: the SKIPPED drainer branch (``pr-fix →
-        # wait_for_pr_signal``) and ``_execute_action_step``'s success path
-        # when the next step is a monitor.
+        # ADR-045 — pr-fix is an INTRA-workflow edge now (the task is already
+        # inside ``pr-monitor``; the monitor state and ``pr-fix`` share one flow),
+        # so there is no sub-flow entry to record. The active workflow stays
+        # ``pr-monitor`` throughout — no ``current_flow`` / stack mutation here.
         await self._merge_task_metadata(
             item,
             {
                 "pr_fix_dispatched_at": dispatched_at,
                 "pr_fix_round_count": current_rounds + 1,
-                "current_flow": "pr_fix",
             },
         )
         # NOTE: the operator's ``user_feedback`` row is persisted earlier (right
@@ -4900,6 +4992,34 @@ class OrchestratorService:
             await self._release_first_step(row)
             return
 
+        # ADR-045 — legacy pre-stack rows. A task persisted with a ``current_flow``
+        # slot and no ``call_stack`` predates the call stack; Phase 1 does not
+        # migrate it onto a synthetic stack (decided). Give it the one defined
+        # answer: route to ``blocked`` with the standard recovery message. Close
+        # in-flight tasks before upgrading (changelog note in ADR-045).
+        if is_legacy_flow_row(row.metadata):
+            result = await self.db.atomic_transition(
+                row.id,
+                from_status=row.status,
+                from_state=row.state,
+                to_status="blocked",
+                to_state=row.state,
+                to_current_step=row.current_step or row.state,
+                audit_on_win=AuditRow(
+                    role="system",
+                    step_name=row.current_step or row.state,
+                    content=(
+                        "This task predates the ADR-045 workflow call stack "
+                        "(legacy `current_flow`) and cannot be resumed — click Retry "
+                        "to restart it, or close it. Close in-flight tasks before upgrading."
+                    ),
+                    msg_type="status_change",
+                ),
+            )
+            if not result.won:
+                return
+            return
+
         resume_count = int((row.metadata or {}).get("resume_count", 0))
         step_label = row.current_step or row.state
 
@@ -5223,49 +5343,36 @@ class OrchestratorService:
             await self.source.append_event(item.id, {"type": "dispatch", "job_type": step.job_type, "success": False})
             return
 
-        # Success: advance to step.success_state. For action jobs that
-        # transition into a monitor state, status flips to ``waiting_for_pr``
-        # so the monitor engine's list query picks the task up. For terminal
-        # success_state (complete), fold the status flip into the same CAS.
-        #
-        # Sub-flow terminal override: a sub-flow's last binding resolves to
-        # ``success_state="complete"`` (the standard _resolve_jobs derivation),
-        # but operationally the sub-flow's last step should return to the
-        # host flow's monitor — not mark the task complete. ``pr_fix → push_pr``
-        # is the canonical case: a successful pr-fix push lands new commits on
-        # the PR, and the task must return to ``wait_for_pr_signal`` to await
-        # merge / further feedback. The (last.active, host_monitor.queue) edge
-        # is registered in the sub-flow's SM by ``_register_cross_flow_edges``;
-        # this block redirects the runtime transition to match.
-        # ADR-021: "root" is the task's OWN process's root flow, not a global
-        # active flow.
-        root_flow = self._root_flow_for(item)
-        success_state = step.success_state
-        is_subflow = active_flow.name != root_flow.name
-        if is_subflow and success_state == "complete":
-            host_monitor = next((s for s in root_flow.jobs if s.type == "monitor"), None)
-            if host_monitor is not None:
-                success_state = host_monitor.queue_state
+        # Success: advance the action. ADR-045 — an action step's success routes
+        # through its explicit ``routes: { COMPLETED: <target> }`` when present
+        # (the "on success" edge for a non-agent step), else its derived
+        # ``success_state``. Two shapes matter here:
+        #   * ``call <workflow>`` (build/fix ``push_pr → call pr-monitor``): push a
+        #     frame and hand off to the callee — a deliberate cross-workflow jump.
+        #   * a sibling step (pr-monitor ``push_pr → wait_for_pr_signal``): loop
+        #     back to the monitor (replaces the old sub-flow terminal override).
+        raw_target = next(
+            (r.target for r in step.rules if r.source == "stdout" and r.pattern.endswith("COMPLETED")),
+            None,
+        )
+        if raw_target is not None and is_call_target(raw_target):
+            if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+                await self._clear_interruption_markers(item)
+            workflow, target_job = parse_call_target(raw_target)
+            fresh = await self.db.get_task(item.id)
+            called = await self._dispatch_call(fresh, workflow, target_job=target_job)
+            await self.source.append_event(
+                item.id, {"type": "dispatch", "job_type": step.job_type, "success": called}
+            )
+            return
+
+        if raw_target is not None:
+            success_state = resolve_output_target(raw_target, step, active_flow)
+        else:
+            success_state = step.success_state
         to_status: TaskStatusLiteral
         to_current_step: str | None
-        # ``next_step`` resolution: try the active flow first so a sub-flow
-        # action job's mid-sub-flow successor (which only exists in the
-        # sub-flow's bindings) is found, then fall back to the root flow so
-        # the sub-flow terminal override above still works — that override
-        # redirects ``success_state`` to the host monitor's ``queue_state``
-        # (e.g. ``pr_fix → push_pr`` rewrites to ``wait_for_pr_signal``),
-        # which lives in the root flow's jobs, not in the sub-flow.
-        # Both paths matter:
-        #   * Root-flow action: active_flow == root_flow, found immediately.
-        #   * Bundled sub-flow terminal (pr_fix.push_pr): active_flow=pr_fix
-        #     lacks ``wait_for_pr_signal`` as a queue_state; main carries it.
-        #   * Custom mid-sub-flow action: successor's queue_state lives only
-        #     in the sub-flow's bindings; the active-flow lookup finds it
-        #     and the (then-correct) ``next_step.name`` is what gets
-        #     persisted to ``to_current_step`` below.
         next_step = next((s for s in active_flow.jobs if s.queue_state == success_state), None)
-        if next_step is None:
-            next_step = next((s for s in root_flow.jobs if s.queue_state == success_state), None)
         if success_state == "complete":
             to_status = "complete"
             to_current_step = None
@@ -5357,16 +5464,6 @@ class OrchestratorService:
         # here makes both sibling paths symmetric.)
         if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
             await self._clear_interruption_markers(item)
-        # Sub-flow exit: an action that lands the task into a monitor state
-        # (e.g. ``push_pr`` → ``wait_for_pr_signal``) is the canonical return
-        # to the root flow. Reset ``current_flow`` to the task's OWN process's
-        # root flow name (ADR-021; not a hardcoded ``"main"``) so a custom
-        # process whose root flow is named something else still persists the
-        # right value. The merge happens after the CAS wins — a CAS-loss
-        # leaves ``current_flow`` untouched, matching the won-check pattern
-        # elsewhere.
-        if next_step is not None and next_step.type == "monitor":
-            await self._merge_task_metadata(item, {"current_flow": root_flow.name})
         await self.source.append_event(item.id, {"type": "dispatch", "job_type": step.job_type, "success": True})
 
         # If the next state is a monitor, the engine drives it from here.
@@ -5859,7 +5956,7 @@ class OrchestratorService:
                             # ``blocked`` (where Retry/Revise would just re-trigger
                             # the same non-fast-forward and loop).
                             if hook_meta.get("error_kind") == "publish_conflict" and any(
-                                s.name == "resolve_conflicts" for s in self._process_for(item).jobs
+                                s.name == "resolve_conflicts" for s in self._active_process_for(item).jobs
                             ):
                                 conflicting_files = tuple(hook_meta.get("conflicting_files") or ())
                                 task_id = item.id
@@ -7239,8 +7336,13 @@ class OrchestratorService:
         catalog keys under the ``(project_id, name)`` tuple; every other task
         (bundled / inline / legacy) keys under the plain ``name`` — mirroring how
         :meth:`_register_process_plumbing` registered it.
+
+        ADR-045 — keyed on the **active workflow** (top call-stack frame), not the
+        creation process: after extraction, ``build``/``fix`` carry no monitor, so
+        a build task that called ``pr-monitor`` must resolve ``pr-monitor``'s
+        engine / monitor state / config here, not build's (which has none).
         """
-        name = self._process_name_for(item_or_row)
+        name = self._active_workflow_name_for(item_or_row)
         if name in self._project_process_catalog(item_or_row):
             return (self._project_id_for(item_or_row), name)
         return name
@@ -7369,30 +7471,96 @@ class OrchestratorService:
         """Return the pr_monitor config for the task's process (or None)."""
         return self._pr_monitor_configs_by_process.get(self._plumbing_key_for(item_or_row))
 
-    def _resolve_flow(self, item: Item) -> FlowConfig:
-        """Return the flow currently driving ``item``'s dispatch.
+    def _active_workflow_name_for(self, item_or_row: Any) -> str:
+        """Return the name of the workflow currently driving this task (ADR-045).
 
-        ADR-014 Layer A / ADR-021: a task can be running inside a sub-flow
-        (``pr_fix``) whose binding rules differ from the root flow (``main``).
-        The sub-flow's name is recorded in ``item.metadata['current_flow']``
-        at sub-flow entry (``_dispatch_pr_fix_locked``) and reset at sub-flow
-        exit (the SKIPPED drainer branch and ``_execute_action_step``'s
-        success path into a monitor state). Resolution runs against the
-        task's OWN process (``_process_for``): tasks created before
-        ``current_flow`` existed, and any task whose ``current_flow`` names a
-        flow that no longer exists in that process, fall back to that
-        process's root flow.
+        The active workflow is the **top call-stack frame**. Unlike
+        ``_process_name_for`` (the *creation* process — task identity, promotion,
+        the PR trailer), this follows a ``call`` into another workflow: a build
+        task that called ``pr-monitor`` resolves ``pr-monitor`` here while its
+        creation process stays ``build``.
+
+        Resolution mirrors ``_process_name_for``: the top frame's workflow must
+        resolve in the task's project repo catalog or the global catalog,
+        otherwise fall back to the creation process (a legacy row with a
+        ``current_flow`` slot and no stack is caught and blocked upstream, never
+        reaching here).
+        """
+        metadata = getattr(item_or_row, "metadata", None) or {}
+        top = stack_top(metadata)
+        if top is not None:
+            name = top.get("workflow")
+            if name and (name in self._project_process_catalog(item_or_row) or name in self._processes):
+                return name
+        name = self._process_name_for(item_or_row)
+        # Compat / defence — a task parked in a PR phase whose creation process
+        # carries no monitor (post-ADR-045 ``build``/``fix``, and any frameless
+        # legacy row) resolves to the monitor-bearing workflow that owns its
+        # state: the ``pr-monitor`` a ``call`` would have pushed. Only reached
+        # when the top frame is absent/unresolvable — a normal task always
+        # resolves via its frame above.
+        proc = self._processes.get(name)
+        if proc is not None and not any(j.type == "monitor" for j in proc.jobs):
+            inferred = self._pr_workflow_for(item_or_row)
+            if inferred is not None:
+                return inferred
+        return name
+
+    def _pr_workflow_for(self, item_or_row: Any) -> str | None:
+        """Return the monitor-bearing workflow that owns this task's current
+        PR-phase state/step, or ``None`` (ADR-045 compat resolver).
+
+        Searches the task's project repo catalog then the global catalog for a
+        workflow with a monitor whose state machine contains the task's current
+        ``state`` or whose jobs include its ``current_step`` — the workflow a
+        ``push_pr → call`` edge would have entered. Processes without a monitor
+        are never candidates (so a build task's own ``reviewing`` step never
+        misroutes here).
+        """
+        state = getattr(item_or_row, "state", None)
+        step = getattr(item_or_row, "current_step", None)
+        catalogs = (self._project_process_catalog(item_or_row), self._processes)
+        for catalog in catalogs:
+            for cand_name, process in catalog.items():
+                flow = process.flows.get("main") or next(iter(process.flows.values()))
+                if not any(j.type == "monitor" for j in flow.jobs):
+                    continue
+                job_names = {j.name for j in flow.jobs}
+                if (state is not None and state in flow.state_machine.states) or (step in job_names):
+                    return cand_name
+        return None
+
+    def _active_process_for(self, item_or_row: Any) -> Process:
+        """Return the workflow (Process) currently driving this task (ADR-045).
+
+        The active-workflow analogue of ``_process_for``: step lookup, flow
+        resolution, and PR-phase plumbing all resolve against the workflow named
+        by the top call-stack frame, not the creation process.
+        """
+        if self.process is None:
+            raise RuntimeError("_active_process_for called before start()")
+        name = self._active_workflow_name_for(item_or_row)
+        project_catalog = self._project_process_catalog(item_or_row)
+        if name in project_catalog:
+            return project_catalog[name]
+        return self._processes.get(name, self._process_for(item_or_row))
+
+    def _resolve_flow(self, item: Item) -> FlowConfig:
+        """Return the flow currently driving ``item``'s dispatch (ADR-045).
+
+        A task's active workflow is the top call-stack frame (``call_stack``
+        metadata). Every workflow has a single ``main`` flow now — the former
+        multi-flow-per-process (``pr_fix`` sub-flow) construct is gone — so this
+        resolves the active workflow's ``main`` flow. A task with no stack (or one
+        whose top frame names a workflow no longer loaded) falls back to its
+        creation process's root flow.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
         if self.process is None:
             return self.flow
-        process = self._process_for(item)
-        root = process.flows.get("main") or next(iter(process.flows.values()))
-        name = (item.metadata or {}).get("current_flow")
-        if not name:
-            return root
-        return process.flows.get(name) or root
+        process = self._active_process_for(item)
+        return process.flows.get("main") or next(iter(process.flows.values()))
 
     def _resolve_step_for_row(self, row: Any) -> Job | None:
         """Resolve ``row.current_step`` to its ``Job`` against the task's flow.
