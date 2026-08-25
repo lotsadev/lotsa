@@ -5608,12 +5608,21 @@ class OrchestratorService:
                     f"{listed}."
                 )
 
+            # Both deadlines are passed explicitly. Omitting them is what made
+            # every step of every process inherit the runner signature's 3600s
+            # default (prod incident ``f22e232b``): an hour nobody chose, and a
+            # wall-clock hour cannot tell a working step from a wedged one.
+            # ``timeout_kill_seconds`` — already per-step in process.yaml, and
+            # until now only decorative (it drove the Activity dot) — is the
+            # step-level override for the wall-clock backstop.
             result = await runner.run(
                 system_prompt=system,
                 user_prompt=user_prompt,
                 work_dir=work_dir,
                 session_id=session_id,
                 model=resolved_model,
+                timeout_seconds=step.timeout_kill_seconds or self.config.agent_timeout_seconds,
+                idle_timeout_seconds=self.config.agent_idle_timeout_seconds,
             )
 
             info.agent_result = result

@@ -704,6 +704,30 @@ systemd doesn't SIGKILL mid-drain.
 flows through environment variables; the container is removed after each
 run (`--rm`).
 
+### Agent runs die on silence, not on a clock
+
+Two deadlines, both set by the orchestrator from `lotsa.yaml` and both passed on
+every `runner.run()` call — never left to the runner signature's default:
+
+| Setting | Default | What it measures |
+|---|---|---|
+| `agent_idle_timeout_seconds` | 900 (15 min) | **Silence.** The container writes nothing to stdout until it exits (`--output-format json` is one blob), so wall-clock cannot tell a 40-minute working step from one wedged at minute three. The session JSONL under the mounted HOME *is* appended as the agent works, so `DockerAgentRunner` polls its mtime (`rigg.activity.last_activity_mtime`) and kills only when it has gone quiet for the whole window. |
+| `agent_timeout_seconds` | 5400 (90 min) | Wall-clock backstop for when the probe itself is unavailable. A step raises it for itself via `timeout_kill_seconds:` in process.yaml — the field that until now only drove the Activity dot. |
+
+The idle window's **floor** is the longest legitimate single tool call, not the
+longest pause in agent thinking: the session log advances when a tool call
+*returns*, so a 600s full-suite run looks identical to a stall while it runs.
+Don't tighten it below that without a finer liveness signal (`--output-format
+stream-json` read incrementally would be one).
+
+A timeout runs `docker kill` against the id captured via `--cidfile`. This is
+not optional bookkeeping: `subprocess`-level timeouts kill the `docker run`
+*client*, and the daemon's container keeps going. In incident `f22e232b` it ran
+7m39s past the deadline, still writing into a worktree the orchestrator had
+already marked failed. `ClaudeCodeRunner` accepts `idle_timeout_seconds` but
+does not yet enforce it (no process handle through `subprocess.run`) — see
+docs/post-launch-plan.md.
+
 For advanced use, instantiate `DockerAgentRunner` directly:
 
 ```python
