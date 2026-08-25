@@ -623,8 +623,14 @@ ADR-029). Created lazily by `WorktreeManager` (`rigg.git.WorktreeManager`) via
 the `worktree` **prehook** the orchestrator runs before dispatching a step
 (ADR-044 Phase 3) — every step derives it EXCEPT an agent declaring
 `needs_worktree: false` (only `chat`), which runs in the project work_dir
-instead. The orchestrator switches into the worktree for agent dispatch, push,
-and rebase operations.
+instead and derives the `sync_root` prehook in its place: it fetches and
+**fast-forwards the project checkout** to `origin/<default_branch>`, so a
+worktree-less step reads current code rather than a tree frozen at whenever the
+clone was last touched. `sync_root` skips (non-fatally, with an operator
+message when the root is actually behind) if the checkout is dirty or on
+another branch, and only ever uses `git merge --ff-only` — it must never be
+able to destroy operator work. The orchestrator switches into the worktree for
+agent dispatch, push, and rebase operations.
 
 ### Restart is resumptive, not destructive (ADR-040)
 

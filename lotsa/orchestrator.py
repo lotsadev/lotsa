@@ -4841,7 +4841,8 @@ class OrchestratorService:
 
         # Run the step's prehooks (ADR-044 Phase 3) — the built-in ``worktree``
         # prehook creates/reuses the task's git worktree; a step that opts out
-        # (chat) runs in the project work_dir. Resolves this step's work_dir.
+        # (chat) runs in the project work_dir, which the derived ``sync_root``
+        # prehook fast-forwards first. Resolves this step's work_dir.
         wt_path = await self._run_step_prehooks(item, step)
 
         # ADR-040 graceful drain — refuse new dispatches once shutdown has begun
@@ -4978,8 +4979,8 @@ class OrchestratorService:
             return
 
         # Run the step's prehooks (ADR-044 Phase 3) — same as ``_dispatch_step``.
-        # A resumed chat step also skips the worktree; a needs_worktree step
-        # re-creates it idempotently.
+        # A resumed chat step also skips the worktree (and re-syncs the project
+        # root); a needs_worktree step re-creates it idempotently.
         wt_path = await self._run_step_prehooks(item, step)
 
         # ADR-040 graceful drain — check ``_accepting`` immediately before the
@@ -5379,7 +5380,10 @@ class OrchestratorService:
 
         Replaces the former unconditional ``WorktreeManager.create`` at the two
         dispatch sites. A step with no ``worktree`` prehook (today: only
-        ``chat``) never creates a worktree and runs in the project work_dir.
+        ``chat``) never creates a worktree and runs in the project work_dir —
+        where the ``sync_root`` prehook derived in its place fast-forwards that
+        checkout to ``origin/<default_branch>``, so a worktree-less step still
+        reads current code instead of a frozen tree.
 
         The work_dir is the path the ``worktree`` prehook reports it created
         (``metadata['worktree']`` — authoritative, and the value ``create``

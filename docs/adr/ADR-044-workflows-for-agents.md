@@ -145,6 +145,26 @@ risk call); the pre-merge-branch exposure is noted and accepted.
    prehook failure is non-fatal (falls back to the project work_dir, preserving
    the pre-Phase-3 best-effort behaviour). Activity-tab work_dir resolution is
    aligned so a worktree-less chat step's session log is still read.
+
+   **Amendment — the opt-out derives `sync_root` instead.** As first shipped,
+   opting out of the worktree left a step with *no* prehooks, so it ran in the
+   project checkout with nothing keeping that checkout current: the worktree
+   prehook it declined was the only path that based work on fresh
+   `origin/<default_branch>` (ADR-018's `_sync_branch_to_main` bails outright
+   when there is no worktree, and `WorktreeManager`'s fetch moves remote-tracking
+   refs without touching the working tree). Chat therefore read a tree frozen at
+   whenever the clone was last touched, and reported files added upstream as
+   missing. The derivation now yields `worktree` **or** `sync_root` — never
+   neither. `sync_root` (`lotsa.prehooks`) fetches origin and fast-forwards the
+   project root, gated on two rails that make destroying operator work
+   impossible: HEAD must be on the default branch, and tracked files must be
+   clean (untracked survive a fast-forward, so they don't veto it). The merge
+   verb is `--ff-only`, which cannot rewrite or discard a commit, so a diverged
+   root fails safely rather than being reset. A skip is non-fatal like any
+   prehook failure, and additionally writes an operator-visible message **when
+   the root is genuinely behind** — a healthy sync stays silent, since a chat
+   REPL re-dispatches every turn. See `docs/post-launch-plan.md` for the shared
+   read-only worktree that would remove the best-effort caveat entirely.
 4. **Workflow-model cleanup** (**Implemented**) — all three sub-parts shipped.
    (a) The routing sugar, renamed `edges:` → **`routes:`**
    (the name says what it is — a `{OUTCOME: target}` map): `flows.py` desugars it
