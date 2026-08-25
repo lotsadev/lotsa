@@ -276,12 +276,21 @@ def test_chat_process_derives_no_worktree_prehook():
     """The ``chat`` process's sole step opts out of the worktree prehook — chat
     tasks stop creating a worktree they never use (ADR-044 Phase 3's payoff).
 
+    It derives ``sync_root`` in its place: opting out of the worktree also opts
+    out of the only thing that based work on fresh ``origin/<default_branch>``,
+    so a worktree-less step needs its project checkout fast-forwarded instead
+    (see ``test_project_root_sync.py``). The invariant here is "no worktree",
+    not "no prehooks".
+
     RED pre-Phase-3: no ``prehooks`` attribute; worktree creation is
     unconditional for every step including chat.
     """
     process = build_process("chat")
     for j in process.jobs:
-        assert j.prehooks == [], f"chat job {j.name!r} must derive no worktree prehook; got {j.prehooks!r}"
+        assert "worktree" not in j.prehooks, f"chat job {j.name!r} must derive no worktree prehook; got {j.prehooks!r}"
+        assert j.prehooks == ["sync_root"], (
+            f"chat job {j.name!r} must derive sync_root in the worktree's place; got {j.prehooks!r}"
+        )
 
 
 def test_build_drops_all_spec_and_plan_inputs():

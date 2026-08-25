@@ -323,13 +323,15 @@ class Job:
     ADR-044 Phase 3 step prehooks (applies to ``agent``/``action`` steps):
         prehooks:       names of prehooks (registered via
                         ``lotsa.registry.register_prehook``) the orchestrator
-                        runs before this step dispatches. ``[worktree]`` is the
-                        built-in. Usually left unset — ``worktree`` is *derived*
-                        from the agent's ``needs_worktree`` property at
-                        process-build time (opt-out: worktree is the universal
-                        default; only a ``needs_worktree: false`` agent, e.g.
-                        ``chat``, drops it). A per-binding ``prehooks:`` value
-                        (including ``[]``) fully replaces the derived base.
+                        runs before this step dispatches. ``worktree`` and
+                        ``sync_root`` are the built-ins. Usually left unset —
+                        both are *derived* from the agent's ``needs_worktree``
+                        property at process-build time (opt-out: worktree is the
+                        universal default; only a ``needs_worktree: false``
+                        agent, e.g. ``chat``, drops it, and takes ``sync_root``
+                        in its place so it still reads current code). A
+                        per-binding ``prehooks:`` value (including ``[]``) fully
+                        replaces the derived base.
 
     ADR-016 schema slots (parser only; write path deferred):
         output_file:  worktree-relative path to persist agent stdout to
@@ -815,11 +817,14 @@ def _resolve_jobs(
     derivation, but with the *inverse* polarity to commit: worktree is the
     pre-existing universal default for every dispatched step, so it is derived
     onto every agent/action step EXCEPT the one opt-out — an agent whose
-    ``needs_worktree`` is false (today: only ``chat``). Monitor jobs never
-    created a worktree at dispatch, so they derive none. Deriving worktree
-    opt-in (like commit) would strip it from ``push_pr`` (action),
-    ``resolve_conflicts``, and inline agent steps with no ``agent.yaml`` — a
-    regression. A per-binding ``prehooks:`` override fully replaces the step.
+    ``needs_worktree`` is false (today: only ``chat``) — which instead derives
+    ``sync_root``, the counterpart that fast-forwards the project checkout the
+    step will actually run in (a worktree-less step otherwise has nothing
+    keeping it current). Monitor jobs never created a worktree at dispatch, so
+    they derive neither. Deriving worktree opt-in (like commit) would strip it
+    from ``push_pr`` (action), ``resolve_conflicts``, and inline agent steps
+    with no ``agent.yaml`` — a regression. A per-binding ``prehooks:`` override
+    fully replaces the step.
     """
     by_name = {j.name: j for j in jobs}
     binding_names = [b.name for b in bindings]
@@ -933,6 +938,16 @@ def _resolve_jobs(
                         opts_out = True
                 if not opts_out:
                     effective_prehooks.append("worktree")
+                elif "sync_root" not in effective_prehooks:
+                    # The opt-out's counterpart: a worktree-less step runs in
+                    # the project's own checkout, and the worktree prehook it
+                    # just declined was the only thing that would have based it
+                    # on fresh ``origin/<default_branch>``. Derive ``sync_root``
+                    # so it reads current code instead of a tree frozen at
+                    # whenever the clone was last touched (the "chat says the
+                    # file doesn't exist" bug). Non-destructive by construction
+                    # — see ``lotsa.prehooks.sync_root_prehook`` for the rails.
+                    effective_prehooks.append("sync_root")
 
         resolved.append(
             ResolvedJob(

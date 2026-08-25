@@ -289,7 +289,12 @@ flows:
 
 def test_chat_agent_opts_out_of_worktree_derivation(tmp_path: Path):
     """The sole opt-out: a ``needs_worktree: false`` agent (``chat``) derives NO
-    worktree prehook.
+    worktree prehook — it derives ``sync_root`` instead.
+
+    Opting out of the worktree also opts out of the only path that based work on
+    fresh ``origin/<default_branch>``, so the step's project checkout has to be
+    fast-forwarded in its place (see ``test_project_root_sync.py``). The
+    invariant is "no worktree", not "no prehooks".
 
     RED pre-Phase-3: ``ResolvedJob`` has no ``prehooks`` attribute, so the
     access raises ``AttributeError``; more fundamentally, worktree creation is
@@ -312,7 +317,7 @@ flows:
       - talk
 """,
     )
-    assert _job(process, "talk").prehooks == []
+    assert _job(process, "talk").prehooks == ["sync_root"]
 
 
 def test_needs_worktree_agent_derives_worktree(tmp_path: Path):

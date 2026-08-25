@@ -56,13 +56,32 @@ You cannot probe an app you cannot build, so Layer 0 lands before the probe.
 7. **ADR-038 Phase 3 — SDK-runner sandbox parity.** 🟡 (Phases 0–2 shipped:
    native sandbox on macOS, Docker isolation on Linux, per-launch opt-out.)
 
+8. **Shared read-only worktree for worktree-less steps.** 🔴 Today a
+   `needs_worktree: false` step (only `chat`) runs in the project checkout, kept
+   current by the `sync_root` prehook, which fast-forwards it. That works but is
+   best-effort: it skips when the operator's checkout is dirty or on another
+   branch (it must — it can't be allowed to destroy their work), so those
+   sessions still read a stale tree. The alternative is one shared read-only
+   worktree per project, pinned to `origin/<default_branch>` and reused by every
+   worktree-less task: always fresh, never touches the operator's checkout, and
+   costs exactly one extra checkout per project rather than one per task. Needs
+   its own lifecycle (creation, staleness, cleanup, concurrent readers) — which
+   is why it wasn't folded into the `sync_root` fix.
+
+9. **Workflow graph viewer shows derived hooks.** 🔴 `flows._serialize_flow`
+   builds each node's `prehooks`/`posthooks` from the *declared* values, so the
+   ADR-044 derivations (`produces_changes → commit`, `needs_worktree →
+   worktree`/`sync_root`) are invisible: bundled steps that no longer declare
+   hooks by hand render as running none. Serialize from the `ResolvedJob`
+   instead. Cosmetic — viewer accuracy only, no runtime effect.
+
 ## Phase 4 — larger bets (revisit when the above is solid)
 
-8. **ADR-035 — Cross-repo coordinated changes (epic coordinator).** 🔴 Phased,
-   post-launch.
-9. **ADR-016 — Task artifact persistence & PR-inclusion.** 🔴 (Accepted; only
-   schema slots exist, no write path.)
-10. **ADR-026 — Orchestrator-managed background tasks.** 🔴 (Risky / undecided —
+10. **ADR-035 — Cross-repo coordinated changes (epic coordinator).** 🔴 Phased,
+    post-launch.
+11. **ADR-016 — Task artifact persistence & PR-inclusion.** 🔴 (Accepted; only
+    schema slots exist, no write path.)
+12. **ADR-026 — Orchestrator-managed background tasks.** 🔴 (Risky / undecided —
     re-evaluate, don't build on inertia.)
 
 ---
