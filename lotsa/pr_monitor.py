@@ -257,6 +257,37 @@ class MonitoredPr:
 # Feedback aggregation
 # ---------------------------------------------------------------------------
 
+# Section headers emitted by ``aggregate_feedback``. These are a shared contract:
+# the orchestrator's approval-only cap classifier (``_feedback_is_approval_only``)
+# keys off the exact same strings to decide whether a repeatedly-skipped pr-fix
+# dispatch is benign for cap accounting. Defining them here — in the producer —
+# and importing them there means the two sides can't drift (rather than each
+# module hardcoding its own copy of the literal). Change a header here and both
+# the rendered output and the classifier move together.
+FEEDBACK_HEADER_REVIEW_DECISION = "### Review Decision"
+FEEDBACK_HEADER_REVIEW_BODY = "### Review Body Comments"
+FEEDBACK_HEADER_INLINE_COMMENTS = "### Inline Comments"
+FEEDBACK_HEADER_PR_COMMENTS = "### PR Comments"
+FEEDBACK_HEADER_FAILING_CHECKS = "### Failing Checks"
+
+# GitHub review states relevant to the ``### Review Body Comments`` section.
+# ``aggregate_feedback`` renders each entry as ``**author** (STATE): body`` via
+# ``format_review_body_marker``; the orchestrator's classifier reuses the same
+# helper + constants to detect an approval-only payload, so the ``(STATE)``
+# format lives in exactly one place.
+REVIEW_STATE_APPROVED = "APPROVED"
+REVIEW_STATE_COMMENTED = "COMMENTED"
+
+
+def format_review_body_marker(state: str) -> str:
+    """The ``(STATE)`` token rendered for a ``### Review Body Comments`` entry.
+
+    Shared with the orchestrator's approval-only classifier so the marker format
+    (the parenthesised review state) has a single definition on both the
+    producing and consuming sides.
+    """
+    return f"({state})"
+
 
 def aggregate_feedback(
     reviews: list[dict],
@@ -282,7 +313,7 @@ def aggregate_feedback(
     # ── Review Decision ───────────────────────────────────────────────────
     changes_reviews = [r for r in reviews if r.get("state") == "CHANGES_REQUESTED"]
     if changes_reviews:
-        lines = ["### Review Decision\n"]
+        lines = [f"{FEEDBACK_HEADER_REVIEW_DECISION}\n"]
         lines.append("Status: **CHANGES_REQUESTED**\n")
         for review in changes_reviews:
             author = (review.get("user") or {}).get("login", "unknown")
@@ -296,29 +327,30 @@ def aggregate_feedback(
     # ── Review Comments (body text from COMMENTED/APPROVED reviews) ───────
     # Reviewers may submit substantive feedback as a COMMENTED or APPROVED
     # review body.  These do not appear in the comments endpoints.
-    # NOTE: the orchestrator's ``_feedback_is_approval_only`` keys off this exact
-    # header ("### Review Body Comments") and the "(APPROVED)"/"(COMMENTED)"
-    # state markers rendered below to decide whether a repeatedly-skipped pr-fix
-    # dispatch is benign for cap accounting — keep them in sync (see
-    # lotsa/orchestrator.py).
+    # NOTE: the orchestrator's ``_feedback_is_approval_only`` keys off the shared
+    # ``FEEDBACK_HEADER_*`` constants and the ``format_review_body_marker``
+    # ``(STATE)`` token to decide whether a repeatedly-skipped pr-fix dispatch is
+    # benign for cap accounting. Both sides import those symbols from here, so the
+    # header and marker format have one definition — change them here and the
+    # classifier moves with them (see lotsa/orchestrator.py).
     other_reviews = [
         r
         for r in reviews
         if r.get("state") not in ("CHANGES_REQUESTED", "DISMISSED", "PENDING") and (r.get("body") or "").strip()
     ]
     if other_reviews:
-        lines = ["### Review Body Comments\n"]
+        lines = [f"{FEEDBACK_HEADER_REVIEW_BODY}\n"]
         for review in other_reviews:
             author = (review.get("user") or {}).get("login", "unknown")
             state = review.get("state", "UNKNOWN")
             body = (review.get("body") or "").strip()
-            lines.append(f"**{author}** ({state}): {body}")
+            lines.append(f"**{author}** {format_review_body_marker(state)}: {body}")
         sections.append("\n".join(lines))
 
     # ── Inline Comments (diff-level) ──────────────────────────────────────
     inline = [c for c in comments if c.path is not None]
     if inline:
-        lines = ["### Inline Comments\n"]
+        lines = [f"{FEEDBACK_HEADER_INLINE_COMMENTS}\n"]
         for c in inline:
             lines.append(f"**{c.author}** on `{c.path}`" + (f" line {c.line}" if c.line else "") + f":\n> {c.body}")
         sections.append("\n".join(lines))
@@ -326,14 +358,14 @@ def aggregate_feedback(
     # ── PR Comments (issue-level) ─────────────────────────────────────────
     general = [c for c in comments if c.path is None]
     if general:
-        lines = ["### PR Comments\n"]
+        lines = [f"{FEEDBACK_HEADER_PR_COMMENTS}\n"]
         for c in general:
             lines.append(f"**{c.author}:** {c.body}")
         sections.append("\n".join(lines))
 
     # ── Failing Checks ────────────────────────────────────────────────────
     if checks.failing > 0:
-        lines = ["### Failing Checks\n"]
+        lines = [f"{FEEDBACK_HEADER_FAILING_CHECKS}\n"]
         for name in checks.failing_names:
             lines.append(f"- {name}")
         sections.append("\n".join(lines))

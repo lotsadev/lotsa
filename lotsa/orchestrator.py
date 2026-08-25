@@ -52,6 +52,16 @@ from lotsa.flows import (
     resolve_output_target,
     serialize_process_graph,
 )
+from lotsa.pr_monitor import (
+    FEEDBACK_HEADER_FAILING_CHECKS,
+    FEEDBACK_HEADER_INLINE_COMMENTS,
+    FEEDBACK_HEADER_PR_COMMENTS,
+    FEEDBACK_HEADER_REVIEW_BODY,
+    FEEDBACK_HEADER_REVIEW_DECISION,
+    REVIEW_STATE_APPROVED,
+    REVIEW_STATE_COMMENTED,
+    format_review_body_marker,
+)
 from lotsa.push_step import CC_TITLE_RE
 from lotsa.status import TaskStatusLiteral
 from rigg import (
@@ -504,18 +514,20 @@ def _strip_agent_result_prefix(line: str) -> str:
 _strip_pr_fix_marker_prefix = _strip_agent_result_prefix
 
 
-# Section headers emitted by ``aggregate_feedback`` (lotsa/pr_monitor.py). The
-# approval-only benign check below keys off these exact strings, so the two
-# functions co-vary — change them together (same marker/parser co-location
-# discipline as ``_AGENT_RESULT_RE`` ↔ its emitters). An *actionable* section
-# means the reviewer asked for something: a CHANGES_REQUESTED decision, inline
-# or PR comments, or a failing check. ``### Review Body Comments`` (APPROVED /
-# COMMENTED review bodies) is the only section that is not actionable on its own.
+# Section headers that mean the reviewer asked for something: a CHANGES_REQUESTED
+# decision, inline or PR comments, or a failing check. ``### Review Body Comments``
+# (APPROVED / COMMENTED review bodies) is the only section not actionable on its
+# own. These are the shared ``FEEDBACK_HEADER_*`` constants imported from
+# ``lotsa/pr_monitor.py`` — the same values ``aggregate_feedback`` renders with —
+# so the approval-only check below can't drift from the producer's output (no
+# hand-copied literal on this side; change a header at its definition and both
+# move together, same marker/parser co-location discipline as ``_AGENT_RESULT_RE``
+# ↔ its emitters).
 _ACTIONABLE_FEEDBACK_SECTIONS = (
-    "### Review Decision",
-    "### Inline Comments",
-    "### PR Comments",
-    "### Failing Checks",
+    FEEDBACK_HEADER_REVIEW_DECISION,
+    FEEDBACK_HEADER_INLINE_COMMENTS,
+    FEEDBACK_HEADER_PR_COMMENTS,
+    FEEDBACK_HEADER_FAILING_CHECKS,
 )
 
 
@@ -523,7 +535,7 @@ def _feedback_is_approval_only(feedback: str) -> bool:
     """Whether aggregated feedback is a reviewer/bot approval with nothing to act on.
 
     ``aggregate_feedback`` (lotsa/pr_monitor.py) folds APPROVED and COMMENTED
-    review bodies into one ``### Review Body Comments`` section. A payload is
+    review bodies into one ``FEEDBACK_HEADER_REVIEW_BODY`` section. A payload is
     *approval-only* when it has that section, none of the actionable sections
     (``_ACTIONABLE_FEEDBACK_SECTIONS``), and every review-body entry is
     ``(APPROVED)`` — no ``(COMMENTED)`` entry. Such a payload carries no
@@ -533,17 +545,19 @@ def _feedback_is_approval_only(feedback: str) -> bool:
 
     A COMMENTED review body, or any actionable section alongside the approval,
     makes the payload actionable — the approve-with-a-caveat case still reaches
-    the agent and still counts if repeatedly skipped. Keyed off
-    ``aggregate_feedback``'s section headers and ``(STATE)`` markers; the two
-    must change together.
+    the agent and still counts if repeatedly skipped. The section headers and the
+    ``(STATE)`` marker are the shared ``FEEDBACK_HEADER_*`` /
+    ``format_review_body_marker`` symbols imported from ``aggregate_feedback``'s
+    module, so producer and classifier share one definition rather than two
+    hand-matched copies.
     """
-    if "### Review Body Comments" not in feedback:
+    if FEEDBACK_HEADER_REVIEW_BODY not in feedback:
         return False
     if any(header in feedback for header in _ACTIONABLE_FEEDBACK_SECTIONS):
         return False
-    if "(COMMENTED)" in feedback:
+    if format_review_body_marker(REVIEW_STATE_COMMENTED) in feedback:
         return False
-    return "(APPROVED)" in feedback
+    return format_review_body_marker(REVIEW_STATE_APPROVED) in feedback
 
 
 def _feedback_is_actionable(feedback: str | None) -> bool:
