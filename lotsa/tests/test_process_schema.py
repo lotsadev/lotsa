@@ -289,12 +289,13 @@ def test_full_process_has_push_pr_action_state():
     assert push_pr.tool == "push_pr"
 
 
-def test_full_process_has_wait_for_pr_signal_monitor_state():
-    """The ``wait_for_pr_signal`` monitor job contributes a single state addressable
-    by name."""
+def test_pr_monitor_process_has_wait_for_pr_signal_monitor_state():
+    """The ``wait_for_pr_signal`` monitor job contributes a single state
+    addressable by name. ADR-045 moved it from build/full into the standalone
+    ``pr-monitor`` workflow."""
     from lotsa.flows import build_process
 
-    process = build_process("build")
+    process = build_process("pr-monitor")
     monitor = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     assert monitor.type == "monitor"
     assert monitor.engine == "pr_monitor"
@@ -314,103 +315,42 @@ def test_main_flow_review_fail_routes_to_code():
     assert fail_rules[0].target == "code"
 
 
-def test_pr_fix_flow_review_fail_routes_to_pr_fix():
-    """Per-flow override: in ``pr_fix``, REVIEW_FAIL routes back to ``pr-fix``."""
+def test_pr_monitor_review_fail_routes_to_pr_fix():
+    """In the ``pr-monitor`` workflow (ADR-045, formerly the ``pr_fix`` sub-flow),
+    REVIEW_FAIL routes back to ``pr-fix``."""
     from lotsa.flows import build_process
 
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    review_binding = next(b for b in pr_fix.bindings if b.name == "review")
-    fail_rules = [r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern]
-    assert fail_rules, "pr_fix.review must override REVIEW_FAIL routing"
+    main = build_process("pr-monitor").flows["main"]
+    review_job = next(j for j in main.jobs if j.name == "review")
+    fail_rules = [r for r in review_job.rules if "AGENT_RESULT: FAILED" in r.pattern]
+    assert fail_rules, "pr-monitor.review must route REVIEW_FAIL"
     assert fail_rules[0].target == "pr-fix"
 
 
-def test_pr_fix_flow_has_no_verify_step():
-    """The pr_fix flow skips verify — supersedes the PR #62 stopgap heuristic."""
+def test_pr_monitor_flow_has_no_verify_step():
+    """The ``pr-monitor`` workflow skips verify — supersedes the PR #62 stopgap
+    heuristic."""
     from lotsa.flows import build_process
 
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    assert not any(b.name == "verify" for b in pr_fix.bindings)
+    main = build_process("pr-monitor").flows["main"]
+    assert not any(b.name == "verify" for b in main.bindings)
 
 
-def test_cross_flow_rule_target_first_agent_uses_resolved_queue_state(tmp_path: Path):
-    """A cross-flow rule target whose queue_state is derived (not declared)
-    must register the transition against the target's ACTUAL queue_state
-    (e.g. ``"backlog"`` for the first agent binding in its flow), not the
-    raw job name.
+# ADR-045 removed cross-flow rule-target stitching (the former
+# ``_register_cross_flow_edges``): sub-flows are gone, so a rule can only target
+# a job in its own flow, and cross-*workflow* handoff is an explicit ``call``.
+# The former ``test_cross_flow_rule_target_first_agent_uses_resolved_queue_state``
+# pinned that removed machinery and was dropped with it.
 
-    Pre-fix, ``_build_state_machine`` looked up cross-flow targets in the
-    raw-Job catalog and used ``cross.queue_state or cross.name`` — for a
-    target that is the first agent in its flow (deriving ``"backlog"``),
-    this produced a stale ``(active_state, job.name)`` edge instead of
-    ``(active_state, "backlog")``. The orchestrator's pre-CAS transition
-    check would then reject the dispatch silently because the actual CAS
-    target is ``"backlog"`` (the ResolvedJob queue_state).
 
-    Bundled processes happen to dodge this — none of their cross-flow
-    rule targets sit at first-binding position — so the bug is latent
-    there. This test pins the contract for custom processes.
-    """
+def test_pr_monitor_pr_fix_skipped_targets_wait_for_pr_signal():
+    """``pr-fix``'s SKIPPED outcome in the ``pr-monitor`` workflow loops back to
+    the monitor by name."""
     from lotsa.flows import build_process
 
-    yaml_path = tmp_path / "process.yaml"
-    yaml_path.write_text(
-        yaml.dump(
-            {
-                "process": "first_agent_cross_flow",
-                "jobs": [
-                    # ``alpha`` is the first agent of the ``side`` flow —
-                    # _resolve_jobs derives its queue_state as ``"backlog"``.
-                    {"name": "alpha", "type": "agent", "prompt": "alpha"},
-                    {"name": "beta", "type": "agent", "prompt": "beta"},
-                    {
-                        "name": "gamma",
-                        "type": "agent",
-                        "prompt": "gamma",
-                        # gamma's GO rule targets alpha (cross-flow).
-                        "rules": [
-                            {"source": "stdout", "pattern": "^GO:", "target": "alpha"},
-                        ],
-                    },
-                ],
-                "flows": {
-                    "main": {"steps": ["beta", "gamma"]},
-                    "side": {"steps": ["alpha"]},
-                },
-            }
-        )
-    )
-    process = build_process("first_agent_cross_flow", process_file=yaml_path)
-
-    # Alpha's actual queue_state under the ``side`` flow is ``"backlog"``.
-    side = process.flows["side"]
-    alpha_resolved = next(rj for rj in side.jobs if rj.name == "alpha")
-    assert alpha_resolved.queue_state == "backlog"
-
-    # The cross-flow edge from gamma.active to alpha's queue_state must
-    # use the resolved value, not the raw job name. The edge is needed
-    # in BOTH the target flow's SM (so the engine's CAS can validate the
-    # destination) AND the source flow's SM (so the drainer's pre-CAS
-    # check against the active flow accepts the routing).
-    gamma_resolved = next(rj for rj in process.flows["main"].jobs if rj.name == "gamma")
-    side_sm = side.state_machine
-    main_sm = process.flows["main"].state_machine
-    assert (gamma_resolved.active_state, "backlog") in side_sm.transitions
-    assert (gamma_resolved.active_state, "backlog") in main_sm.transitions
-    # And the stale edge keyed on the raw job name must NOT be there.
-    assert (gamma_resolved.active_state, "alpha") not in main_sm.transitions
-
-
-def test_pr_fix_flow_skipped_targets_wait_for_pr_signal():
-    """``PR_FIX_SKIPPED:`` in the pr_fix flow targets the monitor by name."""
-    from lotsa.flows import build_process
-
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
-    skipped_rules = [r for r in (pr_fix_binding.rules or []) if "SKIPPED" in r.pattern]
+    main = build_process("pr-monitor").flows["main"]
+    pr_fix_job = next(j for j in main.jobs if j.name == "pr-fix")
+    skipped_rules = [r for r in pr_fix_job.rules if "SKIPPED" in r.pattern]
     assert skipped_rules
     assert skipped_rules[0].target == "wait_for_pr_signal"
 

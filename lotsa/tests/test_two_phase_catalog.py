@@ -33,12 +33,10 @@ from lotsa.flows import (
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_preset_names_are_exactly_chat_build_fix():
-    """``PRESET_NAMES`` is the three-process think→execute catalog.
-
-    Fails pre-impl: it is still ``("simple","standard","full","chat","quickfix")``.
-    """
-    assert PRESET_NAMES == ("chat", "build", "fix")
+def test_preset_names_are_chat_build_fix_and_pr_monitor():
+    """``PRESET_NAMES`` is the think→execute catalog plus the standalone
+    ``pr-monitor`` watch workflow (ADR-045)."""
+    assert PRESET_NAMES == ("chat", "build", "fix", "pr-monitor")
 
 
 @pytest.mark.parametrize("removed", ["simple", "standard", "full", "quickfix"])
@@ -86,14 +84,20 @@ def test_no_orphaned_pr_summary_files_remain():
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_build_process_loads_with_main_and_pr_fix_flows():
+def test_build_process_loads_with_single_main_flow():
+    """ADR-045 — build carries only a ``main`` flow; the former ``pr_fix``
+    sub-flow is the standalone ``pr-monitor`` workflow reached via ``call``."""
     process = build_process("build")
-    assert "main" in process.flows
-    assert "pr_fix" in process.flows
+    assert list(process.flows) == ["main"]
+    assert "pr_fix" not in process.flows
 
 
 def test_build_main_flow_step_order():
-    """build's main flow is plan→test→code→review→verify→pr_summary→push_pr→wait."""
+    """build's main flow is plan→test→code→review→verify→pr_summary→push_pr.
+
+    ADR-045 — the PR watch (``wait_for_pr_signal``) moved to the ``pr-monitor``
+    workflow; ``push_pr`` routes ``COMPLETED: call pr-monitor``.
+    """
     main = build_process("build").flows["main"]
     names = [b.name for b in main.bindings]
     assert names == [
@@ -104,7 +108,6 @@ def test_build_main_flow_step_order():
         "verify",
         "pr_summary",
         "push_pr",
-        "wait_for_pr_signal",
     ]
 
 
@@ -146,8 +149,9 @@ def test_build_commit_posthooks_derived_on_producing_steps():
     """
     import lotsa.posthooks  # noqa: F401 — ensures the built-in ``commit`` exists
 
-    process = build_process("build")
-    by_name = {j.name: j for j in process.jobs}
+    # ADR-045 — ``pr-fix`` produces changes too, but now lives in ``pr-monitor``.
+    by_name = {j.name: j for j in build_process("build").jobs}
+    by_name.update({j.name: j for j in build_process("pr-monitor").jobs})
     for step in ("test", "code", "pr-fix"):
         assert by_name[step].posthooks == ["commit"], (
             f"{step} must run the commit posthook; got {by_name[step].posthooks!r}"
@@ -189,34 +193,35 @@ def test_bundled_effective_posthooks_preserved_except_verify():
         "test": ["commit"],
         "code": ["commit"],
         "review": [],
-        "pr-fix": ["commit"],
         "verify": [],  # ← the one change
         "pr_summary": [],
         "push_pr": [],  # action
-        "resolve_conflicts": ["commit"],
-        "wait_for_pr_signal": [],  # monitor
     }
     expected_fix = {
         "code": ["commit"],
         "review": [],
-        "pr-fix": ["commit"],
         "pr_summary": [],
         "push_pr": [],  # action
-        "resolve_conflicts": ["commit"],
+    }
+    # ADR-045 — the PR-phase producers moved into the ``pr-monitor`` workflow.
+    expected_pr_monitor = {
         "wait_for_pr_signal": [],  # monitor
+        "pr-fix": ["commit"],
+        "resolve_conflicts": ["commit"],
+        "review": [],
+        "push_pr": [],  # action
     }
 
-    build_jobs = {j.name: j for j in build_process("build").jobs}
-    for name, expected in expected_build.items():
-        assert build_jobs[name].posthooks == expected, (
-            f"build/{name}: expected posthooks {expected!r}, got {build_jobs[name].posthooks!r}"
-        )
-
-    fix_jobs = {j.name: j for j in build_process("fix").jobs}
-    for name, expected in expected_fix.items():
-        assert fix_jobs[name].posthooks == expected, (
-            f"fix/{name}: expected posthooks {expected!r}, got {fix_jobs[name].posthooks!r}"
-        )
+    for process_name, expected in (
+        ("build", expected_build),
+        ("fix", expected_fix),
+        ("pr-monitor", expected_pr_monitor),
+    ):
+        jobs = {j.name: j for j in build_process(process_name).jobs}
+        for name, want in expected.items():
+            assert jobs[name].posthooks == want, (
+                f"{process_name}/{name}: expected posthooks {want!r}, got {jobs[name].posthooks!r}"
+            )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -242,34 +247,35 @@ def test_bundled_effective_prehooks_worktree_everywhere_except_monitor():
         "test": ["worktree"],
         "code": ["worktree"],
         "review": ["worktree"],
-        "pr-fix": ["worktree"],
         "verify": ["worktree"],
         "pr_summary": ["worktree"],
         "push_pr": ["worktree"],  # action — always got a worktree pre-Phase-3
-        "resolve_conflicts": ["worktree"],
-        "wait_for_pr_signal": [],  # monitor — never created one
     }
     expected_fix = {
         "code": ["worktree"],
         "review": ["worktree"],
-        "pr-fix": ["worktree"],
         "pr_summary": ["worktree"],
         "push_pr": ["worktree"],  # action
+    }
+    # ADR-045 — the PR-phase steps moved into the ``pr-monitor`` workflow.
+    expected_pr_monitor = {
+        "wait_for_pr_signal": [],  # monitor — never created one
+        "pr-fix": ["worktree"],
         "resolve_conflicts": ["worktree"],
-        "wait_for_pr_signal": [],  # monitor
+        "review": ["worktree"],
+        "push_pr": ["worktree"],  # action
     }
 
-    build_jobs = {j.name: j for j in build_process("build").jobs}
-    for name, expected in expected_build.items():
-        assert build_jobs[name].prehooks == expected, (
-            f"build/{name}: expected prehooks {expected!r}, got {build_jobs[name].prehooks!r}"
-        )
-
-    fix_jobs = {j.name: j for j in build_process("fix").jobs}
-    for name, expected in expected_fix.items():
-        assert fix_jobs[name].prehooks == expected, (
-            f"fix/{name}: expected prehooks {expected!r}, got {fix_jobs[name].prehooks!r}"
-        )
+    for process_name, expected in (
+        ("build", expected_build),
+        ("fix", expected_fix),
+        ("pr-monitor", expected_pr_monitor),
+    ):
+        jobs = {j.name: j for j in build_process(process_name).jobs}
+        for name, want in expected.items():
+            assert jobs[name].prehooks == want, (
+                f"{process_name}/{name}: expected prehooks {want!r}, got {jobs[name].prehooks!r}"
+            )
 
 
 def test_chat_process_derives_no_worktree_prehook():
@@ -320,10 +326,12 @@ def test_build_verify_routing():
     assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
-def test_build_pr_fix_subflow_shape():
-    """pr_fix sub-flow preserved: pr-fix → resolve_conflicts → review → push_pr."""
-    pr_fix = build_process("build").flows["pr_fix"]
-    assert [b.name for b in pr_fix.bindings] == [
+def test_pr_monitor_workflow_shape():
+    """ADR-045 — the former ``pr_fix`` sub-flow is the standalone ``pr-monitor``
+    workflow: wait_for_pr_signal → pr-fix → resolve_conflicts → review → push_pr."""
+    main = build_process("pr-monitor").flows["main"]
+    assert [b.name for b in main.bindings] == [
+        "wait_for_pr_signal",
         "pr-fix",
         "resolve_conflicts",
         "review",
@@ -331,14 +339,20 @@ def test_build_pr_fix_subflow_shape():
     ]
 
 
-def test_build_ends_in_push_and_pr_watch():
-    """Execute ends in push_pr (action) → wait_for_pr_signal (monitor)."""
+def test_build_ends_in_push_then_calls_pr_monitor():
+    """Execute ends in push_pr (action), which routes ``COMPLETED: call
+    pr-monitor`` — the PR watch is the ``pr-monitor`` workflow (ADR-045)."""
     process = build_process("build")
     by_name = {j.name: j for j in process.jobs}
     assert by_name["push_pr"].type == "action"
     assert by_name["push_pr"].tool == "push_pr"
-    assert by_name["wait_for_pr_signal"].type == "monitor"
-    assert by_name["wait_for_pr_signal"].engine == "pr_monitor"
+    assert "wait_for_pr_signal" not in by_name
+    call_rules = [(r.pattern, r.target) for r in by_name["push_pr"].rules]
+    assert ("^AGENT_RESULT: COMPLETED", "call pr-monitor") in call_rules
+    # The watch monitor lives in the pr-monitor workflow.
+    pm = {j.name: j for j in build_process("pr-monitor").jobs}
+    assert pm["wait_for_pr_signal"].type == "monitor"
+    assert pm["wait_for_pr_signal"].engine == "pr_monitor"
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -346,19 +360,21 @@ def test_build_ends_in_push_and_pr_watch():
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_fix_process_loads_with_main_and_pr_fix_flows():
+def test_fix_process_loads_with_single_main_flow():
+    """ADR-045 — fix carries only a ``main`` flow; PR watching is the standalone
+    ``pr-monitor`` workflow reached via ``call``."""
     process = build_process("fix")
-    assert "main" in process.flows
-    assert "pr_fix" in process.flows
+    assert list(process.flows) == ["main"]
+    assert "pr_fix" not in process.flows
 
 
 def test_fix_main_flow_step_order():
-    """fix's main flow is code→review→pr_summary→push_pr→wait_for_pr_signal.
+    """fix's main flow is code→review→pr_summary→push_pr.
 
     fix opens a human-facing PR, so it summarizes (pr_summary → pr_description
     artifact) before push — without it, the PR title falls back to the raw
-    first-prompt commit subject. pr_summary lives in ``main`` only (not the
-    ``pr_fix`` sub-flow, which must not regenerate PR text on a re-push).
+    first-prompt commit subject. ADR-045 — the PR watch (``wait_for_pr_signal``)
+    moved to the ``pr-monitor`` workflow; ``push_pr`` routes ``call pr-monitor``.
     """
     main = build_process("fix").flows["main"]
     assert [b.name for b in main.bindings] == [
@@ -366,21 +382,24 @@ def test_fix_main_flow_step_order():
         "review",
         "pr_summary",
         "push_pr",
-        "wait_for_pr_signal",
     ]
 
 
-def test_fix_opens_a_pr_and_enters_pr_watch():
-    """fix now pushes: a push_pr action + pr_monitor wait must be present.
+def test_fix_opens_a_pr_and_calls_pr_monitor():
+    """fix now pushes: a push_pr action that routes ``COMPLETED: call
+    pr-monitor``; the pr_monitor wait lives in the ``pr-monitor`` workflow.
 
     (Today quickfix commits but never opens a PR.)
     """
-    process = build_process("fix")
-    by_name = {j.name: j for j in process.jobs}
+    by_name = {j.name: j for j in build_process("fix").jobs}
     assert by_name["push_pr"].type == "action"
     assert by_name["push_pr"].tool == "push_pr"
-    assert by_name["wait_for_pr_signal"].type == "monitor"
-    assert by_name["wait_for_pr_signal"].engine == "pr_monitor"
+    assert "wait_for_pr_signal" not in by_name
+    call_rules = [(r.pattern, r.target) for r in by_name["push_pr"].rules]
+    assert ("^AGENT_RESULT: COMPLETED", "call pr-monitor") in call_rules
+    pm = {j.name: j for j in build_process("pr-monitor").jobs}
+    assert pm["wait_for_pr_signal"].type == "monitor"
+    assert pm["wait_for_pr_signal"].engine == "pr_monitor"
 
 
 def test_fix_code_step_has_commit_posthook():
@@ -397,14 +416,10 @@ def test_fix_review_routing_pass_next_fail_code():
     assert ("^AGENT_RESULT: FAILED", "code") in targets
 
 
-def test_fix_pr_fix_subflow_shape():
-    pr_fix = build_process("fix").flows["pr_fix"]
-    assert [b.name for b in pr_fix.bindings] == [
-        "pr-fix",
-        "resolve_conflicts",
-        "review",
-        "push_pr",
-    ]
+def test_fix_shares_the_pr_monitor_workflow():
+    """ADR-045 — ``fix`` has no ``pr_fix`` sub-flow; the PR-fix loop is the shared
+    standalone ``pr-monitor`` workflow (pinned by ``test_pr_monitor_workflow_shape``)."""
+    assert "pr_fix" not in build_process("fix").flows
 
 
 # ───────────────────────────────────────────────────────────────────────────

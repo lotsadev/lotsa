@@ -69,6 +69,7 @@ class _StubOrchestrator:
         self.db = None
         self.transitions: list[tuple[str, str]] = []
         self.sub_flow_calls: list[tuple[str, str, str | None]] = []
+        self.pr_fix_calls: list[tuple[str, str | None]] = []
         self.waiting: list[dict] = []
 
     async def transition_task(self, task_id: str, target_state: str) -> None:
@@ -76,6 +77,12 @@ class _StubOrchestrator:
 
     async def dispatch_sub_flow(self, task_id: str, flow_name: str, *, feedback=None, target_job=None) -> bool:
         self.sub_flow_calls.append((task_id, flow_name, feedback))
+        return True
+
+    async def dispatch_pr_fix(self, task_id: str, feedback: str) -> bool:
+        # ADR-045 — pr-fix is intra-workflow in ``pr-monitor`` now, so feedback
+        # dispatch forwards straight through ``dispatch_pr_fix``.
+        self.pr_fix_calls.append((task_id, feedback))
         return True
 
     async def list_waiting_pr_tasks(self) -> list[dict]:
@@ -224,13 +231,15 @@ def test_engine_config_carries_base_branch_field():
 # ---------------------------------------------------------------------------
 
 
-async def test_engine_feedback_dispatches_via_sub_flow_not_dispatch_pr_fix():
-    """Feedback dispatch goes through ``orchestrator.dispatch_sub_flow("pr_fix", ...)``.
+async def test_engine_feedback_dispatches_via_dispatch_pr_fix():
+    """Feedback dispatch goes through ``orchestrator.dispatch_pr_fix(task, feedback)``.
 
-    Layer A replaces the ad-hoc ``dispatch_pr_fix`` orchestrator method with
-    a generic sub-flow dispatcher. The engine MUST call the new method
-    rather than the old name — there is no longer a ``dispatch_pr_fix``
-    bound on the orchestrator for the engine to fall back to.
+    ADR-045 — after ``pr-monitor`` became its own top-level workflow, the monitor
+    state and ``pr-fix`` live in the SAME workflow, so a feedback dispatch is an
+    INTRA-workflow edge (monitor state → pr-fixing), not a call into a sub-flow.
+    The engine's ``_SubFlowAdapter`` therefore forwards ``dispatch_pr_fix``
+    straight through (which resolves ``pr-fix`` against the task's active
+    workflow) instead of the old ``dispatch_sub_flow("pr_fix", …)`` indirection.
     """
     from lotsa.engines.pr_monitor import PrMonitorEngine
     from lotsa.github_client import PrInfo
@@ -250,10 +259,10 @@ async def test_engine_feedback_dispatches_via_sub_flow_not_dispatch_pr_fix():
     # 3.10+ and would also close the global loop other sync tests reuse.
     await engine._monitor._on_feedback("task-id", pr, "some review feedback", since_cutoff=None)
 
-    assert len(orch.sub_flow_calls) == 1
-    task_id, flow_name, feedback = orch.sub_flow_calls[0]
+    assert orch.sub_flow_calls == [], "feedback must not route through the removed sub-flow indirection"
+    assert len(orch.pr_fix_calls) == 1
+    task_id, feedback = orch.pr_fix_calls[0]
     assert task_id == "task-id"
-    assert flow_name == "pr_fix"
     assert "some review feedback" in (feedback or "")
 
 

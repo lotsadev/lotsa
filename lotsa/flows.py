@@ -1394,7 +1394,7 @@ def resolve_output_target(
 # ---------------------------------------------------------------------------
 
 
-def validate_call_graph(processes: dict[str, "Process"]) -> None:
+def validate_call_graph(processes: dict[str, Process]) -> None:
     """Validate every ``call <workflow>[@<step>]`` edge across the whole catalog.
 
     Runs once the full catalog is loaded (a single ``build_process`` cannot see
@@ -1412,7 +1412,7 @@ def validate_call_graph(processes: dict[str, "Process"]) -> None:
     a shared state machine.
     """
 
-    def _calls(process: "Process") -> list[tuple[str, str | None]]:
+    def _calls(process: Process) -> list[tuple[str, str | None]]:
         out: list[tuple[str, str | None]] = []
         for flow in process.flows.values():
             for rj in flow.jobs:
@@ -1428,8 +1428,7 @@ def validate_call_graph(processes: dict[str, "Process"]) -> None:
         for target_wf, target_step in _calls(process):
             if target_wf not in processes:
                 raise ValueError(
-                    f"Workflow {name!r} calls unknown workflow {target_wf!r} "
-                    f"(known workflows: {sorted(processes)})."
+                    f"Workflow {name!r} calls unknown workflow {target_wf!r} (known workflows: {sorted(processes)})."
                 )
             if target_step is not None:
                 callee = processes[target_wf]

@@ -24,6 +24,13 @@ if TYPE_CHECKING:
     from lotsa.tools import ToolResult
 
 from lotsa.attachments import materialize_into_worktree
+from lotsa.call_stack import (
+    CALL_STACK_KEY,
+    is_legacy_flow_row,
+    make_frame,
+    push_frame,
+    stack_top,
+)
 from lotsa.config import LotsaConfig, resolve_project_specs
 from lotsa.db import (
     PUSH_START,
@@ -36,19 +43,9 @@ from lotsa.db import (
     TaskRow,
 )
 from lotsa.diff import compute_branch_diff
-from lotsa.call_stack import (
-    CALL_STACK_KEY,
-    get_stack,
-    is_legacy_flow_row,
-    make_frame,
-    pop_frame,
-    push_frame,
-    stack_top,
-)
 from lotsa.flows import (
     BUNDLED_PROMPTS,
     PRESET_NAMES,
-    TERMINATE_TARGET,
     FlowConfig,
     FlowStep,
     Job,
@@ -5361,9 +5358,7 @@ class OrchestratorService:
             workflow, target_job = parse_call_target(raw_target)
             fresh = await self.db.get_task(item.id)
             called = await self._dispatch_call(fresh, workflow, target_job=target_job)
-            await self.source.append_event(
-                item.id, {"type": "dispatch", "job_type": step.job_type, "success": called}
-            )
+            await self.source.append_event(item.id, {"type": "dispatch", "job_type": step.job_type, "success": called})
             return
 
         if raw_target is not None:
@@ -7501,9 +7496,22 @@ class OrchestratorService:
         # resolves via its frame above.
         proc = self._processes.get(name)
         if proc is not None and not any(j.type == "monitor" for j in proc.jobs):
-            inferred = self._pr_workflow_for(item_or_row)
-            if inferred is not None:
-                return inferred
+            # Guard against state-name collision: only infer the ``pr-monitor``
+            # a ``call`` would have pushed when the creation process does NOT
+            # itself own the task's current state/step. Otherwise a monitor-less
+            # workflow whose state name merely coincides with one of
+            # ``pr-monitor``'s (e.g. a custom ``code → review`` process's
+            # ``reviewing``) is wrongly hijacked into pr-monitor's flow, and its
+            # step resolves against the wrong routing.
+            flow = proc.flows.get("main") or next(iter(proc.flows.values()))
+            state = getattr(item_or_row, "state", None)
+            step = getattr(item_or_row, "current_step", None)
+            owns_state = state is not None and state in flow.state_machine.states
+            owns_step = step is not None and step in {j.name for j in flow.jobs}
+            if not (owns_state or owns_step):
+                inferred = self._pr_workflow_for(item_or_row)
+                if inferred is not None:
+                    return inferred
         return name
 
     def _pr_workflow_for(self, item_or_row: Any) -> str | None:
@@ -7514,8 +7522,10 @@ class OrchestratorService:
         workflow with a monitor whose state machine contains the task's current
         ``state`` or whose jobs include its ``current_step`` — the workflow a
         ``push_pr → call`` edge would have entered. Processes without a monitor
-        are never candidates (so a build task's own ``reviewing`` step never
-        misroutes here).
+        are never candidates. The caller (``_active_workflow_name_for``) only
+        consults this when the creation process does not itself own the task's
+        state/step, so a monitor-less process whose state name collides with a
+        candidate's (e.g. ``reviewing``) is not hijacked.
         """
         state = getattr(item_or_row, "state", None)
         step = getattr(item_or_row, "current_step", None)
@@ -7567,9 +7577,10 @@ class OrchestratorService:
 
         Resolution order — **active flow first**, then root, then catalog:
 
-        1. **Active flow** (``_resolve_flow`` — honours ``current_flow``).
-        2. **Root flow** (``main``) — covers legacy rows with no
-           ``current_flow`` and the common case where active == root.
+        1. **Active flow** (``_resolve_flow`` — honours the top call-stack
+           frame, ADR-045).
+        2. **Root flow** (``main``) — covers rows with an empty call stack
+           and the common case where active == root.
         3. **Process catalog** (``_process_for``) — covers sub-flow-only jobs
            (e.g. ``pr-fix``) that aren't in any flow's top-level job list.
 

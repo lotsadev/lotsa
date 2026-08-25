@@ -1256,7 +1256,7 @@ def test_resolve_conflicts_monitor_entry_edge_in_main_sm():
     main_sm = process.flows["main"].state_machine
     resolve_step = next((rj for rj in process.flows["main"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None, (
-        "resolve_conflicts must be a job in the pr-monitor main flow of the pr-monitor workflow. Add it to full/process.yaml."
+        "resolve_conflicts must be a job in the pr-monitor workflow's main flow. Add it to pr-monitor/process.yaml."
     )
     assert ("wait_for_pr_signal", resolve_step.queue_state) in main_sm.transitions, (
         f"main's SM must contain the sub-flow entry edge "
