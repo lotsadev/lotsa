@@ -52,6 +52,16 @@ from lotsa.flows import (
     resolve_output_target,
     serialize_process_graph,
 )
+from lotsa.pr_monitor import (
+    FEEDBACK_HEADER_FAILING_CHECKS,
+    FEEDBACK_HEADER_INLINE_COMMENTS,
+    FEEDBACK_HEADER_PR_COMMENTS,
+    FEEDBACK_HEADER_REVIEW_BODY,
+    FEEDBACK_HEADER_REVIEW_DECISION,
+    REVIEW_STATE_APPROVED,
+    REVIEW_STATE_COMMENTED,
+    format_review_body_marker,
+)
 from lotsa.push_step import CC_TITLE_RE
 from lotsa.status import TaskStatusLiteral
 from rigg import (
@@ -504,6 +514,52 @@ def _strip_agent_result_prefix(line: str) -> str:
 _strip_pr_fix_marker_prefix = _strip_agent_result_prefix
 
 
+# Section headers that mean the reviewer asked for something: a CHANGES_REQUESTED
+# decision, inline or PR comments, or a failing check. ``### Review Body Comments``
+# (APPROVED / COMMENTED review bodies) is the only section not actionable on its
+# own. These are the shared ``FEEDBACK_HEADER_*`` constants imported from
+# ``lotsa/pr_monitor.py`` — the same values ``aggregate_feedback`` renders with —
+# so the approval-only check below can't drift from the producer's output (no
+# hand-copied literal on this side; change a header at its definition and both
+# move together, same marker/parser co-location discipline as ``_AGENT_RESULT_RE``
+# ↔ its emitters).
+_ACTIONABLE_FEEDBACK_SECTIONS = (
+    FEEDBACK_HEADER_REVIEW_DECISION,
+    FEEDBACK_HEADER_INLINE_COMMENTS,
+    FEEDBACK_HEADER_PR_COMMENTS,
+    FEEDBACK_HEADER_FAILING_CHECKS,
+)
+
+
+def _feedback_is_approval_only(feedback: str) -> bool:
+    """Whether aggregated feedback is a reviewer/bot approval with nothing to act on.
+
+    ``aggregate_feedback`` (lotsa/pr_monitor.py) folds APPROVED and COMMENTED
+    review bodies into one ``FEEDBACK_HEADER_REVIEW_BODY`` section. A payload is
+    *approval-only* when it has that section, none of the actionable sections
+    (``_ACTIONABLE_FEEDBACK_SECTIONS``), and every review-body entry is
+    ``(APPROVED)`` — no ``(COMMENTED)`` entry. Such a payload carries no
+    requested change, so a subsequent ``AGENT_RESULT: SKIPPED`` is benign and
+    must not burn ``max_consecutive_skipped`` (task 28a6f847 / PR #41: three bot
+    APPROVED reviews in a row false-blocked the task).
+
+    A COMMENTED review body, or any actionable section alongside the approval,
+    makes the payload actionable — the approve-with-a-caveat case still reaches
+    the agent and still counts if repeatedly skipped. The section headers and the
+    ``(STATE)`` marker are the shared ``FEEDBACK_HEADER_*`` /
+    ``format_review_body_marker`` symbols imported from ``aggregate_feedback``'s
+    module, so producer and classifier share one definition rather than two
+    hand-matched copies.
+    """
+    if FEEDBACK_HEADER_REVIEW_BODY not in feedback:
+        return False
+    if any(header in feedback for header in _ACTIONABLE_FEEDBACK_SECTIONS):
+        return False
+    if format_review_body_marker(REVIEW_STATE_COMMENTED) in feedback:
+        return False
+    return format_review_body_marker(REVIEW_STATE_APPROVED) in feedback
+
+
 def _feedback_is_actionable(feedback: str | None) -> bool:
     """Whether feedback delivered to a pr-fix dispatch was real.
 
@@ -520,6 +576,12 @@ def _feedback_is_actionable(feedback: str | None) -> bool:
       the rule-route carry-forward. The conflict is already resolved, so skipping
       it is benign (internal tasks / 04ee0735: the echo skip burned the cap and
       re-blocked a conflict-resolved, review-ready PR).
+    - An approval-only aggregate: a ``### Review Body Comments`` section whose
+      entries are all ``(APPROVED)``, with no actionable section (changes-
+      requested / inline / PR comments / failing checks) and no ``(COMMENTED)``
+      body. A reviewer approving the PR is the opposite of an agent dodging
+      requested changes (task 28a6f847 / PR #41). See
+      :func:`_feedback_is_approval_only`.
 
     Only the ``COMPLETED`` worker echo is benign. A ``review`` step's
     ``AGENT_RESULT: FAILED`` verdict, carried into pr-fix via the
@@ -529,6 +591,8 @@ def _feedback_is_actionable(feedback: str | None) -> bool:
     """
     delivered = (feedback or "").strip()
     if _AGENT_ECHO_RE.search(delivered):
+        return False
+    if _feedback_is_approval_only(delivered):
         return False
     return bool(delivered) and delivered != "No specific feedback found."
 
@@ -6066,14 +6130,16 @@ class OrchestratorService:
                             # when actionable feedback was actually delivered to
                             # the agent (see ``_feedback_is_actionable``). A skip
                             # with no feedback injected — the reviewer's review
-                            # still streaming in, an empty retry, or bot chatter
-                            # that aggregated to nothing — is benign (the agent
-                            # correctly had nothing to do) and must not burn the
-                            # cap. Task 9c7c28e9: in-progress-review skips plus an
-                            # empty retry tripped the cap ~38s before the real
-                            # review posted, blocking the task with its findings
-                            # unhandled. The cap's intent is "agent keeps dodging
-                            # REAL feedback," which requires real feedback present.
+                            # still streaming in, an empty retry, bot chatter
+                            # that aggregated to nothing, or an aggregate that is
+                            # a bare approval (task 28a6f847 / PR #41) — is benign
+                            # (the agent correctly had nothing to do) and must not
+                            # burn the cap. Task 9c7c28e9: in-progress-review skips
+                            # plus an empty retry tripped the cap ~38s before the
+                            # real review posted, blocking the task with its
+                            # findings unhandled. The cap's intent is "agent keeps
+                            # dodging REAL feedback," which requires real feedback
+                            # present.
                             feedback_was_actionable = _feedback_is_actionable(info.feedback)
                             prev_skipped = int(item.metadata.get("pr_fix_consecutive_skipped", 0))
                             new_skipped = prev_skipped + 1 if feedback_was_actionable else prev_skipped

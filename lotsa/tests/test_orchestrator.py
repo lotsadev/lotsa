@@ -1156,6 +1156,120 @@ class TestFeedbackIsActionable:
         )
         assert _feedback_is_actionable(verdict) is True
 
+    # ── Approval-only aggregated feedback is benign (task 28a6f847 / PR #41) ──
+    # A review bot repeatedly posted an APPROVED review with body text ("No
+    # issues found."). ``aggregate_feedback`` folds APPROVED bodies into a
+    # ``### Review Body Comments`` section, so each poll classified it as
+    # FEEDBACK, dispatched pr-fix, which correctly SKIPPED — but the skip was
+    # counted as actionable, so three in a row tripped ``max_consecutive_skipped``
+    # and false-blocked the task. A reviewer approving the PR is the opposite of
+    # an agent dodging requested changes, so such a skip must be benign.
+    # The markdown shapes below match ``aggregate_feedback``'s output exactly
+    # (see lotsa/tests/test_pr_monitor.py::test_aggregate_feedback_*).
+
+    def test_approval_only_review_body_is_benign(self):
+        """A pure bot APPROVED aggregate must not count toward the skip cap.
+
+        RED against pre-fix code: ``_feedback_is_actionable`` only treats
+        empty/sentinel/``COMPLETED``-echo feedback as benign, so an approval
+        aggregate (none of those) returns True and the skip burns the cap.
+        """
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        approval = "### Review Body Comments\n\n**bot** (APPROVED): No issues found."
+        assert _feedback_is_actionable(approval) is False
+
+    def test_approval_with_actionable_section_is_actionable(self):
+        """An approval body *plus* an actionable section stays actionable — the
+        approve-with-a-caveat case still reaches (and can be re-skipped by) the
+        agent. Guards the fix from over-broadening: presence of any actionable
+        section disqualifies the benign verdict."""
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        mixed = (
+            "### Review Body Comments\n\n**bot** (APPROVED): LGTM overall.\n\n---\n\n"
+            "### Inline Comments\n\n**carol** on `foo.py` line 42:\n> rename this"
+        )
+        assert _feedback_is_actionable(mixed) is True
+
+    def test_commented_review_body_is_actionable(self):
+        """A COMMENTED review body is substantive reviewer input — actionable,
+        even though it shares the ``### Review Body Comments`` header with an
+        approval. Its ``(COMMENTED)`` marker must keep it counting."""
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        commented = "### Review Body Comments\n\n**carol** (COMMENTED): Consider another approach."
+        assert _feedback_is_actionable(commented) is True
+
+    def test_approval_plus_commented_body_is_actionable(self):
+        """A section mixing an APPROVED and a COMMENTED body is actionable — the
+        COMMENTED entry disqualifies the benign verdict."""
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        mixed = (
+            "### Review Body Comments\n\n"
+            "**bot** (APPROVED): No issues found.\n"
+            "**carol** (COMMENTED): but reconsider the naming."
+        )
+        assert _feedback_is_actionable(mixed) is True
+
+    def test_review_decision_section_is_actionable(self):
+        """A CHANGES_REQUESTED review (``### Review Decision``) is actionable and
+        keeps burning the cap when repeatedly skipped."""
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        changes = "### Review Decision\n\nStatus: **CHANGES_REQUESTED**\n\n**bob:** Please fix the tests."
+        assert _feedback_is_actionable(changes) is True
+
+    def test_failing_checks_section_is_actionable(self):
+        """A ``### Failing Checks`` aggregate is actionable — an approval body is
+        never the only content when checks are red."""
+        from lotsa.orchestrator import _feedback_is_actionable
+
+        checks = "### Failing Checks\n\n- ci/lint\n- ci/test"
+        assert _feedback_is_actionable(checks) is True
+
+
+class TestFeedbackIsApprovalOnly:
+    """The pure helper recognising an approval-only ``aggregate_feedback``
+    payload (all review-body entries ``(APPROVED)``, no actionable section, no
+    ``(COMMENTED)`` entry). It underlies the approval-only benign case in
+    ``_feedback_is_actionable`` (task 28a6f847 / PR #41).
+
+    RED against pre-fix code: ``_feedback_is_approval_only`` does not exist yet,
+    so every test here fails at import.
+    """
+
+    def test_pure_approval_body_is_approval_only(self):
+        from lotsa.orchestrator import _feedback_is_approval_only
+
+        approval = "### Review Body Comments\n\n**bot** (APPROVED): No issues found."
+        assert _feedback_is_approval_only(approval) is True
+
+    def test_no_review_body_section_is_not_approval_only(self):
+        from lotsa.orchestrator import _feedback_is_approval_only
+
+        assert _feedback_is_approval_only("### PR Comments\n\n**dan:** please fix X") is False
+
+    def test_commented_entry_is_not_approval_only(self):
+        from lotsa.orchestrator import _feedback_is_approval_only
+
+        commented = "### Review Body Comments\n\n**carol** (COMMENTED): Consider another approach."
+        assert _feedback_is_approval_only(commented) is False
+
+    def test_approval_plus_actionable_section_is_not_approval_only(self):
+        from lotsa.orchestrator import _feedback_is_approval_only
+
+        mixed = (
+            "### Review Body Comments\n\n**bot** (APPROVED): LGTM overall.\n\n---\n\n### Failing Checks\n\n- ci/lint"
+        )
+        assert _feedback_is_approval_only(mixed) is False
+
+    def test_empty_string_is_not_approval_only(self):
+        from lotsa.orchestrator import _feedback_is_approval_only
+
+        assert _feedback_is_approval_only("") is False
+
 
 class TestGatherPendingPrFeedback:
     """retry/jump feedback re-resolution (fix #2): orchestrator re-aggregates the

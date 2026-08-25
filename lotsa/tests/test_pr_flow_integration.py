@@ -2213,3 +2213,201 @@ def test_pr_fix_skipped_writes_short_divider_and_single_reasoning(tmp_path):
             raise
     finally:
         loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Approval-only PR feedback must not burn the consecutive-skip cap
+# (task 28a6f847 / PR #41 — false-block regression).
+#
+# A review bot repeatedly posted an APPROVED review with body text ("No issues
+# found."). ``aggregate_feedback`` folds APPROVED bodies into a
+# ``### Review Body Comments`` section, so each poll classified it as FEEDBACK,
+# dispatched pr-fix, which correctly emitted AGENT_RESULT: SKIPPED — but the
+# skip was counted as *actionable*, so three in a row tripped
+# ``max_consecutive_skipped`` (default 3) and false-blocked the task with
+# "Agent skipped 3 reviewer comments in a row." A reviewer approving the PR is
+# the opposite of an agent dodging requested changes, so such a skip must be
+# benign for cap accounting.
+#
+# These drive the REAL drainer skip-accounting path (orchestrator.py) end to
+# end on the bundled ``build`` process, stubbing only the ``commit`` posthook's
+# git/publish (which the tmpdir can't satisfy) — the exact harness the existing
+# ``test_pr_fix_skipped_*`` tests above use.
+# ---------------------------------------------------------------------------
+
+
+def _skip_service_with_stubbed_commit(tmp_path, run, skip_reason):
+    """Full-process service whose pr-fix agent always emits AGENT_RESULT: SKIPPED
+    and whose ``commit`` posthook is stubbed to a no-op success.
+
+    Mirrors ``test_pr_fix_skipped_writes_short_divider_and_single_reasoning``'s
+    setup. The autouse ``_isolated_registry`` fixture restores the built-in
+    ``commit`` posthook (and ``push_pr`` tool) after the test.
+    """
+    from lotsa import registry as reg
+    from lotsa.registry import register_posthook
+    from lotsa.tests.test_orchestrator import FakeRunner
+    from lotsa.tools import ToolResult
+    from rigg.models import AgentResult
+
+    svc, db, _hang = _stub_full_process_service(tmp_path, run)
+
+    reg._POSTHOOKS.pop("commit", None)
+
+    async def stub_commit(ctx, config):
+        return ToolResult(success=True, output="no changes to commit", metadata={})
+
+    register_posthook("commit", stub_commit)
+
+    svc.runner = FakeRunner(
+        AgentResult(
+            success=True,
+            stdout=f"Triaged the feedback.\nAGENT_RESULT: SKIPPED: {skip_reason}\n",
+            stderr="",
+            return_code=0,
+            duration_ms=42,
+            cost_usd=0.001,
+            session_id="skip-sess",
+        )
+    )
+    return svc, db
+
+
+def _stage_waiting_pr_task(svc, run, title):
+    """Stage a task as if the pr_monitor engine had just parked it at
+    ``(state=wait_for_pr_signal, status=waiting_for_pr)``, with the pr-fix input
+    artifacts seeded so the dispatch is not short-circuited."""
+    task = run(
+        svc.db.create_task(
+            title,
+            state="wait_for_pr_signal",
+            status="waiting_for_pr",
+            metadata={"pr_number": 41, "github_owner": "o", "github_repo": "r"},
+        )
+    )
+    for art in ("spec", "plan"):
+        run(
+            svc.db.add_message(
+                task.id,
+                "agent",
+                art,
+                f"{art} content",
+                "artifact",
+                metadata={"artifact_name": art},
+            )
+        )
+    return task
+
+
+def _dispatch_skip_rounds(svc, run, task_id, feedback, rounds):
+    """Dispatch ``rounds`` consecutive pr-fix rounds, each delivering *feedback*
+    and each drained to completion. Stops early if the task leaves
+    ``waiting_for_pr`` (e.g. the cap fired and blocked it)."""
+    for _ in range(rounds):
+        current = run(svc.db.get_task(task_id))
+        if current.status != "waiting_for_pr":
+            break
+        run(svc.dispatch_pr_fix(task_id, feedback))
+        _drain_in_flight(run, svc, task_id)
+
+
+def test_approval_only_feedback_does_not_trip_consecutive_skip_cap(tmp_path):
+    """Three consecutive approval-only pr-fix rounds must NOT block the task.
+
+    Each round delivers a pure bot APPROVED review body (the exact payload PR #41
+    re-fired); the agent SKIPS. Because the feedback is approval-only — no
+    requested change — the skip is benign: ``pr_fix_consecutive_skipped`` must
+    stay 0, the task must remain ``waiting_for_pr``, and no cap-fire
+    ``pr_decision(blocked)`` row may be written.
+
+    RED against pre-fix code: an approval aggregate is treated as actionable, so
+    the counter reaches 3 on round 3, ``max_consecutive_skipped`` fires, and the
+    task blocks with "Agent skipped 3 reviewer comments in a row (cap=3)". The
+    three assertions below (counter==0, status==waiting_for_pr, no cap message)
+    all fail. (Verified against the pre-fix drainer during authoring.)
+    """
+    import asyncio
+
+    # aggregate_feedback's exact rendering for a bot APPROVED review with a body:
+    # a single "### Review Body Comments" section, entry "**{author}** (APPROVED): {body}".
+    approval_only = "### Review Body Comments\n\n**review-bot** (APPROVED): No issues found."
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        svc, db = _skip_service_with_stubbed_commit(
+            tmp_path, run, "reviewer approved (bot review, no actionable findings)"
+        )
+        try:
+            run(svc.start())
+            try:
+                task = _stage_waiting_pr_task(svc, run, "Approval-only skip regression")
+                _dispatch_skip_rounds(svc, run, task.id, approval_only, rounds=3)
+
+                row = run(svc.db.get_task(task.id))
+                assert row.metadata.get("pr_fix_consecutive_skipped", 0) == 0, (
+                    "approval-only skips must not increment the consecutive-skip "
+                    f"counter, got {row.metadata.get('pr_fix_consecutive_skipped')!r}"
+                )
+                assert row.status == "waiting_for_pr", (
+                    f"approval-only skips must not block the task, got status={row.status!r}"
+                )
+                assert row.state == "wait_for_pr_signal", (
+                    f"task must stay parked at the monitor state, got state={row.state!r}"
+                )
+                decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
+                assert not any("reviewer comments in a row" in (m.content or "") for m in decisions), (
+                    "no consecutive-skip cap message may be written for approval-only feedback"
+                )
+                assert not any((m.metadata or {}).get("decision") == "blocked" for m in decisions), (
+                    "no pr_decision(blocked) row may be written for approval-only feedback"
+                )
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+    finally:
+        loop.close()
+
+
+def test_actionable_feedback_still_trips_consecutive_skip_cap(tmp_path):
+    """Guard: genuine feedback repeatedly skipped STILL trips the cap.
+
+    Same harness and skip stub, but each round delivers a real PR comment
+    (``### PR Comments``). After ``max_consecutive_skipped`` (3) rounds the task
+    must block with the cap message — proving the approval-only carve-out did not
+    disarm the cap for actionable feedback. Passes both pre- and post-fix (a
+    behaviour-preservation guard, not a RED test).
+    """
+    import asyncio
+
+    actionable = "### PR Comments\n\n**dan:** Please rename the helper before merge."
+
+    loop = asyncio.new_event_loop()
+    try:
+        run = loop.run_until_complete
+        svc, db = _skip_service_with_stubbed_commit(tmp_path, run, "declining to act")
+        try:
+            run(svc.start())
+            try:
+                task = _stage_waiting_pr_task(svc, run, "Actionable skip cap guard")
+                _dispatch_skip_rounds(svc, run, task.id, actionable, rounds=3)
+
+                row = run(svc.db.get_task(task.id))
+                assert row.status == "blocked", (
+                    f"three consecutive actionable skips must trip the cap and block, got status={row.status!r}"
+                )
+                decisions = run(svc.db.get_messages(task.id, msg_type="pr_decision"))
+                assert any("reviewer comments in a row" in (m.content or "") for m in decisions), (
+                    "the consecutive-skip cap message must be written when actionable feedback is skipped 3x"
+                )
+            finally:
+                run(svc.shutdown())
+                run(db.close())
+        except Exception:
+            run(db.close())
+            raise
+    finally:
+        loop.close()
