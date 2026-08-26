@@ -8,6 +8,7 @@ directory is mounted as a volume at ``/workspace`` inside the container.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import subprocess
@@ -18,6 +19,16 @@ from rigg import CLI_DISPATCH_SHAPE_FRAGMENT, parse_claude_output
 from rigg.models import ActivityResult, AgentResult
 
 logger = logging.getLogger(__name__)
+
+# How often the idle watchdog re-reads the liveness probe. Cheap (one directory
+# stat walk over a single-project tree), so the resolution cost is negligible
+# next to the minutes-scale windows it enforces. Module-level so tests can
+# shrink it.
+_WATCHDOG_POLL_SECONDS = 15.0
+
+# The container's cwd, and therefore the encoded project-directory name Claude
+# Code writes its session JSONL under inside the mounted HOME.
+_CONTAINER_WORKDIR = Path("/workspace")
 
 # Auth env vars that Claude Code recognises.
 # At least one of ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN must be set.
@@ -94,8 +105,28 @@ class DockerAgentRunner:
         timeout_seconds: int = 3600,
         session_id: str | None = None,
         model: str | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> AgentResult:
-        """Run claude inside a Docker container with work_dir mounted."""
+        """Run claude inside a Docker container with work_dir mounted.
+
+        Two independent deadlines, both of which stop the *container* and not
+        merely the ``docker run`` client:
+
+        * ``idle_timeout_seconds`` — the useful one. The container emits nothing
+          on stdout until it exits (``--output-format json`` is a single blob),
+          so wall-clock is blind to the difference between a step doing 40
+          minutes of real work and one wedged at minute three. The session JSONL
+          under the mounted HOME *is* appended as the agent works, so the
+          watchdog kills only when that has gone quiet for the whole window.
+          ``None`` disables it (wall-clock only, the pre-fix shape).
+        * ``timeout_seconds`` — a backstop for the case the probe itself is
+          unavailable (no session file ever written, an unreadable mount).
+
+        Prod incident ``f22e232b``: before this, the only deadline was the
+        signature's own 3600s default — never overridden by the orchestrator —
+        and reaching it killed the client while the container ran on for
+        another 7m39s, still writing into a worktree already marked failed.
+        """
         # Per-step override (ADR-022): when set, this one invocation runs
         # against ``model`` instead of the construction-time default.
         effective_model = model or self._model
@@ -117,10 +148,20 @@ class DockerAgentRunner:
         git_common = self._git_common_dir(wt)
         git_mount = ["-v", f"{git_common}:{git_common}"] if git_common else []
 
+        # Capture the container id so a timeout can stop the *container*.
+        # Killing the ``docker run`` client (all ``subprocess`` timeouts do)
+        # leaves the daemon's container running. Docker refuses to start if the
+        # cidfile already exists, so clear a stale one from a prior run.
+        cid_path = agent_home / "container.cid"
+        with contextlib.suppress(OSError):
+            cid_path.unlink(missing_ok=True)
+
         cmd = [
             "docker",
             "run",
             "--rm",
+            "--cidfile",
+            str(cid_path),
             # Run as the host (lotsa) uid so files written to the bind mounts —
             # the worktree AND the session HOME — are owned by, and writable by,
             # the host user. The image's default uid (1000) can't write the
@@ -178,6 +219,16 @@ class DockerAgentRunner:
         )
 
         start = time.monotonic()
+        # The watchdog reports through this holder rather than a return value:
+        # the run can finish either by the container exiting on its own or by
+        # the watchdog killing it, and the caller has to tell those apart after
+        # the fact (a killed container still returns *a* completed process).
+        idle_kill: dict[str, float] = {}
+        watchdog = (
+            asyncio.create_task(self._idle_watchdog(cid_path, agent_home, idle_timeout_seconds, idle_kill))
+            if idle_timeout_seconds
+            else None
+        )
         try:
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -189,6 +240,22 @@ class DockerAgentRunner:
                 ),
             )
             elapsed_ms = int((time.monotonic() - start) * 1000)
+
+            if idle_kill:
+                # We stopped it. Whatever the client reported is the corpse of
+                # our own kill, not a verdict on the work — report the timeout.
+                return AgentResult(
+                    success=False,
+                    stdout="",
+                    stderr=(
+                        f"Docker container killed after {idle_kill['idle']:g}s with no agent activity "
+                        f"(idle timeout). The agent wrote nothing to its session log for that whole "
+                        f"window, so it was treated as wedged rather than working."
+                    ),
+                    return_code=-1,
+                    duration_ms=elapsed_ms,
+                    model=effective_model,
+                )
 
             parsed = parse_claude_output(result.stdout)
 
@@ -206,6 +273,10 @@ class DockerAgentRunner:
             )
         except subprocess.TimeoutExpired:
             elapsed_ms = int((time.monotonic() - start) * 1000)
+            # The client is dead; the container is not. Stop it explicitly.
+            # The brief wait covers a container still being created as the
+            # deadline landed — unlike the watchdog, this path has no retry.
+            await self._kill_container(cid_path, wait_seconds=5.0)
             return AgentResult(
                 success=False,
                 stdout="",
@@ -216,6 +287,116 @@ class DockerAgentRunner:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"docker not found: {exc}") from exc
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
+            with contextlib.suppress(OSError):
+                cid_path.unlink(missing_ok=True)
+
+    async def _idle_watchdog(
+        self,
+        cid_path: Path,
+        agent_home: Path,
+        idle_timeout_seconds: float,
+        report: dict[str, float],
+    ) -> None:
+        """Kill the container once agent activity has been quiet too long.
+
+        The liveness probe is the session JSONL's mtime under the per-task
+        mounted HOME (``rigg.activity.last_activity_mtime``) — the same file the
+        Activity tab reads. Before the agent has written anything, the run's own
+        start time stands in, so a container that dies silently at startup is
+        still bounded by the idle window rather than the wall-clock backstop.
+
+        Scoped to the container's own ``/workspace`` project directory: the
+        mounted HOME belongs to exactly one task, and scoping keeps the probe
+        honest if that ever stops being true.
+
+        Never raises — an unreadable probe reports ``None``, which is treated as
+        "no evidence yet" (fall back to the start time), never as a reason to
+        kill. Cancelled by ``run``'s ``finally`` on every normal exit.
+        """
+        from rigg.activity import encode_cwd, last_activity_mtime
+
+        projects_root = agent_home / ".claude" / "projects"
+        project_dir = encode_cwd(_CONTAINER_WORKDIR)
+        started = time.time()
+        while True:
+            await asyncio.sleep(_WATCHDOG_POLL_SECONDS)
+            last = await asyncio.to_thread(last_activity_mtime, projects_root, project_dir)
+            quiet_for = time.time() - (last if last is not None else started)
+            if quiet_for < idle_timeout_seconds:
+                continue
+            logger.warning(
+                "Agent idle for %.0fs (limit %.0fs) — killing container; agent home=%s",
+                quiet_for,
+                idle_timeout_seconds,
+                agent_home,
+            )
+            if not await self._kill_container(cid_path):
+                # No container to kill *yet*. Docker writes the cidfile when it
+                # creates the container, which a slow image pull delays — and a
+                # pull produces no agent activity, so this watchdog fires on
+                # exactly that. Keep looping instead of returning: reporting a
+                # kill we did not perform would discard the run's real result
+                # (a successful one included) and leave the container running
+                # unsupervised — the very leak this watchdog exists to close.
+                logger.warning("No container to kill yet (cidfile not written) — will retry next poll")
+                continue
+            report["idle"] = idle_timeout_seconds
+            return
+
+    @staticmethod
+    async def _kill_container(cid_path: Path, wait_seconds: float = 0.0) -> bool:
+        """``docker kill`` the container named by *cid_path*; report whether it landed.
+
+        Returns ``True`` only when a kill was actually issued against a real
+        container id. **Callers must not claim a kill on ``False``** — the
+        cidfile is written when Docker *creates* the container, so an absent one
+        means either "not started yet" (a slow image pull) or "already exited
+        and ``--rm`` cleaned up". Treating those as a successful kill is how a
+        healthy run gets its result thrown away and a container gets left
+        running unsupervised (PR #45 review).
+
+        *wait_seconds* polls briefly for a cidfile that may still be on its way.
+        Used by the wall-clock path, which is terminal and has no other retry;
+        the idle watchdog passes 0 because its own poll loop is the retry.
+
+        Argv tokens via the async subprocess API, no shell (Constitution §1.1 /
+        §2.1) — the container id is daemon-generated hex, but it is passed as a
+        separate positional token regardless.
+        """
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                cid = cid_path.read_text().strip()
+            except OSError:
+                cid = ""
+            if cid:
+                break
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(0.25, max(0.01, wait_seconds / 10)))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker",
+                "kill",
+                cid,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _out, err = await proc.communicate()
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not kill container %s: %s", cid[:12], exc)
+            return False
+        if proc.returncode != 0:
+            # Commonly "No such container" — it exited between the deadline and
+            # the kill. Worth a line, never worth raising over. Still ``True``:
+            # a kill was issued and the container is not running.
+            logger.warning("docker kill %s returned %s: %s", cid[:12], proc.returncode, err.decode().strip()[:200])
+        return True
 
     @staticmethod
     def _git_common_dir(work_dir: Path) -> Path | None:

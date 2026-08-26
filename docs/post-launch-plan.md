@@ -75,13 +75,23 @@ You cannot probe an app you cannot build, so Layer 0 lands before the probe.
    hooks by hand render as running none. Serialize from the `ResolvedJob`
    instead. Cosmetic — viewer accuracy only, no runtime effect.
 
+10. **Idle timeout for the native runner.** 🔴 `DockerAgentRunner` kills an
+    agent that has gone silent for `agent_idle_timeout_seconds`, using the
+    session log as a liveness probe and the container id as the kill handle.
+    `ClaudeCodeRunner` accepts the parameter but cannot enforce it: it executes
+    via `subprocess.run` in an executor, which exposes no process handle, so
+    native runs still get only the wall-clock ceiling. Closing it means
+    restructuring that call around `asyncio.create_subprocess_exec` (~13 tests
+    patch `subprocess.run` there). Lower priority because ADR-038 routes Linux
+    servers through Docker — native is the dev-machine path.
+
 ## Phase 4 — larger bets (revisit when the above is solid)
 
-10. **ADR-035 — Cross-repo coordinated changes (epic coordinator).** 🔴 Phased,
+11. **ADR-035 — Cross-repo coordinated changes (epic coordinator).** 🔴 Phased,
     post-launch.
-11. **ADR-016 — Task artifact persistence & PR-inclusion.** 🔴 (Accepted; only
+12. **ADR-016 — Task artifact persistence & PR-inclusion.** 🔴 (Accepted; only
     schema slots exist, no write path.)
-12. **ADR-026 — Orchestrator-managed background tasks.** 🔴 (Risky / undecided —
+13. **ADR-026 — Orchestrator-managed background tasks.** 🔴 (Risky / undecided —
     re-evaluate, don't build on inertia.)
 
 ---

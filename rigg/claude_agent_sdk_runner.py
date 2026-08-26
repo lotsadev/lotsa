@@ -166,6 +166,7 @@ class ClaudeAgentSDKRunner:
         work_dir: Path,
         allowed_tools: list[str] | None = None,
         timeout_seconds: int = 3600,
+        idle_timeout_seconds: float | None = None,  # accepted, not enforced — see ClaudeCodeRunner.run
         session_id: str | None = None,
         model: str | None = None,
     ) -> AgentResult:
