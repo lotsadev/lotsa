@@ -266,3 +266,83 @@ def test_secrets_are_not_swept_into_the_recovery_commit(tmp_path, _loop, run):
     assert "real_change.py" in committed
     assert ".env" not in committed, "the deny-list must still exclude secrets from a recovery commit"
     assert (wt / ".env").exists(), "excluded, not deleted"
+
+
+# ===========================================================================
+# 4. Every path that interrupts a running step, not just the failure drainer
+# ===========================================================================
+#
+# PR #48 review, Medium: the first cut preserved work only in the completion
+# drainer's ``not result.success`` branch. ``stop()`` cancels through
+# ``_cancel_in_flight``, which never reaches that branch (``_run_agent``
+# re-raises ``CancelledError`` without queuing a completion) — so an operator
+# clicking Stop mid-edit parked the task at ``blocked`` with a dirty worktree,
+# and a later Retry re-entered exactly the "local changes would be overwritten"
+# deadlock this PR exists to fix.
+#
+# The fix goes in ``_cancel_in_flight`` rather than in ``stop()``: it is the one
+# place that interrupts a running agent (shared by ``stop``/``archive``/
+# ``jump_to_step``/promotion), so no sibling path can drift out of sync — the
+# repo's "symmetric behaviour across sibling paths" rule.
+
+
+class BlockingRunner:
+    """Writes files, then blocks until cancelled — a step caught mid-edit."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    def dispatch_shape_prompt(self) -> str:
+        return ""
+
+    async def run(self, system_prompt, user_prompt, work_dir, **kwargs):
+        target = Path(work_dir) / "lotsa" / "half_written.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# operator hit Stop while this was being written\n")
+        self.started.set()
+        await asyncio.sleep(3600)  # cancelled by stop()
+        raise AssertionError("unreachable")
+
+
+def test_stop_preserves_the_work_it_interrupts(tmp_path, _loop, run):
+    """Stop → blocked must not leave a dirty tree for the next Retry to deadlock on."""
+    repo = _make_repo(tmp_path)
+    runner = BlockingRunner()
+    svc, db = _service(tmp_path, run, repo, runner)
+    try:
+        task = run(svc.create_task("do the thing", process_name="build"))
+
+        async def _stop_once_running() -> None:
+            await asyncio.wait_for(runner.started.wait(), timeout=10)
+            await asyncio.sleep(0.1)  # let the write land
+            await svc.stop(task.id)
+
+        run(_stop_once_running())
+        wt = svc.config.data_dir / "worktrees" / "default" / task.id
+        status = _git("status", "--porcelain", cwd=wt)
+        committed = _git("show", "--name-only", "--format=", "HEAD", cwd=wt)
+        row = run(db.get_task(task.id))
+    finally:
+        run(svc.shutdown())
+        run(db.close())
+
+    assert status == "", f"Stop must leave a clean tree, else Retry deadlocks on the sync; got:\n{status}"
+    assert "lotsa/half_written.py" in committed, "the interrupted work must be preserved, not discarded"
+    assert row.status == "blocked", "Stop must still park the task"
+
+
+def test_preservation_lives_in_the_shared_cancel_primitive(tmp_path, _loop, run):
+    """Structural guard: every interrupt path inherits preservation.
+
+    ``stop``/``archive``/``jump_to_step``/promotion all cancel through
+    ``_cancel_in_flight``. Preserving inside ``stop()`` alone would leave the
+    siblings free to drift — the bug class this repo calls out explicitly.
+    """
+    import inspect
+
+    from lotsa.orchestrator import OrchestratorService
+
+    src = inspect.getsource(OrchestratorService._cancel_in_flight)
+    assert "_preserve_failed_step_work" in src, (
+        "preservation belongs in the shared cancel primitive, not bolted onto one caller"
+    )

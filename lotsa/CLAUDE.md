@@ -644,8 +644,13 @@ raises, the task blocks, and Retry re-runs the same sync against the same dirty
 tree forever. Incident `f22e232b` stranded 671 lines of a PR-review response
 behind that loop until an operator committed them by ssh.
 
-So `_preserve_failed_step_work` commits whatever a failed step left, before the
-block CAS. Two rails, both load-bearing:
+So `_preserve_failed_step_work` commits whatever such a step left. It runs from
+**both** places a step can end early: the completion drainer's failure branch
+(crash / timeout / OOM) and `_cancel_in_flight` (operator Stop, archive, jump,
+promotion). Putting it in the shared cancel primitive rather than in `stop()`
+alone is deliberate — a cancelled step never queues a completion, so it never
+reaches the drainer, and patching one caller would leave the siblings free to
+drift. Two rails, both load-bearing:
 
 - **Only inside the task's own worktree.** A `needs_worktree: false` step
   (`chat`) runs in the *project root* — the operator's checkout. A `git add -A`
@@ -658,6 +663,11 @@ It never raises — an exception on the failure path would strand the task at
 `status=working` with no in-flight agent, trading a recoverable block for an
 unrecoverable hang. A clean tree is silent; a real recovery writes an audit row
 naming the commit and warning that the step didn't finish.
+
+Known gap: cancelling does **not** stop the agent's container, so a still-running
+agent can re-dirty the tree after the recovery commit. That captures the common
+case rather than closing the race — cancellation should kill the container the
+way a timeout now does (docs/post-launch-plan.md).
 
 When adding a new step-ending path, ask "does this leave the worktree clean?"
 

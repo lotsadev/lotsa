@@ -3202,12 +3202,29 @@ class OrchestratorService:
         Cancellation only abandons the asyncio task; the underlying
         ``subprocess.run`` thread (if any) keeps running and is reaped at the
         next orchestrator boundary — same semantics as ``shutdown()``.
+
+        **Preserves whatever the interrupted step had written** (PR #48 review).
+        A cancelled step never queues a completion, so it never reaches the
+        drainer's failure branch where preservation first landed — an operator
+        clicking Stop mid-edit parked the task at ``blocked`` with a dirty
+        worktree, and the next Retry re-entered the "local changes would be
+        overwritten" deadlock this all exists to prevent. Doing it *here*, in
+        the one place that interrupts a running agent, is what stops
+        ``stop``/``archive``/``jump_to_step``/promotion drifting apart — the
+        asymmetric-sibling-paths bug class.
+
+        Caveat, honestly: cancelling does not stop the agent's *container*, so a
+        still-running agent can write again after this commit and re-dirty the
+        tree. This captures the common case rather than closing the race; the
+        real fix is for cancellation to kill the container the way a timeout now
+        does (see docs/post-launch-plan.md).
         """
         info = self._in_flight.pop(task_id, None)
         if info is None:
             return None
         if info.task and not info.task.done():
             info.task.cancel()
+        await self._preserve_failed_step_work(info.item, info)
         return info
 
     async def stop(self, task_id: str) -> None:
@@ -5465,11 +5482,12 @@ class OrchestratorService:
         return created_path or wtm.get_path(item.id) or self._fallback_work_dir(item)
 
     async def _preserve_failed_step_work(self, item: Item, info: InFlightStep) -> None:
-        """Commit whatever a failed step left in its worktree (incident ``f22e232b``).
+        """Commit whatever an ended-early step left in its worktree (incident ``f22e232b``).
 
         The ``commit`` posthook only runs after a step *succeeds*. When a step
-        fails — a timeout kill, an OOM, a crashed runner — its edits stay
-        uncommitted, and nothing owns them. Every later lifecycle event then
+        ends any other way — a timeout kill, an OOM, a crashed runner, or an
+        operator pressing Stop — its edits stay uncommitted, and nothing owns
+        them. Every later lifecycle event then
         trips a precondition it silently assumes:
 
             git merge origin/main failed (no conflicts): error: Your local

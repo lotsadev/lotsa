@@ -85,13 +85,23 @@ You cannot probe an app you cannot build, so Layer 0 lands before the probe.
     patch `subprocess.run` there). Lower priority because ADR-038 routes Linux
     servers through Docker — native is the dev-machine path.
 
+11. **Cancellation should kill the agent's container.** 🔴 A timeout now stops
+    the container via `--cidfile` + `docker kill` (PR #45), but
+    `_cancel_in_flight` (operator Stop, archive, jump, promotion) only abandons
+    the asyncio task — the container keeps running and is reaped at the next
+    orchestrator boundary. Two consequences: an unsupervised agent keeps writing
+    into a worktree the orchestrator considers parked, and it can re-dirty the
+    tree after `_preserve_failed_step_work`'s recovery commit, so that
+    preservation covers the common case rather than closing the race. The kill
+    machinery already exists; it needs a handle reachable from the cancel path.
+
 ## Phase 4 — larger bets (revisit when the above is solid)
 
-11. **ADR-035 — Cross-repo coordinated changes (epic coordinator).** 🔴 Phased,
+12. **ADR-035 — Cross-repo coordinated changes (epic coordinator).** 🔴 Phased,
     post-launch.
-12. **ADR-016 — Task artifact persistence & PR-inclusion.** 🔴 (Accepted; only
+13. **ADR-016 — Task artifact persistence & PR-inclusion.** 🔴 (Accepted; only
     schema slots exist, no write path.)
-13. **ADR-026 — Orchestrator-managed background tasks.** 🔴 (Risky / undecided —
+14. **ADR-026 — Orchestrator-managed background tasks.** 🔴 (Risky / undecided —
     re-evaluate, don't build on inertia.)
 
 ---
