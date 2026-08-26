@@ -632,6 +632,35 @@ another branch, and only ever uses `git merge --ff-only` — it must never be
 able to destroy operator work. The orchestrator switches into the worktree for
 agent dispatch, push, and rebase operations.
 
+### A step that ends leaves a clean worktree
+
+The `commit` posthook only runs after a step *succeeds*. A step that fails — a
+timeout kill, an OOM, a crashed runner — used to leave its edits uncommitted and
+unowned, and every later lifecycle event then tripped a precondition it silently
+assumes. `git merge` refuses on a dirty tree ("local changes would be
+overwritten"), which is **not** a content conflict, so ADR-015's
+`resolve_conflicts` path can't apply (no unmerged paths): `_sync_branch_to_main`
+raises, the task blocks, and Retry re-runs the same sync against the same dirty
+tree forever. Incident `f22e232b` stranded 671 lines of a PR-review response
+behind that loop until an operator committed them by ssh.
+
+So `_preserve_failed_step_work` commits whatever a failed step left, before the
+block CAS. Two rails, both load-bearing:
+
+- **Only inside the task's own worktree.** A `needs_worktree: false` step
+  (`chat`) runs in the *project root* — the operator's checkout. A `git add -A`
+  there would sweep up their uncommitted work, strictly worse than the bug being
+  fixed. The work_dir is compared against `WorktreeManager.get_path`.
+- **Reuses `execute_commit`**, so a recovery commit passes the same secrets
+  deny-list as a normal one. Never a bespoke `git add -A`.
+
+It never raises — an exception on the failure path would strand the task at
+`status=working` with no in-flight agent, trading a recoverable block for an
+unrecoverable hang. A clean tree is silent; a real recovery writes an audit row
+naming the commit and warning that the step didn't finish.
+
+When adding a new step-ending path, ask "does this leave the worktree clean?"
+
 ### Restart is resumptive, not destructive (ADR-040)
 
 **The DB is the state of record; in-memory dicts/timers are caches only;
