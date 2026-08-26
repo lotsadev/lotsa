@@ -3224,7 +3224,16 @@ class OrchestratorService:
             return None
         if info.task and not info.task.done():
             info.task.cancel()
-        await self._preserve_failed_step_work(info.item, info)
+        if info.agent_result is None:
+            # Only genuinely-interrupted work. ``_run_agent`` sets
+            # ``agent_result`` and enqueues the completion, but the DB status
+            # stays ``working`` and this ``_in_flight`` entry stays present
+            # until the drainer — which runs serially and may be busy with
+            # another task — picks it up. A cancel landing in that window would
+            # otherwise commit a *successful* step's output and tell the
+            # operator it "ended before finishing". A result means the drainer
+            # owns this step's outcome, including preserving a failed one.
+            await self._preserve_failed_step_work(info.item, info)
         return info
 
     async def stop(self, task_id: str) -> None:
@@ -5555,19 +5564,34 @@ class OrchestratorService:
             return
 
         logger.info("Preserved uncommitted work for task %s as %s", item.id, outcome.sha)
-        await self.db.add_message(
-            item.id,
-            "system",
-            info.step.name,
-            (
-                f"The {info.step.name} step failed with uncommitted changes in its worktree. "
-                f"They were preserved as commit `{(outcome.sha or '')[:8]}` so the branch stays "
-                f"mergeable and the work carries into the next attempt — review it before relying on it, "
-                f"since the step did not finish."
-            ),
-            "status_change",
-            metadata={"recovered_commit_sha": outcome.sha, "step": info.step.name},
-        )
+        # The audit write gets its own guard: it is as capable of raising (a
+        # transient SQLite lock is enough) as the git sequence above, and
+        # ``jump_to_step`` CASes the *new* step to ``working`` BEFORE cancelling
+        # — so an exception escaping here aborts the jump before it dispatches,
+        # stranding the task at ``status=working`` with no in-flight agent. That
+        # is the exact outcome this function promises it cannot cause, so the
+        # promise has to cover every await in it, not just the git calls.
+        try:
+            await self.db.add_message(
+                item.id,
+                "system",
+                info.step.name,
+                (
+                    f"The {info.step.name} step ended before finishing, with uncommitted changes in "
+                    f"its worktree. They were preserved as commit `{(outcome.sha or '')[:8]}` so the "
+                    f"branch stays mergeable and the work carries into the next attempt — review it "
+                    f"before relying on it."
+                ),
+                "status_change",
+                metadata={"recovered_commit_sha": outcome.sha, "step": info.step.name},
+            )
+        except Exception:  # noqa: BLE001 — the commit landed; the notice isn't worth stranding a task
+            logger.warning(
+                "Preserved work for task %s as %s but could not record the audit notice",
+                item.id,
+                outcome.sha,
+                exc_info=True,
+            )
 
     async def _run_step_posthooks(self, item: Item, step: FlowStep, work_dir: Path) -> ToolResult | None:
         """Run *step*'s resolved posthooks in order (ADR-024).

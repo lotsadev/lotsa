@@ -346,3 +346,91 @@ def test_preservation_lives_in_the_shared_cancel_primitive(tmp_path, _loop, run)
     assert "_preserve_failed_step_work" in src, (
         "preservation belongs in the shared cancel primitive, not bolted onto one caller"
     )
+
+
+# ===========================================================================
+# 5. Two ways preservation could make things worse (PR #48 review, round 2)
+# ===========================================================================
+
+
+def _dirty_worktree_service(tmp_path, run):
+    """A started service with one task whose worktree has uncommitted changes."""
+    repo = _make_repo(tmp_path)
+    runner = DyingRunner()
+    svc, db = _service(tmp_path, run, repo, runner)
+    task = run(svc.create_task("do the thing", process_name="build"))
+    _settle(run, svc, db, task.id)
+    wt = svc.config.data_dir / "worktrees" / "default" / task.id
+    # The first dispatch already preserved; re-dirty it for these cases.
+    (wt / "lotsa" / "later_edit.py").write_text("# written after the recovery commit\n")
+    return svc, db, task, wt
+
+
+def test_a_failed_audit_write_never_escapes_preservation(tmp_path, _loop, run):
+    """The "never raises" guarantee has to cover the DB write too.
+
+    ``jump_to_step`` CASes the *new* step to ``working`` **before** calling
+    ``_cancel_in_flight``. If preservation raises there — a transient SQLite
+    lock on the audit INSERT is enough — the jump aborts before dispatching,
+    stranding the task at ``status=working`` with no in-flight agent: precisely
+    the failure this function's docstring promises it cannot cause.
+    """
+    from lotsa.orchestrator import InFlightStep, Item
+
+    svc, db, task, wt = _dirty_worktree_service(tmp_path, run)
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    fake_item = Item(id=task.id, state="planned", title="t", body="", metadata={})
+    flow_step = svc._resolve_flow(fake_item).steps[0]
+    info = InFlightStep(item=fake_item, step=flow_step, step_work_dir=wt)
+
+    original = svc.db.add_message
+    svc.db.add_message = boom  # type: ignore[method-assign]
+    try:
+        run(svc._preserve_failed_step_work(fake_item, info))  # must not raise
+    finally:
+        svc.db.add_message = original  # type: ignore[method-assign]
+        run(svc.shutdown())
+        run(db.close())
+
+    assert _git("status", "--porcelain", cwd=wt) == "", "the commit itself must still have landed"
+
+
+def test_cancelling_an_already_finished_step_does_not_claim_it_failed(tmp_path, _loop, run):
+    """A completion sits in ``_in_flight`` until the drainer picks it up.
+
+    ``_run_agent`` sets ``info.agent_result`` and enqueues, but the DB status
+    stays ``working`` and the ``_in_flight`` entry stays present until the
+    drainer — which processes serially and may be busy with another task —
+    dequeues it. A Stop landing in that window would otherwise commit a
+    *successful* step's work and write an audit row saying the step "did not
+    finish". Pre-PR that window was harmless; preservation put real side
+    effects in it.
+    """
+    from lotsa.orchestrator import InFlightStep, Item
+    from rigg.models import AgentResult
+
+    svc, db, task, wt = _dirty_worktree_service(tmp_path, run)
+    head_before = _git("rev-parse", "HEAD", cwd=wt)
+    try:
+        fake_item = Item(id=task.id, state="planned", title="t", body="", metadata={})
+        flow_step = svc._resolve_flow(fake_item).steps[0]
+        info = InFlightStep(item=fake_item, step=flow_step, step_work_dir=wt)
+        # The agent already finished successfully — just not drained yet.
+        info.agent_result = AgentResult(success=True, stdout="all good", stderr="", return_code=0, duration_ms=10)
+        svc._in_flight[task.id] = info
+
+        run(svc._cancel_in_flight(task.id))
+        messages = run(db.get_messages(task.id))
+    finally:
+        run(svc.shutdown())
+        run(db.close())
+
+    assert _git("rev-parse", "HEAD", cwd=wt) == head_before, (
+        "a step that already produced a result is not interrupted work — the drainer owns it"
+    )
+    assert not any("did not finish" in m.content for m in messages), (
+        "must not tell the operator a successful step failed"
+    )
