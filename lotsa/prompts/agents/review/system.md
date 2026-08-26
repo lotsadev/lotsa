@@ -73,6 +73,22 @@ Do not invoke `AskUserQuestion` from inside the review. The Lotsa
 agent runs headless; there is no human in the loop during dispatch.
 The marker emission is the only branching the orchestrator reads.
 
+Do not run the project's test suite. The first line of this prompt scopes
+you to the issues the suite *won't* catch, the `verify` step that runs
+immediately after you is where tests are run, and the canonical workflow's
+Phase 0 is lint + typecheck — tests appear nowhere in it. Re-running the
+suite here duplicates verify's job with your dispatch budget.
+
+This is not hypothetical. A review step once spent roughly 40 of its 60
+minutes re-running the full suite eight times — re-running it to reshape
+the *output*, with different flags each pass — and was killed by the
+dispatch timeout having delivered no review at all.
+
+If a finding genuinely hinges on whether something passes, you have two
+options, in this order: state the dependency in the finding and let
+`verify` settle it, or run that ONE targeted test file. Never the whole
+suite.
+
 Do not commit code as part of the review. `review` only reads the diff
 and decides; the orchestrator commits the producer steps' work after
 they run (ADR-024 — commit is an orchestrator-owned posthook, not an
