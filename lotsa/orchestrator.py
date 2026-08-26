@@ -3202,12 +3202,38 @@ class OrchestratorService:
         Cancellation only abandons the asyncio task; the underlying
         ``subprocess.run`` thread (if any) keeps running and is reaped at the
         next orchestrator boundary — same semantics as ``shutdown()``.
+
+        **Preserves whatever the interrupted step had written** (PR #48 review).
+        A cancelled step never queues a completion, so it never reaches the
+        drainer's failure branch where preservation first landed — an operator
+        clicking Stop mid-edit parked the task at ``blocked`` with a dirty
+        worktree, and the next Retry re-entered the "local changes would be
+        overwritten" deadlock this all exists to prevent. Doing it *here*, in
+        the one place that interrupts a running agent, is what stops
+        ``stop``/``archive``/``jump_to_step``/promotion drifting apart — the
+        asymmetric-sibling-paths bug class.
+
+        Caveat, honestly: cancelling does not stop the agent's *container*, so a
+        still-running agent can write again after this commit and re-dirty the
+        tree. This captures the common case rather than closing the race; the
+        real fix is for cancellation to kill the container the way a timeout now
+        does (see docs/post-launch-plan.md).
         """
         info = self._in_flight.pop(task_id, None)
         if info is None:
             return None
         if info.task and not info.task.done():
             info.task.cancel()
+        if info.agent_result is None:
+            # Only genuinely-interrupted work. ``_run_agent`` sets
+            # ``agent_result`` and enqueues the completion, but the DB status
+            # stays ``working`` and this ``_in_flight`` entry stays present
+            # until the drainer — which runs serially and may be busy with
+            # another task — picks it up. A cancel landing in that window would
+            # otherwise commit a *successful* step's output and tell the
+            # operator it "ended before finishing". A result means the drainer
+            # owns this step's outcome, including preserving a failed one.
+            await self._preserve_failed_step_work(info.item, info)
         return info
 
     async def stop(self, task_id: str) -> None:
@@ -4111,7 +4137,14 @@ class OrchestratorService:
                 # empty file set blocks the task on a phantom reason (finding #10).
                 # Abort the half-done merge and surface the real cause.
                 await _git("merge", "--abort")
-                raise RuntimeError(f"git merge origin/{branch} failed (no conflicts): {merge_err.strip()}")
+                raise RuntimeError(
+                    f"git merge origin/{branch} failed (no conflicts): {merge_err.strip()} — "
+                    "this is a dirty or locked worktree, not a content conflict, so "
+                    "``resolve_conflicts`` cannot apply. A failed step's leftovers are "
+                    "committed automatically (see ``_preserve_failed_step_work``), so reaching "
+                    "here means something else left the tree dirty; Retry will hit the same "
+                    "merge until the worktree is clean."
+                )
             return SyncResult(status="conflicts", conflicting_files=conflicting)
 
         # 5. Clean merge — push the merged ref to the task's PR branch. The PR
@@ -5457,6 +5490,109 @@ class OrchestratorService:
 
         return created_path or wtm.get_path(item.id) or self._fallback_work_dir(item)
 
+    async def _preserve_failed_step_work(self, item: Item, info: InFlightStep) -> None:
+        """Commit whatever an ended-early step left in its worktree (incident ``f22e232b``).
+
+        The ``commit`` posthook only runs after a step *succeeds*. When a step
+        ends any other way — a timeout kill, an OOM, a crashed runner, or an
+        operator pressing Stop — its edits stay uncommitted, and nothing owns
+        them. Every later lifecycle event then
+        trips a precondition it silently assumes:
+
+            git merge origin/main failed (no conflicts): error: Your local
+            changes to the following files would be overwritten by merge
+
+        That is not a content conflict, so ADR-015's ``resolve_conflicts`` path
+        cannot apply (no unmerged paths) — ``_sync_branch_to_main`` raises, the
+        task blocks, and Retry re-runs the same sync against the same dirty tree
+        forever. In the incident 671 lines of a PR-review response sat stranded
+        behind that loop until an operator committed them by hand.
+
+        So the invariant is restored at the source: **a step that ends leaves a
+        clean tree**, succeeded or not. The work survives into the next round
+        rather than being discarded, which also matches ADR-040's "at-least-once
+        dispatch is safe" posture — the next attempt starts from what the last
+        one actually achieved.
+
+        Two rails:
+
+        * **Only ever inside the task's own worktree.** A ``needs_worktree:
+          false`` step (``chat``) runs in the *project root* — the operator's own
+          checkout. A ``git add -A`` there would sweep up their uncommitted work,
+          which is strictly worse than the bug being fixed. The work_dir is
+          compared against the manager's ``get_path``; anything else is skipped.
+        * **Reuses ``execute_commit``**, so a recovery commit passes the same
+          secrets deny-list as a normal one. No bespoke ``git add -A`` here.
+
+        Never raises: this runs on the failure path, and an exception escaping
+        it would strand the task at ``status=working`` with no in-flight agent —
+        replacing a recoverable block with an unrecoverable hang.
+        """
+        work_dir = info.step_work_dir
+        if work_dir is None:
+            return
+        try:
+            wtm = self._worktree_manager_for_task(item)
+            task_worktree = wtm.get_path(item.id)
+            if task_worktree is None or Path(work_dir).resolve() != Path(task_worktree).resolve():
+                # Worktree-less step (chat, or a degraded prehook) — this is the
+                # project root, not ours to commit in.
+                return
+
+            from lotsa.commit_step import execute_commit
+
+            row = await self.db.get_task(item.id)
+            title = (row.title if row is not None else item.title) or item.id
+            outcome = await execute_commit(
+                work_dir=Path(work_dir),
+                task_id=item.id,
+                task_title=title,
+                step_name=f"{info.step.name} — recovered after failure",
+            )
+        except Exception:  # noqa: BLE001 — preservation is best-effort; the block must still land
+            logger.warning(
+                "Could not preserve uncommitted work for task %s step %s",
+                item.id,
+                info.step.name,
+                exc_info=True,
+            )
+            return
+
+        if not outcome.committed:
+            # Clean tree — the overwhelmingly common case (gate steps, agents
+            # that failed before writing). Say nothing.
+            return
+
+        logger.info("Preserved uncommitted work for task %s as %s", item.id, outcome.sha)
+        # The audit write gets its own guard: it is as capable of raising (a
+        # transient SQLite lock is enough) as the git sequence above, and
+        # ``jump_to_step`` CASes the *new* step to ``working`` BEFORE cancelling
+        # — so an exception escaping here aborts the jump before it dispatches,
+        # stranding the task at ``status=working`` with no in-flight agent. That
+        # is the exact outcome this function promises it cannot cause, so the
+        # promise has to cover every await in it, not just the git calls.
+        try:
+            await self.db.add_message(
+                item.id,
+                "system",
+                info.step.name,
+                (
+                    f"The {info.step.name} step ended before finishing, with uncommitted changes in "
+                    f"its worktree. They were preserved as commit `{(outcome.sha or '')[:8]}` so the "
+                    f"branch stays mergeable and the work carries into the next attempt — review it "
+                    f"before relying on it."
+                ),
+                "status_change",
+                metadata={"recovered_commit_sha": outcome.sha, "step": info.step.name},
+            )
+        except Exception:  # noqa: BLE001 — the commit landed; the notice isn't worth stranding a task
+            logger.warning(
+                "Preserved work for task %s as %s but could not record the audit notice",
+                item.id,
+                outcome.sha,
+                exc_info=True,
+            )
+
     async def _run_step_posthooks(self, item: Item, step: FlowStep, work_dir: Path) -> ToolResult | None:
         """Run *step*'s resolved posthooks in order (ADR-024).
 
@@ -5751,6 +5887,10 @@ class OrchestratorService:
                     if self.flow is None:
                         raise RuntimeError("OrchestratorService not started")
                     err_msg = _summarize_agent_error(result.return_code, result.stderr)
+                    # A failed step never reaches its commit posthook, so any work
+                    # it left is uncommitted and unowned. Preserve it BEFORE the
+                    # block CAS so the worktree is clean for whatever runs next.
+                    await self._preserve_failed_step_work(item, info)
                     # Validate against the active flow's SM — a sub-flow-only
                     # agent step whose ``active_state`` isn't stitched into
                     # main's SM (custom processes only; the bundled ``build``
