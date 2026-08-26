@@ -720,9 +720,15 @@ longest pause in agent thinking: the session log advances when a tool call
 Don't tighten it below that without a finer liveness signal (`--output-format
 stream-json` read incrementally would be one).
 
-A timeout runs `docker kill` against the id captured via `--cidfile`. This is
-not optional bookkeeping: `subprocess`-level timeouts kill the `docker run`
-*client*, and the daemon's container keeps going. In incident `f22e232b` it ran
+A timeout runs `docker kill` against the id captured via `--cidfile`, and
+**only reports a kill that actually landed** — Docker writes the cidfile when it
+*creates* the container, so an absent one means "not started yet" (a slow image
+pull, which produces no agent activity and therefore trips the idle watchdog) or
+"already exited". Claiming a kill there would discard the run's real result,
+successful ones included. The watchdog retries on its next poll; the wall-clock
+path waits briefly, having no other retry. This is not optional bookkeeping:
+`subprocess`-level timeouts kill the `docker run` *client*, and the daemon's
+container keeps going. In incident `f22e232b` it ran
 7m39s past the deadline, still writing into a worktree the orchestrator had
 already marked failed. `ClaudeCodeRunner` accepts `idle_timeout_seconds` but
 does not yet enforce it (no process handle through `subprocess.run`) — see

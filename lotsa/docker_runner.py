@@ -274,7 +274,9 @@ class DockerAgentRunner:
         except subprocess.TimeoutExpired:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             # The client is dead; the container is not. Stop it explicitly.
-            await self._kill_container(cid_path)
+            # The brief wait covers a container still being created as the
+            # deadline landed — unlike the watchdog, this path has no retry.
+            await self._kill_container(cid_path, wait_seconds=5.0)
             return AgentResult(
                 success=False,
                 stdout="",
@@ -325,36 +327,58 @@ class DockerAgentRunner:
             await asyncio.sleep(_WATCHDOG_POLL_SECONDS)
             last = await asyncio.to_thread(last_activity_mtime, projects_root, project_dir)
             quiet_for = time.time() - (last if last is not None else started)
-            if quiet_for >= idle_timeout_seconds:
-                logger.warning(
-                    "Agent idle for %.0fs (limit %.0fs) — killing container; agent home=%s",
-                    quiet_for,
-                    idle_timeout_seconds,
-                    agent_home,
-                )
-                report["idle"] = idle_timeout_seconds
-                await self._kill_container(cid_path)
-                return
+            if quiet_for < idle_timeout_seconds:
+                continue
+            logger.warning(
+                "Agent idle for %.0fs (limit %.0fs) — killing container; agent home=%s",
+                quiet_for,
+                idle_timeout_seconds,
+                agent_home,
+            )
+            if not await self._kill_container(cid_path):
+                # No container to kill *yet*. Docker writes the cidfile when it
+                # creates the container, which a slow image pull delays — and a
+                # pull produces no agent activity, so this watchdog fires on
+                # exactly that. Keep looping instead of returning: reporting a
+                # kill we did not perform would discard the run's real result
+                # (a successful one included) and leave the container running
+                # unsupervised — the very leak this watchdog exists to close.
+                logger.warning("No container to kill yet (cidfile not written) — will retry next poll")
+                continue
+            report["idle"] = idle_timeout_seconds
+            return
 
     @staticmethod
-    async def _kill_container(cid_path: Path) -> None:
-        """Best-effort ``docker kill`` of the container named by *cid_path*.
+    async def _kill_container(cid_path: Path, wait_seconds: float = 0.0) -> bool:
+        """``docker kill`` the container named by *cid_path*; report whether it landed.
 
-        Split out so both deadlines share one kill path, and so tests can
-        observe the kill without a docker daemon. Silent when the cidfile is
-        absent (the container never started, or already exited and ``--rm``
-        cleaned up) — there is nothing to kill and nothing to report.
+        Returns ``True`` only when a kill was actually issued against a real
+        container id. **Callers must not claim a kill on ``False``** — the
+        cidfile is written when Docker *creates* the container, so an absent one
+        means either "not started yet" (a slow image pull) or "already exited
+        and ``--rm`` cleaned up". Treating those as a successful kill is how a
+        healthy run gets its result thrown away and a container gets left
+        running unsupervised (PR #45 review).
+
+        *wait_seconds* polls briefly for a cidfile that may still be on its way.
+        Used by the wall-clock path, which is terminal and has no other retry;
+        the idle watchdog passes 0 because its own poll loop is the retry.
 
         Argv tokens via the async subprocess API, no shell (Constitution §1.1 /
         §2.1) — the container id is daemon-generated hex, but it is passed as a
         separate positional token regardless.
         """
-        try:
-            cid = cid_path.read_text().strip()
-        except OSError:
-            return
-        if not cid:
-            return
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                cid = cid_path.read_text().strip()
+            except OSError:
+                cid = ""
+            if cid:
+                break
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(0.25, max(0.01, wait_seconds / 10)))
         try:
             proc = await asyncio.create_subprocess_exec(
                 "docker",
@@ -366,11 +390,13 @@ class DockerAgentRunner:
             _out, err = await proc.communicate()
         except (OSError, ValueError) as exc:
             logger.warning("Could not kill container %s: %s", cid[:12], exc)
-            return
+            return False
         if proc.returncode != 0:
             # Commonly "No such container" — it exited between the deadline and
-            # the kill. Worth a line, never worth raising over.
+            # the kill. Worth a line, never worth raising over. Still ``True``:
+            # a kill was issued and the container is not running.
             logger.warning("docker kill %s returned %s: %s", cid[:12], proc.returncode, err.decode().strip()[:200])
+        return True
 
     @staticmethod
     def _git_common_dir(work_dir: Path) -> Path | None:

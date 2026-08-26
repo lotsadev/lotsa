@@ -1538,8 +1538,15 @@ class OrchestratorService:
         """Classify *elapsed_s* against the active *step*'s soft-timeout thresholds.
 
         ``over`` (red) wins over ``warn`` (yellow); a missing step or unset
-        threshold yields ``ok`` (no dot). Informational only — ADR-017 ships the
-        indicator, not auto-kill, so ``timeout_kill_seconds`` just drives the dot.
+        threshold yields ``ok`` (no dot).
+
+        This classification is informational — it drives the ADR-017 Activity
+        dot and nothing else. ``timeout_kill_seconds`` itself is no longer
+        decorative, though: ``_run_agent`` passes it to the runner as that
+        step's wall-clock kill deadline (falling back to
+        ``config.agent_timeout_seconds``), so the field now sets a real
+        deadline *and* colours the dot, and the dot goes red exactly when the
+        agent is killed. The kill is enforced by the runner, not here.
         """
         if step is None:
             return "ok"
