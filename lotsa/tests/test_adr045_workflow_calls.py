@@ -607,3 +607,358 @@ def test_pr_monitor_has_no_agent_route_to_terminate_on_approval():
             f"{rj.name} routes to terminate; approval/feedback branches must stay local — "
             "only merged/closed terminate, via the untouched ADR-030 terminal CAS"
         )
+
+
+# ===========================================================================
+# L. Runtime stack semantics — complete pops, terminate unwinds, call dispatches
+#
+# The topology/parse tests above prove the graph is shaped right; these prove
+# the RUNTIME is wired to it. The review flagged that ``pop_frame`` had zero
+# production callers, that a ``terminate`` catch was treated as a file path, and
+# that an agent step routing to ``call``/``terminate``/``complete`` fell through
+# to the "no SM edge" strand-warning and stalled at ``status="working"``. Each
+# test below fails against that pre-wiring code.
+# ===========================================================================
+
+
+class _CompletedRunner:
+    """Agent runner that emits ``AGENT_RESULT: COMPLETED`` (drives the drainer's
+    rule-match → route path end-to-end)."""
+
+    def __init__(self) -> None:
+        from rigg.models import AgentResult
+
+        self.result = AgentResult(
+            success=True, stdout="AGENT_RESULT: COMPLETED\n", stderr="", return_code=0, duration_ms=5
+        )
+
+    def dispatch_shape_prompt(self) -> str:
+        return ""
+
+    async def run(self, system_prompt, user_prompt, work_dir, **kwargs):
+        return self.result
+
+
+class _HangRunner:
+    """Agent runner whose ``run`` never returns within a test — so a step
+    dispatched as a side effect stays put and the row under assertion is stable."""
+
+    def dispatch_shape_prompt(self) -> str:
+        return ""
+
+    async def run(self, system_prompt, user_prompt, work_dir, **kwargs):
+        import asyncio
+
+        await asyncio.Event().wait()  # never set
+
+
+def _item_from(row):
+    return Item(id=row.id, state=row.state, title=row.title, body=row.body, metadata=row.metadata)
+
+
+def _seed(svc, run, *, state, current_step, stack, status="working", extra=None):
+    metadata = {"process_name": stack[0]["workflow"], "call_stack": stack}
+    if extra:
+        metadata.update(extra)
+    return run(
+        svc.db.create_task(
+            f"seed-{current_step}",
+            state=state,
+            status=status,
+            current_step=current_step,
+            metadata=metadata,
+        )
+    )
+
+
+def _wf_names(row):
+    return [f["workflow"] for f in (row.metadata.get("call_stack") or [])]
+
+
+def test_complete_at_root_frame_ends_the_task(tmp_path, run):
+    """``complete`` on a depth-1 (root) stack pops the last frame and ends the
+    task — status ``complete`` with an empty stack.
+
+    Fails pre-fix: ``_return_to_caller`` does not exist; the drainer completed
+    the task without ever popping, leaving ``call_stack`` with a stale frame.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        task = _seed(
+            svc,
+            run,
+            state="summarizing",
+            current_step="pr_summary",
+            stack=[{"workflow": "build", "step": "pr_summary", "called_from": None}],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._return_to_caller(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete", f"root complete must end the task; status={row.status!r}"
+        assert row.metadata.get("call_stack") == [], "the root frame must be popped (pop_frame wired)"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_complete_folds_through_tail_caller_to_terminal(tmp_path, run):
+    """``complete`` pops one frame and returns to the caller; a caller whose call
+    site was its LAST step (a tail call — ``build``'s ``push_pr``) has nothing
+    after it, so the unwind folds through it to a terminal completion.
+
+    Fails pre-fix: the completing frame is never popped and the caller is never
+    consulted — the task simply ends with the two-frame stack intact.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        task = _seed(
+            svc,
+            run,
+            state="reviewing",
+            current_step="review",
+            stack=[
+                {"workflow": "build", "step": "push_pr", "called_from": None},
+                {"workflow": "pr-monitor", "step": "review", "called_from": "push_pr"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._return_to_caller(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete", f"tail-call return must reach terminal; status={row.status!r}"
+        assert row.metadata.get("call_stack") == [], "both frames unwind on a tail-call completion"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_complete_returns_to_caller_next_step(tmp_path, run):
+    """``complete`` with a caller that has a step AFTER its call site resumes the
+    caller there (not the whole task ending, and not the call site re-running).
+
+    Caller ``build`` is parked at ``plan`` (call site); its binding successor is
+    ``test``. The callee (``pr-monitor``) completing pops one frame and lands the
+    task at ``test`` with only the caller frame remaining.
+
+    Fails pre-fix: a mid-stack ``complete`` ended the whole task (no pop, no
+    resume).
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    svc.runner = _HangRunner()  # the resumed ``test`` agent hangs → row stays put
+    run(svc.start())
+    try:
+        task = _seed(
+            svc,
+            run,
+            state="reviewing",
+            current_step="review",
+            stack=[
+                {"workflow": "build", "step": "plan", "called_from": None},
+                {"workflow": "pr-monitor", "step": "review", "called_from": "plan"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._return_to_caller(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert _wf_names(row) == ["build"], f"only the caller frame remains; stack={row.metadata.get('call_stack')!r}"
+        assert row.current_step == "test", f"must resume at the caller's next step after plan; got {row.current_step!r}"
+        assert row.state == "testing"
+        assert row.status != "complete", "a mid-stack complete returns to the caller, it does not end the task"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_terminate_unwinds_to_root_and_completes(tmp_path, run):
+    """``terminate`` with no catch anywhere unwinds every frame and ends the task
+    (the graph-driven route into ADR-030's terminal CAS shape).
+
+    Fails pre-fix: ``terminate`` resolved to the literal string ``"terminate"``,
+    found no queue_state, and fell through to the best-effort ``blocked`` — never
+    a terminal completion, and the stack was never unwound.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        task = _seed(
+            svc,
+            run,
+            state="pr-fixing",
+            current_step="pr-fix",
+            stack=[
+                {"workflow": "build", "step": "push_pr", "called_from": None},
+                {"workflow": "pr-monitor", "step": "pr-fix", "called_from": "push_pr"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._unwind_terminate(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete", f"uncaught terminate ends the task; status={row.status!r}"
+        assert row.metadata.get("call_stack") == [], "terminate unwinds the whole stack"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def _write_terminate_catcher(path: Path) -> Path:
+    path.write_text(
+        """
+process: catcher
+jobs:
+  - name: gate
+    type: agent
+    prompt: coding
+    queue_state: gating
+    active_state: gating
+    routes: { terminate: blocked }
+  - name: after
+    type: agent
+    prompt: coding
+    queue_state: after_state
+    active_state: after_state
+flows:
+  main:
+    steps: [gate, after]
+"""
+    )
+    return path
+
+
+def test_terminate_caught_by_caller_frame(tmp_path, run):
+    """A frame catches ``terminate`` when its call-site step declares a
+    ``routes: { terminate: <target> }`` catch — the task routes to ``<target>``
+    within that caller and the caught frame STAYS on the stack (no further
+    unwinding). Frames above it are still unwound.
+
+    Fails pre-fix: no unwind logic consulted a frame's ``terminate`` catch, so
+    the catch could never fire (it was compiled to an inert rule and, worse,
+    ``evaluate_output_rules`` treated ``source="terminate"`` as a file path).
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        # Inject a catcher workflow whose ``gate`` step catches terminate → blocked.
+        catcher = build_process("catcher", process_file=_write_terminate_catcher(tmp_path / "catcher.yaml"))
+        svc._processes["catcher"] = catcher
+        task = _seed(
+            svc,
+            run,
+            state="coding",
+            current_step="code",
+            stack=[
+                {"workflow": "catcher", "step": "gate", "called_from": None},
+                {"workflow": "build", "step": "code", "called_from": "gate"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._unwind_terminate(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "blocked", f"the catch routes to blocked; status={row.status!r}"
+        assert _wf_names(row) == ["catcher"], (
+            f"the emitting (build) frame is unwound; the catching (catcher) frame stays — stack={_wf_names(row)!r}"
+        )
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_route_stack_target_dispatches_a_call(tmp_path, run):
+    """``_route_stack_target`` (the single seam the three finalize sites share)
+    treats a ``call <workflow>`` target as a stack push + callee dispatch — the
+    caller frame stays and a callee frame is pushed on top.
+
+    Fails pre-fix: ``_route_stack_target`` does not exist; only ``_execute_action_step``
+    handled ``call``, so an agent step routing to ``call`` had no dispatch path.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        task = _seed(
+            svc,
+            run,
+            state="coding",
+            current_step="code",
+            stack=[{"workflow": "build", "step": "code", "called_from": None}],
+        )
+        row = run(svc.db.get_task(task.id))
+        handled = run(svc._route_stack_target(_item_from(row), "call pr-monitor", from_status="working"))
+        assert handled is True, "a call target must be handled by the stack router"
+        row = run(svc.db.get_task(task.id))
+        assert _wf_names(row) == ["build", "pr-monitor"], f"the callee frame must be pushed; stack={_wf_names(row)!r}"
+        top = row.metadata["call_stack"][-1]
+        assert top["called_from"] == "code", "the pushed frame records the calling step"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_agent_step_routing_to_call_enters_the_callee(tmp_path, run):
+    """End-to-end: an AGENT step whose ``COMPLETED`` routes to ``call pr-monitor``
+    actually enters ``pr-monitor`` through the completion drainer — it does not
+    stall at ``status="working"``.
+
+    This is the review's headline gap: pre-fix, the drainer resolved
+    ``target="call pr-monitor"``, found no ``(state, "call pr-monitor")`` SM edge,
+    logged the strand-warning, and ``continue``d — the task never moved and the
+    stack never grew. Post-fix the drainer routes the target through
+    ``_route_stack_target`` before the edge check.
+    """
+    import asyncio
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    caller = tmp_path / "wf_caller.yaml"
+    caller.write_text(
+        """
+process: wf_caller
+jobs:
+  - name: work
+    type: agent
+    prompt: coding
+    queue_state: backlog
+    active_state: working_state
+    routes: { COMPLETED: call pr-monitor }
+flows:
+  main:
+    steps:
+      - name: work
+        prehooks: []
+        posthooks: []
+"""
+    )
+    config = LotsaConfig(
+        data_dir=data_dir,
+        work_dir=tmp_path,
+        flow="wf_caller",
+        flow_file=caller,
+        model="sonnet",
+        budget=5.0,
+    )
+    db = TaskDB(data_dir / "lotsa.db")
+    run(db.initialize())
+    svc = OrchestratorService(config, db)
+    svc.runner = _CompletedRunner()
+    run(svc.start())
+    try:
+        task = run(svc.create_task("agent calls a workflow"))
+
+        async def _entered() -> bool:
+            row = await db.get_task(task.id)
+            return bool(row) and _wf_names(row)[-1:] == ["pr-monitor"]
+
+        async def _drive() -> None:
+            for _ in range(150):
+                if await _entered():
+                    return
+                await asyncio.sleep(0.02)
+
+        run(_drive())
+        row = run(db.get_task(task.id))
+        assert _wf_names(row) == ["wf_caller", "pr-monitor"], (
+            f"the agent's COMPLETED must call pr-monitor (drainer wiring); stack={_wf_names(row)!r}, "
+            f"status={row.status!r}, state={row.state!r}"
+        )
+    finally:
+        run(svc.shutdown())
+        run(db.close())

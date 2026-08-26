@@ -537,6 +537,21 @@ def parse_call_target(target: str) -> tuple[str, str | None]:
     return body, None
 
 
+def terminate_catch_target(rules: list[OutputRule]) -> str | None:
+    """Return the target of a step's ``terminate`` catch, or ``None`` (ADR-045).
+
+    A ``routes: { terminate: <target> }`` catch compiles to an inert
+    ``OutputRule(source="terminate", …)``. When a stack unwind propagates
+    ``terminate`` up to a frame, the drainer consults this to decide whether the
+    frame catches the unwind (routing to ``<target>`` within the frame's
+    workflow) or lets it propagate further toward the root.
+    """
+    for rule in rules:
+        if rule.source == TERMINATE_TARGET:
+            return rule.target
+    return None
+
+
 # ---------------------------------------------------------------------------
 # YAML parsing
 # ---------------------------------------------------------------------------
@@ -1313,6 +1328,14 @@ def evaluate_output_rules(
     work_dir: Path,
 ) -> str | None:
     for rule in rules:
+        # ADR-045 — a ``routes: { terminate: <target> }`` catch compiles to an
+        # inert ``source="terminate"`` rule. It is consulted by the stack-unwind
+        # logic (``_unwind_terminate``), never matched against agent output — so
+        # skip it here (otherwise the ``else`` below would treat ``"terminate"``
+        # as a worktree-relative file path and a stray file named ``terminate``
+        # could spuriously fire the catch).
+        if rule.source == TERMINATE_TARGET:
+            continue
         if rule.source == "stdout":
             content = result.stdout or ""
         else:

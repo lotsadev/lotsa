@@ -26,8 +26,10 @@ if TYPE_CHECKING:
 from lotsa.attachments import materialize_into_worktree
 from lotsa.call_stack import (
     CALL_STACK_KEY,
+    get_stack,
     is_legacy_flow_row,
     make_frame,
+    pop_frame,
     push_frame,
     stack_top,
 )
@@ -46,6 +48,7 @@ from lotsa.diff import compute_branch_diff
 from lotsa.flows import (
     BUNDLED_PROMPTS,
     PRESET_NAMES,
+    TERMINATE_TARGET,
     FlowConfig,
     FlowStep,
     Job,
@@ -60,6 +63,7 @@ from lotsa.flows import (
     parse_call_target,
     resolve_output_target,
     serialize_process_graph,
+    terminate_catch_target,
     validate_call_graph,
 )
 from lotsa.pr_monitor import (
@@ -4099,6 +4103,248 @@ class OrchestratorService:
             await self._dispatch_step(item, step, feedback=feedback or None)
         return True
 
+    def _workflow_main_flow(self, item_or_row: Any, workflow: str | None) -> FlowConfig | None:
+        """Resolve a workflow name to its ``main`` flow (ADR-045).
+
+        Consults the task's project repo catalog first, then the global bundled/
+        inline catalog (same order as ``_active_process_for``). Returns ``None``
+        when the name no longer resolves — a stack frame naming a workflow that
+        was removed between restarts; callers treat that as "unwind to terminal".
+        """
+        if not workflow:
+            return None
+        proc = self._project_process_catalog(item_or_row).get(workflow) or self._processes.get(workflow)
+        if proc is None:
+            return None
+        return proc.flows.get("main") or next(iter(proc.flows.values()))
+
+    async def _route_stack_target(
+        self,
+        item: Item,
+        target: str,
+        *,
+        from_status: TaskStatusLiteral,
+    ) -> bool:
+        """Handle a stack-crossing routing target (ADR-045). Returns ``True`` when
+        *target* was one of ``call``/``terminate``/``complete`` and this method
+        performed the CAS + dispatch; ``False`` when it is an ordinary in-flow
+        target the caller should route itself.
+
+        The three sites that finalize a step — the agent-step drainer's
+        rule-target and auto-advance branches, and ``_execute_action_step``'s
+        success path — all funnel through here so ``complete`` (pop one frame,
+        return to caller), ``terminate`` (unwind subject to catches), and ``call``
+        (push a frame, dispatch the callee) get identical treatment everywhere.
+        These targets cross the call stack, not a single flow edge, so — like a
+        promotion (``jump_to_step``) or ``_dispatch_call`` — their CAS is not
+        gated on a state-machine transition of the current flow.
+        """
+        if is_call_target(target):
+            # A call is forward progress (into the callee's entry) — clear any
+            # ADR-040 interruption markers so a completed step doesn't carry a
+            # stale resume_count into the pushed frame (matches every other
+            # forward-progress edge).
+            if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
+                await self._clear_interruption_markers(item)
+            workflow, target_job = parse_call_target(target)
+            fresh = await self.db.get_task(item.id)
+            if fresh is None:
+                return True
+            await self._dispatch_call(fresh, workflow, target_job=target_job)
+            return True
+        if target == TERMINATE_TARGET:
+            await self._unwind_terminate(item, from_status=from_status)
+            return True
+        if target == "complete":
+            await self._return_to_caller(item, from_status=from_status)
+            return True
+        return False
+
+    async def _return_to_caller(self, item: Item, *, from_status: TaskStatusLiteral) -> None:
+        """ADR-045 ``complete``: pop the active frame and return to the caller.
+
+        The completing workflow's frame is popped. If a caller remains, the task
+        resumes at the step **after** the caller's call site (a workflow returns
+        control to whatever came next). A caller whose call site was its last step
+        (a *tail call*) has nothing after it, so it completes too — the pop folds
+        through such callers until one has a successor or the stack empties, at
+        which point the whole task is done (the ADR-030 terminal CAS shape).
+
+        The unwind is computed in one pass and applied with a single CAS, so the
+        persisted stack is never torn: an interruption before the CAS leaves the
+        completed step's row intact, and re-running it (ADR-040 idempotent resume)
+        recomputes the same landing.
+        """
+        fresh = await self.db.get_task(item.id)
+        if fresh is None:
+            return
+        metadata = pop_frame(fresh.metadata)  # pop the completing frame (ADR-020 CAS below)
+        new_stack = get_stack(metadata)
+        landing: tuple[Any, str] | None = None  # (successor ResolvedJob, workflow)
+        while new_stack:
+            caller = new_stack[-1]
+            caller_flow = self._workflow_main_flow(fresh, caller.get("workflow"))
+            if caller_flow is None:
+                break  # unresolvable caller → treat as terminal
+            order = [s.name for s in caller_flow.steps]
+            idx = order.index(caller.get("step")) if caller.get("step") in order else -1
+            successor = caller_flow.steps[idx + 1] if 0 <= idx < len(order) - 1 else None
+            if successor is not None:
+                landing = (successor, str(caller.get("workflow")))
+                break
+            new_stack = new_stack[:-1]  # tail call — the caller completes too
+        metadata[CALL_STACK_KEY] = new_stack
+
+        if landing is None:
+            # Stack emptied (or a caller no longer resolves) → the task is done.
+            cas = await self.db.atomic_transition(
+                item.id,
+                from_status=from_status,
+                from_state=item.state,
+                to_state="complete",
+                to_status="complete",
+                to_current_step=None,
+                to_metadata=metadata,
+                audit_on_win=AuditRow(
+                    role="system",
+                    step_name=item.state,
+                    content="Workflow complete — call stack unwound to root; task complete.",
+                    msg_type="status_change",
+                ),
+            )
+            if cas.won:
+                item.state = "complete"
+                await self._cleanup_worktree_if_done(item)
+            return
+
+        successor, caller_wf = landing
+        cas = await self.db.atomic_transition(
+            item.id,
+            from_status=from_status,
+            from_state=item.state,
+            to_state=successor.queue_state,
+            to_status="working",
+            to_current_step=successor.name,
+            to_metadata=metadata,
+            audit_on_win=AuditRow(
+                role="system",
+                step_name=successor.name,
+                content=f"Workflow complete — returning to caller {caller_wf!r} at {successor.name!r}.",
+                msg_type="status_change",
+                metadata={"from_step": item.state, "to_step": successor.name},
+            ),
+        )
+        if not cas.won:
+            return
+        item.state = successor.queue_state
+        fresh2 = await self.db.get_task(item.id)
+        if fresh2 is not None:
+            resumed = Item(
+                id=fresh2.id, state=fresh2.state, title=fresh2.title, body=fresh2.body, metadata=fresh2.metadata
+            )
+            await self._dispatch_next_step(resumed)
+
+    async def _unwind_terminate(self, item: Item, *, from_status: TaskStatusLiteral) -> None:
+        """ADR-045 ``terminate``: unwind the stack, subject to per-frame catches.
+
+        The emitting frame is popped, then ``terminate`` propagates toward the
+        root. A caller catches it when its call-site step declares a
+        ``routes: { terminate: <target> }`` catch — the task routes to ``<target>``
+        within that caller (the caught frame stays on the stack), no further
+        unwinding. A caller with no catch is popped and the unwind continues.
+        Reaching the root with no catch ends the task via the terminal CAS shape
+        (ADR-030's terminal status is global truth; this is the graph-driven route
+        into it — it sits beside ADR-043 ``mark_complete`` and ADR-030 terminal PR
+        signals, replacing neither).
+
+        Computed in one pass, applied with a single CAS (see ``_return_to_caller``
+        for the restart-safety argument).
+        """
+        fresh = await self.db.get_task(item.id)
+        if fresh is None:
+            return
+        metadata = pop_frame(fresh.metadata)  # pop the emitting frame (ADR-020 CAS below)
+        new_stack = get_stack(metadata)
+        catch: tuple[Any, str] | None = None  # (destination ResolvedJob, workflow)
+        while new_stack:
+            caller = new_stack[-1]
+            caller_flow = self._workflow_main_flow(fresh, caller.get("workflow"))
+            if caller_flow is None:
+                break  # unresolvable caller → propagate to terminal
+            step_job = next((s for s in caller_flow.steps if s.name == caller.get("step")), None)
+            catch_target = terminate_catch_target(step_job.rules) if step_job is not None else None
+            if catch_target is not None:
+                dest = next((s for s in caller_flow.steps if s.name == catch_target), None)
+                if dest is not None:
+                    catch = (dest, str(caller.get("workflow")))
+                    break
+                # A catch naming a non-step target (e.g. ``blocked``) — resolve it
+                # and route without keeping a ResolvedJob (handled below).
+                catch = (resolve_output_target(catch_target, step_job, caller_flow), str(caller.get("workflow")))
+                break
+            new_stack = new_stack[:-1]  # no catch — this caller is unwound too
+        metadata[CALL_STACK_KEY] = new_stack
+
+        if catch is None:
+            cas = await self.db.atomic_transition(
+                item.id,
+                from_status=from_status,
+                from_state=item.state,
+                to_state="complete",
+                to_status="complete",
+                to_current_step=None,
+                to_metadata=metadata,
+                audit_on_win=AuditRow(
+                    role="system",
+                    step_name=item.state,
+                    content="terminate — call stack unwound to root; task complete.",
+                    msg_type="status_change",
+                ),
+            )
+            if cas.won:
+                item.state = "complete"
+                await self._cleanup_worktree_if_done(item)
+            return
+
+        dest, caught_wf = catch
+        if isinstance(dest, str):
+            # Catch resolved to a bare state (e.g. ``blocked``) rather than a step.
+            to_state = dest
+            to_status: TaskStatusLiteral = "blocked" if dest == "blocked" else "working"
+            to_step: str | None = None
+            dest_queue = dest
+        else:
+            to_state = dest.queue_state
+            to_status = "working"
+            to_step = dest.name
+            dest_queue = dest.queue_state
+        cas = await self.db.atomic_transition(
+            item.id,
+            from_status=from_status,
+            from_state=item.state,
+            to_state=to_state,
+            to_status=to_status,
+            to_current_step=to_step,
+            to_metadata=metadata,
+            audit_on_win=AuditRow(
+                role="system",
+                step_name=to_step or to_state,
+                content=f"terminate caught by {caught_wf!r} → {to_state!r}.",
+                msg_type="status_change",
+                metadata={"from_step": item.state, "to_step": to_step or to_state},
+            ),
+        )
+        if not cas.won:
+            return
+        item.state = dest_queue
+        if to_status == "working":
+            fresh2 = await self.db.get_task(item.id)
+            if fresh2 is not None:
+                resumed = Item(
+                    id=fresh2.id, state=fresh2.state, title=fresh2.title, body=fresh2.body, metadata=fresh2.metadata
+                )
+                await self._dispatch_next_step(resumed)
+
     async def _sync_branch_to_main(self, task_id: str) -> SyncResult:
         """Sync the task's worktree branch to ``origin/<default_branch>`` (ADR-015).
 
@@ -5352,26 +5598,22 @@ class OrchestratorService:
             (r.target for r in step.rules if r.source == "stdout" and r.pattern.endswith("COMPLETED")),
             None,
         )
-        if raw_target is not None and is_call_target(raw_target):
-            if "resume_count" in item.metadata or "interrupted_at" in item.metadata:
-                await self._clear_interruption_markers(item)
-            workflow, target_job = parse_call_target(raw_target)
-            fresh = await self.db.get_task(item.id)
-            called = await self._dispatch_call(fresh, workflow, target_job=target_job)
-            await self.source.append_event(item.id, {"type": "dispatch", "job_type": step.job_type, "success": called})
-            return
-
         if raw_target is not None:
             success_state = resolve_output_target(raw_target, step, active_flow)
         else:
             success_state = step.success_state
+        # ADR-045 — ``call``/``terminate``/``complete`` cross the call stack, not a
+        # single flow edge: push a frame and dispatch the callee, unwind the
+        # stack (subject to catches), or pop one frame and return to the caller.
+        # ``_route_stack_target`` owns the CAS + dispatch for all three; on any
+        # other target we fall through to the ordinary in-flow advance below.
+        if await self._route_stack_target(item, success_state, from_status="working"):
+            await self.source.append_event(item.id, {"type": "dispatch", "job_type": step.job_type, "success": True})
+            return
         to_status: TaskStatusLiteral
         to_current_step: str | None
         next_step = next((s for s in active_flow.jobs if s.queue_state == success_state), None)
-        if success_state == "complete":
-            to_status = "complete"
-            to_current_step = None
-        elif next_step is not None and next_step.type == "monitor":
+        if next_step is not None and next_step.type == "monitor":
             to_status = "waiting_for_pr"
             to_current_step = next_step.name
         else:
@@ -5384,11 +5626,12 @@ class OrchestratorService:
             # ``status="working"`` (the dispatch loop only re-fires from
             # ``queue_state``, but the active-state re-dispatch branch in
             # ``_dispatch_next_step`` would otherwise re-run this same
-            # action indefinitely). For the bundled SE process this is
-            # unreachable — ``_register_cross_flow_edges`` covers the
-            # sub-flow success edges and ``_build_state_machine`` covers
-            # the in-flow ones. Hardens custom process YAMLs that omit a
-            # required success transition.
+            # action indefinitely). For the bundled workflows this is
+            # unreachable — ``_build_state_machine`` covers the in-flow
+            # success edges, and the stack-crossing targets
+            # (``call``/``terminate``/``complete``) never reach here
+            # (``_route_stack_target`` handled them above). Hardens custom
+            # process YAMLs that omit a required success transition.
             #
             # CAS rather than bare ``_set_status`` for symmetry with every
             # other status-flip in this file: a concurrent ``block()`` /
@@ -6452,6 +6695,16 @@ class OrchestratorService:
                                 "chat",
                                 metadata=_run_stats(result),
                             )
+                        # ADR-045 — ``call``/``terminate``/``complete`` cross the
+                        # call stack rather than a single flow edge, so they are
+                        # NOT registered SM transitions and must be intercepted
+                        # before the edge check below (an agent step routing
+                        # ``COMPLETED: call <wf>`` or ``… : terminate`` would
+                        # otherwise fall through to the "no edge" strand-warning
+                        # and stall at status=working — the exact gap the review
+                        # flagged). ``_route_stack_target`` owns the CAS + dispatch.
+                        if await self._route_stack_target(item, target, from_status="working"):
+                            continue
                         # Validate the rule-target transition against the *active*
                         # flow's SM, not main's. Sub-flow bindings (e.g.
                         # pr_fix.review's FAILED → pr-fix) declare edges that
@@ -6470,15 +6723,16 @@ class OrchestratorService:
                             )
                             continue
                         # End-state (status, current_step) depends on target:
-                        # terminal targets fold the status flip into the same
-                        # CAS; non-terminal targets keep status='working' so
+                        # ``blocked`` folds the status flip into the same CAS;
+                        # in-flow targets keep status='working' so
                         # _dispatch_next_step can drive the next step's CAS.
+                        # ``complete``/``terminate``/``call`` are stack-crossing
+                        # and were already handled by ``_route_stack_target``
+                        # above (this branch only sees ``blocked`` or an in-flow
+                        # job target).
                         if target == "blocked":
                             to_status: TaskStatusLiteral = "blocked"
                             to_current_step: str | None = info.step.name
-                        elif target == "complete":
-                            to_status = "complete"
-                            to_current_step = None
                         else:
                             to_status = "working"
                             to_current_step = info.step.name
@@ -6744,6 +6998,16 @@ class OrchestratorService:
                             # push_pr), an edge that is registered only in the
                             # sub-flow's SM, not main's.
                             active_flow_for_auto = self._resolve_flow(item)
+                            # ADR-045 — a step whose success is ``complete`` pops
+                            # one call-stack frame and returns to the caller (only
+                            # truly ending the task at the root frame). Route it
+                            # through the stack-aware handler before the in-flow
+                            # edge check below: ``complete`` is not an SM edge, and
+                            # a mid-stack ``complete`` must resume the caller, not
+                            # end the whole task.
+                            if info.step.success_state == "complete":
+                                await self._route_stack_target(item, "complete", from_status="working")
+                                continue
                             if (
                                 item.state,
                                 info.step.success_state,
@@ -6758,24 +7022,18 @@ class OrchestratorService:
                                     active_flow_for_auto.name,
                                 )
                                 continue
-                            # Terminal success_state (e.g. 'complete') folds the
-                            # status flip into the same CAS; non-terminal
-                            # success_states keep status='working' so the
-                            # following _dispatch_next_step can drive the next
+                            # ``complete`` was intercepted above (stack-crossing,
+                            # not an SM edge); here ``success_state`` is always an
+                            # in-flow queue_state, so keep status='working' and let
+                            # the following _dispatch_next_step drive the next
                             # step's CAS.
-                            if info.step.success_state == "complete":
-                                advance_status: TaskStatusLiteral = "complete"
-                                advance_step: str | None = None
-                            else:
-                                advance_status = "working"
-                                advance_step = info.step.name
                             cas = await self.db.atomic_transition(
                                 item.id,
                                 from_status="working",
                                 from_state=item.state,
                                 to_state=info.step.success_state,
-                                to_status=advance_status,
-                                to_current_step=advance_step,
+                                to_status="working",
+                                to_current_step=info.step.name,
                                 audit_on_win=None,
                             )
                             if not cas.won:
