@@ -91,13 +91,30 @@ isn't there:
   reaped.
 - `AskUserQuestion` — no UI to render in; returns an error result
   the operator never sees.
+- **Shell-level backgrounding**, which the list above misses because
+  it isn't a tool: `cmd &`, `nohup`, and every poll-for-it idiom
+  built on them — `sleep 45; cat out.txt`, `until grep -q done
+  marker; do sleep 3; done`, re-reading a `tasks/*.output` file.
+  The backgrounded process is reaped with your turn, so the file you
+  are polling never fills and the loop just burns your dispatch
+  waiting on a writer that no longer exists. This has really
+  happened, repeatedly, in a single dispatch.
 
 **Foreground, in-turn patterns are fine.** If a command needs to
 run for a few minutes, run it foreground (e.g. `pytest -q`) and let
-your turn block on it. If a command is genuinely too slow to wait
-for in one turn, split it (run a smaller subset) rather than
-deferring it. If you need the operator's input, emit
-`NEEDS_INPUT:` (see *How to communicate*)."""
+your turn block on it. Blocking is the supported way to wait, and
+it is always cheaper than a polling loop. If a command is genuinely
+too slow to wait for in one turn, split it (run a smaller subset)
+rather than deferring it. If you need the operator's input, emit
+`NEEDS_INPUT:` (see *How to communicate*).
+
+**Run a slow command once and keep its output.** Capture it —
+`pytest -q > /tmp/out.txt 2>&1` — then re-read and grep that file as
+many times as you need. Re-running a slow command to reshape its
+output (different flags, quieter traceback, just the failures) pays
+its full cost again every time and is the most common way a dispatch
+burns its budget: one real run has been repeated eight times in a
+single turn for want of a capture."""
 
 
 class AgentRunnerError(Exception):
