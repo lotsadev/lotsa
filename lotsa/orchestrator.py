@@ -4213,6 +4213,14 @@ class OrchestratorService:
             return
 
         successor, caller_wf = landing
+        # Land the successor at ``status="working"`` and let ``_dispatch_next_step``
+        # (below) do the type-specific landing: it is the single authority on
+        # dispatching a step, and its ``_dispatch_step`` monitor branch flips a
+        # monitor successor to ``waiting_for_pr`` (and clears the ADR-040
+        # interruption markers) so the engine picks it up. Hardcoding the monitor
+        # status here would duplicate — and drift from — that logic (notably the
+        # marker clearing); ``_dispatch_call`` hardcodes it only because it does
+        # NOT route through ``_dispatch_next_step``.
         cas = await self.db.atomic_transition(
             item.id,
             from_status=from_status,
@@ -4342,6 +4350,12 @@ class OrchestratorService:
                 to_state, to_status, to_step = dest, "working", catch_step
             dest_queue = dest
         else:
+            # Catch resolved to an actual step. Land it at ``working`` and let the
+            # ``to_status == "working"`` post-CAS branch below re-dispatch through
+            # ``_dispatch_next_step`` — the single step-landing authority, whose
+            # ``_dispatch_step`` monitor branch flips a monitor catch target to
+            # ``waiting_for_pr`` (and clears interruption markers). See the
+            # matching note in ``_return_to_caller``.
             to_state = dest.queue_state
             to_status = "working"
             to_step = dest.name
@@ -6522,20 +6536,20 @@ class OrchestratorService:
                             feedback_was_actionable = _feedback_is_actionable(info.feedback)
                             prev_skipped = int(item.metadata.get("pr_fix_consecutive_skipped", 0))
                             new_skipped = prev_skipped + 1 if feedback_was_actionable else prev_skipped
-                            # Sub-flow exit: task is back in the monitor's
-                            # state (root flow). Reset ``current_flow`` to the
-                            # task's OWN process's root flow name (ADR-021; not
-                            # a hardcoded ``"main"``) so a custom process whose
-                            # root flow is named something else still persists
-                            # the right value. The reset rides on the same
-                            # merge as the counter/cursor advance so a
-                            # concurrent reader never sees a partial update.
+                            # ADR-045 — the SKIPPED edge loops ``pr-fix →
+                            # wait_for_pr_signal`` INTERNALLY within the active
+                            # ``pr-monitor`` workflow: no frame is pushed or
+                            # popped, so there is no ``current_flow`` to reset
+                            # (the call stack is untouched). The pre-ADR-045
+                            # sub-flow-exit ``current_flow`` write is removed —
+                            # nothing reads it anymore, and reintroducing the
+                            # stale key resurrects the exact slot the call stack
+                            # replaced.
                             await self._merge_task_metadata(
                                 item,
                                 {
                                     "pr_comments_since": dispatched_at,
                                     "pr_fix_consecutive_skipped": new_skipped,
-                                    "current_flow": self._root_flow_for(item).name,
                                 },
                             )
                             # Capture the dispatch's round once. ``_record_pr_decision``

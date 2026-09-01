@@ -988,6 +988,155 @@ def test_terminate_catch_to_a_terminal_status_ends_the_task(tmp_path, run):
         run(svc.db.close())
 
 
+def _write_monitor_successor_caller(path: Path) -> Path:
+    """A caller workflow whose call-site step (``work``) is followed by a MONITOR
+    step (``watch``) in binding order — so a callee ``complete`` returns *into* a
+    monitor, exercising the monitor-typed landing in ``_return_to_caller``."""
+    path.write_text(
+        """
+process: monitor_caller
+jobs:
+  - name: work
+    type: agent
+    prompt: coding
+    queue_state: working_state
+    active_state: working_state
+  - name: watch
+    type: monitor
+    engine: pr_monitor
+    config:
+      poll_interval_seconds: 30
+      debounce_seconds: 120
+      triggers: [human_comment]
+      max_pr_fix_rounds: 10
+      max_consecutive_skipped: 3
+flows:
+  main:
+    steps: [work, watch]
+"""
+    )
+    return path
+
+
+def test_complete_returning_to_a_monitor_successor_parks_waiting_for_pr(tmp_path, run):
+    """``complete`` returning to a caller whose next step is a MONITOR must land
+    the task at ``status="waiting_for_pr"`` (so the monitor engine picks it up),
+    with only the caller frame left on the stack.
+
+    Coverage (not a failing-first regression — the behaviour is already correct):
+    ``_return_to_caller`` lands the successor at ``working`` and delegates to
+    ``_dispatch_next_step``, whose ``_dispatch_step`` monitor branch flips a
+    monitor step to ``waiting_for_pr`` (and clears interruption markers). This
+    pins that self-heal for a monitor successor — the previously-untested landing
+    type the review flagged — so a future refactor that hardcodes the landing
+    status (and would drift from the marker-clearing) can't silently regress it.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        caller = build_process(
+            "monitor_caller", process_file=_write_monitor_successor_caller(tmp_path / "monitor_caller.yaml")
+        )
+        svc._processes["monitor_caller"] = caller
+        watch = next(s for s in caller.flows["main"].jobs if s.name == "watch")
+        task = _seed(
+            svc,
+            run,
+            state="callee_active",
+            current_step="last",
+            stack=[
+                {"workflow": "monitor_caller", "step": "work", "called_from": None},
+                {"workflow": "pr-monitor", "step": "push_pr", "called_from": "work"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._return_to_caller(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "waiting_for_pr", (
+            f"a monitor successor must park at waiting_for_pr for the engine; status={row.status!r}"
+        )
+        assert row.current_step == "watch", f"must land at the monitor successor; got {row.current_step!r}"
+        assert row.state == watch.queue_state, f"state must be the monitor's queue_state; got {row.state!r}"
+        assert _wf_names(row) == ["monitor_caller"], "only the caller frame remains after the pop"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def _write_monitor_terminate_catcher(path: Path) -> Path:
+    """A catcher whose ``gate`` step catches ``terminate`` to a MONITOR step
+    (``watch``) — exercising the monitor-typed catch landing in
+    ``_unwind_terminate``."""
+    path.write_text(
+        """
+process: monitor_catcher
+jobs:
+  - name: gate
+    type: agent
+    prompt: coding
+    queue_state: gating
+    active_state: gating
+    routes: { terminate: watch }
+  - name: watch
+    type: monitor
+    engine: pr_monitor
+    config:
+      poll_interval_seconds: 30
+      debounce_seconds: 120
+      triggers: [human_comment]
+      max_pr_fix_rounds: 10
+      max_consecutive_skipped: 3
+flows:
+  main:
+    steps: [gate, watch]
+"""
+    )
+    return path
+
+
+def test_terminate_caught_by_a_monitor_step_parks_waiting_for_pr(tmp_path, run):
+    """A ``terminate`` catch whose target is a MONITOR step lands the task at
+    ``status="waiting_for_pr"`` (engine picks it up), with the catching frame
+    left on the stack.
+
+    Coverage (not a failing-first regression — the behaviour is already correct):
+    the step-catch branch of ``_unwind_terminate`` lands the catch target at
+    ``working`` and re-dispatches through ``_dispatch_next_step``, whose monitor
+    branch flips it to ``waiting_for_pr``. Pins that self-heal for a monitor catch
+    target — the previously-untested landing type the review flagged.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        catcher = build_process(
+            "monitor_catcher", process_file=_write_monitor_terminate_catcher(tmp_path / "monitor_catcher.yaml")
+        )
+        svc._processes["monitor_catcher"] = catcher
+        watch = next(s for s in catcher.flows["main"].jobs if s.name == "watch")
+        task = _seed(
+            svc,
+            run,
+            state="coding",
+            current_step="code",
+            stack=[
+                {"workflow": "monitor_catcher", "step": "gate", "called_from": None},
+                {"workflow": "build", "step": "code", "called_from": "gate"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._unwind_terminate(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "waiting_for_pr", (
+            f"a monitor catch target must park at waiting_for_pr; status={row.status!r}"
+        )
+        assert row.current_step == "watch", f"must land at the monitor catch target; got {row.current_step!r}"
+        assert row.state == watch.queue_state, f"state must be the monitor's queue_state; got {row.state!r}"
+        assert _wf_names(row) == ["monitor_catcher"], "the catching frame stays; the emitting frame is unwound"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
 def test_route_stack_target_dispatches_a_call(tmp_path, run):
     """``_route_stack_target`` (the single seam the three finalize sites share)
     treats a ``call <workflow>`` target as a stack push + callee dispatch — the

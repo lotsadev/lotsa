@@ -1966,6 +1966,22 @@ def test_pr_fix_skipped_writes_short_divider_and_single_reasoning(tmp_path):
                     f"divider must be a bare marker with no reasoning, got {divider.content!r}"
                 )
 
+                # ADR-045 (Medium 2) regression: the SKIPPED drainer branch loops
+                # ``pr-fix → wait_for_pr_signal`` INTRA-workflow — the call stack is
+                # untouched — so it must NOT re-introduce the removed ``current_flow``
+                # metadata slot. Pre-fix this branch merged ``current_flow`` back in,
+                # resurrecting the exact key the call stack replaced.
+                row = run(svc.db.get_task(task.id))
+                # Guard against a trivially-passing assertion: confirm we actually
+                # reached the SKIPPED merge branch (it advances ``pr_comments_since``).
+                assert "pr_comments_since" in (row.metadata or {}), (
+                    "expected the SKIPPED drainer branch to run and advance pr_comments_since"
+                )
+                assert "current_flow" not in (row.metadata or {}), (
+                    "the SKIPPED drainer branch must not write the removed current_flow slot; "
+                    f"metadata keys: {sorted((row.metadata or {}).keys())}"
+                )
+
                 # No stage_transition may embed the reasoning — that duplication
                 # (and its horizontal overflow) is exactly what this fix removes.
                 for m in transitions:
