@@ -4258,7 +4258,11 @@ class OrchestratorService:
             return
         metadata = pop_frame(fresh.metadata)  # pop the emitting frame (ADR-020 CAS below)
         new_stack = get_stack(metadata)
-        catch: tuple[Any, str] | None = None  # (destination ResolvedJob, workflow)
+        # (destination ResolvedJob-or-bare-state, workflow, catch-site step name).
+        # The catch-site step is carried so the bare-state branch below can
+        # preserve ``current_step`` (mirroring ``block()`` / the drainer's
+        # ``blocked`` branch) rather than nulling it.
+        catch: tuple[Any, str, str] | None = None
         while new_stack:
             caller = new_stack[-1]
             caller_flow = self._workflow_main_flow(fresh, caller.get("workflow"))
@@ -4269,11 +4273,15 @@ class OrchestratorService:
             if catch_target is not None:
                 dest = next((s for s in caller_flow.steps if s.name == catch_target), None)
                 if dest is not None:
-                    catch = (dest, str(caller.get("workflow")))
+                    catch = (dest, str(caller.get("workflow")), step_job.name)
                     break
                 # A catch naming a non-step target (e.g. ``blocked``) — resolve it
                 # and route without keeping a ResolvedJob (handled below).
-                catch = (resolve_output_target(catch_target, step_job, caller_flow), str(caller.get("workflow")))
+                catch = (
+                    resolve_output_target(catch_target, step_job, caller_flow),
+                    str(caller.get("workflow")),
+                    step_job.name,
+                )
                 break
             new_stack = new_stack[:-1]  # no catch — this caller is unwound too
         metadata[CALL_STACK_KEY] = new_stack
@@ -4299,12 +4307,17 @@ class OrchestratorService:
                 await self._cleanup_worktree_if_done(item)
             return
 
-        dest, caught_wf = catch
+        dest, caught_wf, catch_step = catch
         if isinstance(dest, str):
             # Catch resolved to a bare state (e.g. ``blocked``) rather than a step.
+            # Preserve ``current_step`` as the catch-site step — every other path
+            # that blocks a task in this file (``block()``, the agent-drainer's
+            # ``target == "blocked"`` branch, ``transition_task``) keeps
+            # ``current_step`` so the dashboard shows where the task blocked;
+            # nulling it here would be the lone inconsistent site.
             to_state = dest
             to_status: TaskStatusLiteral = "blocked" if dest == "blocked" else "working"
-            to_step: str | None = None
+            to_step: str | None = catch_step
             dest_queue = dest
         else:
             to_state = dest.queue_state

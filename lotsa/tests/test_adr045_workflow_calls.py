@@ -910,6 +910,13 @@ def test_terminate_caught_by_caller_frame(tmp_path, run):
         run(svc._unwind_terminate(_item_from(row), from_status="working"))
         row = run(svc.db.get_task(task.id))
         assert row.status == "blocked", f"the catch routes to blocked; status={row.status!r}"
+        # A catch resolving to a bare state (``blocked``) must preserve
+        # ``current_step`` as the catch-site step, mirroring every other blocked
+        # transition in the orchestrator (``block()`` / the drainer's ``blocked``
+        # branch) — not null it. Pre-fix this landed ``current_step=None``.
+        assert row.current_step == "gate", (
+            f"a caught terminate → blocked keeps the catch-site step as current_step; got {row.current_step!r}"
+        )
         assert _wf_names(row) == ["catcher"], (
             f"the emitting (build) frame is unwound; the catching (catcher) frame stays — stack={_wf_names(row)!r}"
         )
