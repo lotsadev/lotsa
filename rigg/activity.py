@@ -83,6 +83,42 @@ def session_jsonl_path(work_dir: Path, session_id: str, projects_root: Path | No
     return matches[0] if matches else None
 
 
+def last_activity_mtime(projects_root: Path, project_dir: str | None = None) -> float | None:
+    """Newest session-file mtime under *projects_root*, or ``None`` if none yet.
+
+    The liveness probe behind the runners' idle timeout. Claude Code appends to
+    its session JSONL as the agent works, so the file's mtime is a "still
+    alive" signal available *during* a run — unlike ``--output-format json``
+    stdout, which is a single blob emitted at exit and therefore indistinguish-
+    able from a wedge until the process ends.
+
+    *project_dir* scopes the scan to one encoded-cwd directory
+    (:func:`encode_cwd`); without it every project under the root is scanned.
+    Scoping matters for the Docker runner, whose per-task mounted home holds
+    exactly one project (``-workspace``) — a shared root would let a busy
+    neighbour mask this task's silence.
+
+    Read-only and never raises: an unreadable or absent tree reports ``None``,
+    which callers treat as "no evidence of life yet" and fall back to the
+    process start time rather than killing on a missing directory.
+
+    NOTE — the mtime advances when a *message* is written, which for a tool call
+    is when the call returns, not while it runs. So the idle window must exceed
+    the longest legitimate single tool call (a full test-suite run), not the
+    longest gap between agent "thoughts". See ``lotsa/tests/test_agent_timeouts.py``.
+    """
+    root = Path(projects_root)
+    if project_dir:
+        root = root / project_dir
+    try:
+        if not root.is_dir():
+            return None
+        mtimes = [p.stat().st_mtime for p in root.rglob("*.jsonl")]
+    except OSError:
+        return None
+    return max(mtimes) if mtimes else None
+
+
 def _truncate(text: str, cap: int) -> tuple[str, bool]:
     """Return *text* capped to *cap* chars and whether it was truncated."""
     if len(text) <= cap:

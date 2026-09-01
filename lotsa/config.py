@@ -52,6 +52,29 @@ class LotsaConfig:
     # survivors. Both are plain YAML scalars (no migration).
     resume_cap: int = 2
     shutdown_grace_seconds: float = field(default_factory=lambda: _DEFAULT_SHUTDOWN_GRACE_SECONDS)
+    # Agent-run deadlines, both enforced by the runner and both stopping the
+    # agent process/container itself (not merely the client that launched it).
+    #
+    # ``agent_idle_timeout_seconds`` is the load-bearing one: it measures
+    # *silence*, not duration, against the agent's session log, so a step doing
+    # 40 minutes of real work is never killed while a wedged one dies in
+    # minutes. The floor is set by the longest legitimate single tool call — the
+    # session log advances when a tool call *returns*, not while it runs, and a
+    # full test-suite run has been observed at 600s. 15 minutes clears that with
+    # margin.
+    #
+    # ``agent_timeout_seconds`` is only a backstop for when the liveness probe
+    # itself is unavailable (no session file ever written, an unreadable mount).
+    # It must stay above the idle window, and it is deliberately generous: a
+    # wall-clock cap cannot distinguish working from wedged, so tightening it
+    # buys nothing the idle window doesn't buy better. Before these existed, an
+    # un-overridden 3600s runner default was the *only* deadline — see the
+    # ``f22e232b`` incident in ``lotsa/tests/test_agent_timeouts.py``.
+    #
+    # A step may raise the wall-clock ceiling for itself via
+    # ``timeout_kill_seconds:`` in process.yaml; the idle window is global.
+    agent_timeout_seconds: int = 5400
+    agent_idle_timeout_seconds: int = 900
     # Cap on tokens Claude Code may emit in a single response. ``None`` means
     # "don't set it — let Claude Code use its built-in default (32000 as of
     # mid-2026) or any value the operator has exported via the

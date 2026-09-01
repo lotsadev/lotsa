@@ -1558,8 +1558,15 @@ class OrchestratorService:
         """Classify *elapsed_s* against the active *step*'s soft-timeout thresholds.
 
         ``over`` (red) wins over ``warn`` (yellow); a missing step or unset
-        threshold yields ``ok`` (no dot). Informational only — ADR-017 ships the
-        indicator, not auto-kill, so ``timeout_kill_seconds`` just drives the dot.
+        threshold yields ``ok`` (no dot).
+
+        This classification is informational — it drives the ADR-017 Activity
+        dot and nothing else. ``timeout_kill_seconds`` itself is no longer
+        decorative, though: ``_run_agent`` passes it to the runner as that
+        step's wall-clock kill deadline (falling back to
+        ``config.agent_timeout_seconds``), so the field now sets a real
+        deadline *and* colours the dot, and the dot goes red exactly when the
+        agent is killed. The kill is enforced by the runner, not here.
         """
         if step is None:
             return "ok"
@@ -5943,12 +5950,21 @@ class OrchestratorService:
                     f"{listed}."
                 )
 
+            # Both deadlines are passed explicitly. Omitting them is what made
+            # every step of every process inherit the runner signature's 3600s
+            # default (prod incident ``f22e232b``): an hour nobody chose, and a
+            # wall-clock hour cannot tell a working step from a wedged one.
+            # ``timeout_kill_seconds`` — already per-step in process.yaml, and
+            # until now only decorative (it drove the Activity dot) — is the
+            # step-level override for the wall-clock backstop.
             result = await runner.run(
                 system_prompt=system,
                 user_prompt=user_prompt,
                 work_dir=work_dir,
                 session_id=session_id,
                 model=resolved_model,
+                timeout_seconds=step.timeout_kill_seconds or self.config.agent_timeout_seconds,
+                idle_timeout_seconds=self.config.agent_idle_timeout_seconds,
             )
 
             info.agent_result = result

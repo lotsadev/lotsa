@@ -91,13 +91,30 @@ isn't there:
   reaped.
 - `AskUserQuestion` — no UI to render in; returns an error result
   the operator never sees.
+- **Shell-level backgrounding**, which the list above misses because
+  it isn't a tool: `cmd &`, `nohup`, and every poll-for-it idiom
+  built on them — `sleep 45; cat out.txt`, `until grep -q done
+  marker; do sleep 3; done`, re-reading a `tasks/*.output` file.
+  The backgrounded process is reaped with your turn, so the file you
+  are polling never fills and the loop just burns your dispatch
+  waiting on a writer that no longer exists. This has really
+  happened, repeatedly, in a single dispatch.
 
 **Foreground, in-turn patterns are fine.** If a command needs to
 run for a few minutes, run it foreground (e.g. `pytest -q`) and let
-your turn block on it. If a command is genuinely too slow to wait
-for in one turn, split it (run a smaller subset) rather than
-deferring it. If you need the operator's input, emit
-`NEEDS_INPUT:` (see *How to communicate*)."""
+your turn block on it. Blocking is the supported way to wait, and
+it is always cheaper than a polling loop. If a command is genuinely
+too slow to wait for in one turn, split it (run a smaller subset)
+rather than deferring it. If you need the operator's input, emit
+`NEEDS_INPUT:` (see *How to communicate*).
+
+**Run a slow command once and keep its output.** Capture it —
+`pytest -q > /tmp/out.txt 2>&1` — then re-read and grep that file as
+many times as you need. Re-running a slow command to reshape its
+output (different flags, quieter traceback, just the failures) pays
+its full cost again every time and is the most common way a dispatch
+burns its budget: one real run has been repeated eight times in a
+single turn for want of a capture."""
 
 
 class AgentRunnerError(Exception):
@@ -162,7 +179,21 @@ class AgentRunner(Protocol):
         timeout_seconds: int = 3600,
         session_id: str | None = None,
         model: str | None = None,
-    ) -> AgentResult: ...
+        idle_timeout_seconds: float | None = None,
+    ) -> AgentResult:
+        """Run one agent turn.
+
+        ``timeout_seconds`` is a wall-clock ceiling. ``idle_timeout_seconds`` is
+        the *silence* budget: a runner that can observe its agent's liveness
+        (e.g. the session log the same runner serves through ``read_activity``)
+        should stop the agent when nothing has been written for that long, and
+        ignore it otherwise. The distinction matters because a CLI agent emits
+        nothing until it exits, so wall-clock alone cannot separate a
+        long-but-working step from a wedged one. Every implementer must ACCEPT
+        the parameter — the orchestrator passes it unconditionally — even where
+        it is not yet enforced.
+        """
+        ...
 
     async def read_activity(
         self,
@@ -349,7 +380,24 @@ class ClaudeCodeRunner:
         timeout_seconds: int = 3600,
         session_id: str | None = None,
         model: str | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> AgentResult:
+        """Run one agent turn as a local ``claude --print`` subprocess.
+
+        ``idle_timeout_seconds`` is **accepted but not yet enforced here.**
+        Killing on silence needs a handle on the running process, and this
+        runner executes through ``subprocess.run`` in an executor, which exposes
+        none. ``DockerAgentRunner`` enforces it because it has an independent
+        handle on the workload — the container id — and *must* have one anyway
+        (killing the ``docker run`` client leaves the container alive). Native
+        runs therefore still get only the wall-clock ceiling, which the
+        orchestrator now sets from config instead of leaving at this signature's
+        3600s default. Closing the gap means restructuring this call around
+        ``asyncio.create_subprocess_exec``; tracked in docs/post-launch-plan.md.
+
+        Practically this is the dev-machine path: ADR-038 routes Linux servers
+        through Docker because the native sandbox doesn't start there.
+        """
         # Per-step override (ADR-022): when set, this one invocation runs
         # against ``model`` instead of the construction-time default.
         effective_model = model or self._model
