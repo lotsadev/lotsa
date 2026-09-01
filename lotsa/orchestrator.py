@@ -4262,8 +4262,10 @@ class OrchestratorService:
         new_stack = get_stack(metadata)
         # (destination ResolvedJob-or-bare-state, workflow, catch-site step name).
         # The catch-site step is carried so the bare-state branch below can
-        # preserve ``current_step`` (mirroring ``block()`` / the drainer's
-        # ``blocked`` branch) rather than nulling it.
+        # preserve ``current_step`` for a non-terminal catch (``blocked`` — where
+        # the dashboard shows where the task blocked, mirroring ``block()`` — or
+        # an in-flow resume); a terminal catch (``complete``/``abandoned``) nulls
+        # it, matching every other terminal transition in this file.
         catch: tuple[Any, str, str] | None = None
         while new_stack:
             caller = new_stack[-1]
@@ -4310,16 +4312,34 @@ class OrchestratorService:
             return
 
         dest, caught_wf, catch_step = catch
+        to_state: str
+        to_status: TaskStatusLiteral
+        to_step: str | None
         if isinstance(dest, str):
-            # Catch resolved to a bare state (e.g. ``blocked``) rather than a step.
-            # Preserve ``current_step`` as the catch-site step — every other path
-            # that blocks a task in this file (``block()``, the agent-drainer's
-            # ``target == "blocked"`` branch, ``transition_task``) keeps
-            # ``current_step`` so the dashboard shows where the task blocked;
-            # nulling it here would be the lone inconsistent site.
-            to_state = dest
-            to_status: TaskStatusLiteral = "blocked" if dest == "blocked" else "working"
-            to_step: str | None = catch_step
+            # Catch resolved to a bare state, not a step. Map ``to_status`` from
+            # the state rather than assuming "blocked-else-working": a catch may
+            # name a TERMINAL status. ``routes: { terminate: complete }`` (and
+            # ``abandoned``) is valid YAML — both are accepted sentinels in
+            # ``_validate_rule_targets`` — and ``terminate: next`` on a last step
+            # also resolves to ``complete`` via ``resolve_output_target``.
+            #   * ``complete`` / ``abandoned`` END the task: fold the status flip
+            #     into this CAS and null ``current_step`` (mirroring the
+            #     ``catch is None`` terminal branch above). Treating these as
+            #     ``working`` left the task stuck at ``status="working"`` /
+            #     ``state="complete"`` and then re-dispatched into a non-existent
+            #     step — never shown complete, never resumable.
+            #   * ``blocked`` PARKS it and keeps the catch-site step so the
+            #     dashboard shows where it blocked (matches ``block()`` / the
+            #     drainer's ``blocked`` branch).
+            #   * anything else is an in-flow queue_state → resume there.
+            if dest == "complete":
+                to_state, to_status, to_step = "complete", "complete", None
+            elif dest == "abandoned":
+                to_state, to_status, to_step = "abandoned", "abandoned", None
+            elif dest == "blocked":
+                to_state, to_status, to_step = "blocked", "blocked", catch_step
+            else:
+                to_state, to_status, to_step = dest, "working", catch_step
             dest_queue = dest
         else:
             to_state = dest.queue_state
@@ -4345,7 +4365,11 @@ class OrchestratorService:
         if not cas.won:
             return
         item.state = dest_queue
-        if to_status == "working":
+        if to_status in ("complete", "abandoned"):
+            # A terminal catch ends the task — mirror the ``catch is None``
+            # branch and reclaim the worktree.
+            await self._cleanup_worktree_if_done(item)
+        elif to_status == "working":
             fresh2 = await self.db.get_task(item.id)
             if fresh2 is not None:
                 resumed = Item(

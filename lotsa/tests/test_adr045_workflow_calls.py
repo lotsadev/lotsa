@@ -925,6 +925,69 @@ def test_terminate_caught_by_caller_frame(tmp_path, run):
         run(svc.db.close())
 
 
+def _write_terminate_complete_catcher(path: Path) -> Path:
+    path.write_text(
+        """
+process: completer
+jobs:
+  - name: gate
+    type: agent
+    prompt: coding
+    queue_state: gating
+    active_state: gating
+    routes: { terminate: complete }
+flows:
+  main:
+    steps: [gate]
+"""
+    )
+    return path
+
+
+def test_terminate_catch_to_a_terminal_status_ends_the_task(tmp_path, run):
+    """A ``routes: { terminate: complete }`` catch (``complete``/``abandoned`` are
+    accepted sentinels, so this is valid YAML) must END the task, not park it at
+    ``status="working"``.
+
+    Fails pre-fix: the bare-state catch branch only special-cased ``blocked``
+    (``to_status = "blocked" if dest == "blocked" else "working"``). A catch
+    resolving to ``"complete"`` therefore landed ``status="working"`` /
+    ``state="complete"`` / ``current_step="gate"`` and then re-dispatched into a
+    non-existent step — the task was stuck (never shown complete, never resumable).
+    Post-fix the transition folds to ``status="complete"`` with a null step.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        completer = build_process(
+            "completer", process_file=_write_terminate_complete_catcher(tmp_path / "completer.yaml")
+        )
+        svc._processes["completer"] = completer
+        task = _seed(
+            svc,
+            run,
+            state="coding",
+            current_step="code",
+            stack=[
+                {"workflow": "completer", "step": "gate", "called_from": None},
+                {"workflow": "build", "step": "code", "called_from": "gate"},
+            ],
+        )
+        row = run(svc.db.get_task(task.id))
+        run(svc._unwind_terminate(_item_from(row), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "complete", (
+            f"a terminate → complete catch must end the task, not leave it working; status={row.status!r}"
+        )
+        assert row.state == "complete", f"the terminal state must be persisted; state={row.state!r}"
+        assert row.current_step is None, (
+            f"a terminal catch nulls current_step (matches every other terminal transition); got {row.current_step!r}"
+        )
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
 def test_route_stack_target_dispatches_a_call(tmp_path, run):
     """``_route_stack_target`` (the single seam the three finalize sites share)
     treats a ``call <workflow>`` target as a stack push + callee dispatch — the
