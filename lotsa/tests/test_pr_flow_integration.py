@@ -1,9 +1,13 @@
-"""End-to-end flow integration tests for the PR phase (ADR-014 Layer A).
+"""End-to-end flow integration tests for the PR phase.
 
-Rewritten for the typed-job model: the PR phase is now expressed as a
-``push_pr`` action job and a ``wait_for_pr_signal`` monitor job, with a
-separate ``pr_fix`` sub-flow that the engine dispatches into. No
-synthetic states, no ``pr_config`` attribute, no ``target: previous``.
+ADR-045 — the PR phase is no longer a ``pr_fix`` *sub-flow* of ``build``/``fix``;
+it is the standalone ``pr-monitor`` workflow (``wait_for_pr_signal`` monitor +
+``pr-fix``/``resolve_conflicts``/``review``/``push_pr``), entered by a ``call
+pr-monitor`` edge. A task in the PR phase carries a two-frame ``call_stack`` whose
+top frame names ``pr-monitor`` (replacing the removed ``current_flow="pr_fix"``
+metadata slot). The pre-ADR-045 sub-flow topology / cross-flow-edge tests moved
+to ``test_adr045_workflow_calls.py``; the behavioural tests below stage the
+pr-monitor call stack via ``_PR_MONITOR_STACK``.
 """
 
 from __future__ import annotations
@@ -12,21 +16,28 @@ import yaml
 
 from lotsa.flows import build_process
 
+# ADR-045 — the call_stack that places a task INSIDE the ``pr-monitor`` workflow
+# (called from ``build``'s ``push_pr``). ``_resolve_flow`` reads the top frame's
+# workflow (``pr-monitor``), so ``pr-fix`` / ``resolve_conflicts`` / ``review``
+# resolve against pr-monitor's flow and its per-binding rule overrides — exactly
+# what the removed ``current_flow="pr_fix"`` slot used to select.
+_PR_MONITOR_STACK = [
+    {"workflow": "build", "step": "push_pr", "called_from": None},
+    {"workflow": "pr-monitor", "step": "pr-fix", "called_from": "push_pr"},
+]
+
 # The ``_isolated_registry`` autouse fixture lives in ``lotsa/tests/conftest.py``
 # (uses the public ``registry.snapshot()`` / ``registry.restore()`` API). Tests
 # in this module pop the built-in ``push_pr`` and register stubs inline; the
 # fixture restores the built-in after each test.
 
 
-def test_full_process_has_push_pr_action_and_wait_for_pr_signal_monitor():
-    """The full process exposes the new typed PR-phase jobs."""
-    process = build_process("build")
-    push_pr = next(j for j in process.jobs if j.name == "push_pr")
-    wait = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
-    assert push_pr.type == "action"
-    assert push_pr.tool == "push_pr"
-    assert wait.type == "monitor"
-    assert wait.engine == "pr_monitor"
+# ADR-045 — the PR-phase topology tests (build carries the ``push_pr`` action +
+# ``wait_for_pr_signal`` monitor; the ``pr_fix`` sub-flow and its cross-flow
+# entry/exit edges) moved to ``test_adr045_workflow_calls.py`` when ``pr-monitor``
+# became a standalone workflow: ``build``/``fix`` main no longer contain
+# ``wait_for_pr_signal`` or a ``pr_fix`` flow, and there is no cross-flow edge
+# machinery to assert. Those tests are deleted here (superseded), not migrated.
 
 
 def test_full_process_main_flow_has_no_synthetic_pr_states():
@@ -46,21 +57,6 @@ def test_full_process_main_review_fail_targets_code():
     review_binding = next(b for b in main.bindings if b.name == "review")
     fail = next(r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern)
     assert fail.target == "code"
-
-
-def test_full_process_pr_fix_has_no_verify_step():
-    """The pr_fix sub-flow skips verify (supersedes PR #62 stopgap)."""
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    assert not any(b.name == "verify" for b in pr_fix.bindings)
-
-
-def test_pr_fix_flow_skipped_targets_wait_for_pr_signal():
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
-    skipped = next(r for r in (pr_fix_binding.rules or []) if "SKIPPED" in r.pattern)
-    assert skipped.target == "wait_for_pr_signal"
 
 
 def test_custom_process_with_monitor_job(tmp_path):
@@ -107,93 +103,6 @@ def test_flow_without_monitor_has_no_pr_phase_states(tmp_path):
     main = process.flows["main"]
     for synthetic in ("pushing", "waiting_for_pr", "rebasing", "wait_for_pr_signal"):
         assert synthetic not in main.state_machine.states
-
-
-def test_full_process_pr_fix_review_fail_targets_pr_fix():
-    """Per-flow override: in pr_fix, review's AGENT_RESULT: FAILED loops back to pr-fix."""
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    review_binding = next(b for b in pr_fix.bindings if b.name == "review")
-    fail = next(r for r in (review_binding.rules or []) if "AGENT_RESULT: FAILED" in r.pattern)
-    assert fail.target == "pr-fix"
-
-
-def test_pr_fix_flow_pr_fix_active_to_wait_for_pr_signal_transition_registered():
-    """SKIPPED routes ``pr-fix`` back into the monitor — the SM transition must exist."""
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    pr_fix_step = next(rj for rj in pr_fix.jobs if rj.name == "pr-fix")
-    assert (pr_fix_step.active_state, "wait_for_pr_signal") in pr_fix.state_machine.transitions
-
-
-# ---------------------------------------------------------------------------
-# Cross-flow edges registered on main's SM — the orchestrator uses a single
-# ``self.flow.state_machine`` for every CAS check, so main must know about
-# sub-flow entry / exit transitions or the dispatch CAS rejects them.
-# ---------------------------------------------------------------------------
-
-
-def test_main_flow_has_sub_flow_entry_edge_into_pr_fix():
-    """``_dispatch_pr_fix_locked`` CAS's into pr-fix's queue_state against main's SM.
-
-    Without the (wait_for_pr_signal, pr-fixing) edge, ``_dispatch_step``'s
-    pre-CAS guard rejects the dispatch and the task stalls in ``working``.
-    """
-    process = build_process("build")
-    main = process.flows["main"]
-    pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
-    assert (
-        "wait_for_pr_signal",
-        pr_fix_step.queue_state,
-    ) in main.state_machine.transitions, (
-        "Main's SM must contain the (monitor_state, pr_fix_queue_state) sub-flow entry edge."
-    )
-
-
-def test_main_flow_has_sub_flow_exit_edges_back_through_pr_fix_rules():
-    """AGENT_RESULT: SKIPPED / AGENT_RESULT: COMPLETED land on main's SM via ``self.flow``.
-
-    The drainer evaluates pr-fix's rules and CAS's against ``self.flow`` (= main).
-    Each rule target that names a main-flow job needs the corresponding edge
-    registered in main's SM, even though the rules live in the pr_fix sub-flow.
-    """
-    process = build_process("build")
-    main = process.flows["main"]
-    pr_fix_step = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
-    # AGENT_RESULT: SKIPPED → wait_for_pr_signal
-    assert (pr_fix_step.active_state, "wait_for_pr_signal") in main.state_machine.transitions
-    # AGENT_RESULT: COMPLETED → review
-    review = next(rj for rj in main.jobs if rj.name == "review")
-    assert (pr_fix_step.active_state, review.queue_state) in main.state_machine.transitions
-    # AGENT_RESULT: FAILED → blocked
-    assert (pr_fix_step.active_state, "blocked") in main.state_machine.transitions
-
-
-def test_pr_fix_flow_has_sub_flow_entry_edge_from_monitor():
-    """The (wait_for_pr_signal, pr-fixing) entry edge must be present in BOTH
-    main's SM AND pr_fix's SM.
-
-    Regression for the silent-no-op bug: ``_dispatch_pr_fix_locked`` merges
-    ``current_flow="pr_fix"`` into the task's metadata before calling
-    ``_dispatch_step``. ``_dispatch_step`` then resolves ``active_flow`` via
-    ``_resolve_flow(item)`` — which reads that metadata and returns the
-    pr_fix FlowConfig — and validates the pre-CAS transition against
-    ``pr_fix.state_machine.transitions``. If the entry edge is only
-    registered in main's SM, the guard fires and the dispatch silently
-    returns. The task is stranded at ``(status=working, state=wait_for_pr_signal)``
-    until the next server restart flips it to blocked. The companion runtime
-    test below exercises the full path.
-    """
-    process = build_process("build")
-    pr_fix_first = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
-    assert (
-        "wait_for_pr_signal",
-        pr_fix_first.queue_state,
-    ) in process.flows["pr_fix"].state_machine.transitions, (
-        "pr_fix's SM must contain the sub-flow entry edge — _dispatch_step "
-        "validates against the resolved active flow, which is pr_fix after "
-        "_dispatch_pr_fix_locked merges current_flow into metadata."
-    )
 
 
 def test_dispatch_pr_fix_transitions_task_to_pr_fixing(tmp_path):
@@ -263,13 +172,15 @@ def test_dispatch_pr_fix_transitions_task_to_pr_fixing(tmp_path):
                 row = run(svc.db.get_task(task.id))
                 assert row.state == "pr-fixing", (
                     f"Expected dispatch to CAS state→pr-fixing, got state={row.state!r}. "
-                    "Regression: _dispatch_pr_fix_locked merged current_flow=pr_fix "
-                    "into metadata, then _dispatch_step resolved active_flow=pr_fix and "
-                    "found no (wait_for_pr_signal, pr-fixing) edge there, so the "
-                    "transition silently no-op'd."
+                    "ADR-045: dispatch_pr_fix resolves ``pr-fix`` against the task's "
+                    "ACTIVE workflow (pr-monitor, inferred from the monitor state) and "
+                    "CAS's the row into pr-fixing — an intra-workflow edge."
                 )
                 assert row.status == "working"
-                assert row.metadata.get("current_flow") == "pr_fix"
+                # ADR-045 — pr-fix is an intra-workflow edge (the task is already
+                # inside pr-monitor); dispatch pushes no frame and no longer writes
+                # the removed ``current_flow`` slot.
+                assert "current_flow" not in row.metadata
             finally:
                 run(svc.shutdown())
                 run(db.close())
@@ -310,7 +221,11 @@ def test_block_untracks_pr_monitor_for_new_monitor_state(tmp_path):
                 # bundled ``full`` process names its monitor state
                 # ``wait_for_pr_signal``. If this changes the test must
                 # change with it.
-                active = svc._active_process_name
+                # ADR-045 — the monitor lives in the standalone ``pr-monitor``
+                # workflow now, not in ``build`` main; its plumbing keys under
+                # ``pr-monitor`` (a task in the PR phase resolves it via the
+                # active call-stack frame).
+                active = "pr-monitor"
                 assert svc._monitor_states_by_process[active] == "wait_for_pr_signal"
 
                 # Stand up a fake PrMonitor that records untrack calls. The
@@ -389,7 +304,11 @@ def test_start_instantiates_monitor_engine_via_registry(tmp_path):
         try:
             run(svc.start())
             try:
-                active = svc._active_process_name
+                # ADR-045 — the monitor lives in the standalone ``pr-monitor``
+                # workflow now, not in ``build`` main; its plumbing keys under
+                # ``pr-monitor`` (a task in the PR phase resolves it via the
+                # active call-stack frame).
+                active = "pr-monitor"
                 assert svc._monitor_states_by_process[active] == "wait_for_pr_signal"
                 engine = svc._pr_monitors_by_process[active]
                 assert isinstance(engine, PrMonitorEngine), (
@@ -476,92 +395,19 @@ def test_transition_task_legacy_waiting_for_pr_state_completes_on_merge(tmp_path
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_flow_returns_subflow_when_metadata_set(tmp_path):
-    """``_resolve_flow(item)`` honours the ``current_flow`` metadata field."""
-    import asyncio
-
-    from lotsa.config import LotsaConfig
-    from lotsa.db import TaskDB
-    from lotsa.orchestrator import OrchestratorService
-    from rigg.models import Item
-
-    loop = asyncio.new_event_loop()
-    try:
-        run = loop.run_until_complete
-        (tmp_path / "data").mkdir()
-        # Use the bundled "full" process — it ships both ``main`` and
-        # ``pr_fix`` flows with different ``review`` bindings.
-        config = LotsaConfig(
-            data_dir=tmp_path / "data",
-            work_dir=tmp_path,
-            flow="build",
-            model="sonnet",
-            budget=5.0,
-        )
-        db = TaskDB(tmp_path / "data" / "lotsa.db")
-        run(db.initialize())
-        svc = OrchestratorService(config, db)
-        try:
-            run(svc.start())
-            try:
-                # Item without metadata → root flow
-                item_main = Item(id="t1", state="reviewing", title="x")
-                assert svc._resolve_flow(item_main).name == "main"
-
-                # Item with ``current_flow=pr_fix`` → pr_fix flow
-                item_subflow = Item(
-                    id="t2",
-                    state="reviewing",
-                    title="x",
-                    metadata={"current_flow": "pr_fix"},
-                )
-                assert svc._resolve_flow(item_subflow).name == "pr_fix"
-
-                # Unknown flow name → falls back to root flow rather than crashing
-                item_bogus = Item(
-                    id="t3",
-                    state="reviewing",
-                    title="x",
-                    metadata={"current_flow": "no_such_flow"},
-                )
-                assert svc._resolve_flow(item_bogus).name == "main"
-
-                # The two flows' review bindings have different rules — the
-                # whole point of the override. Confirm the lookup returns
-                # bindings that actually carry the expected per-flow rules.
-                main_review = svc._find_step_for_state("reviewing", item=item_main)
-                assert main_review is not None
-                main_fail = next(r for r in main_review.rules if "AGENT_RESULT: FAILED" in r.pattern)
-                assert main_fail.target == "code", (
-                    "root-flow lookup must return main's review binding (AGENT_RESULT: FAILED → code)"
-                )
-
-                subflow_review = svc._find_step_for_state("reviewing", item=item_subflow)
-                assert subflow_review is not None
-                subflow_fail = next(r for r in subflow_review.rules if "AGENT_RESULT: FAILED" in r.pattern)
-                assert subflow_fail.target == "pr-fix", (
-                    "pr_fix sub-flow lookup must return pr_fix's review binding "
-                    "(AGENT_RESULT: FAILED → pr-fix). Regression for PR #65 review: a task "
-                    "mid-pr_fix-cycle was dispatching main's review and looping "
-                    "back into ``code`` instead of ``pr-fix``."
-                )
-            finally:
-                run(svc.shutdown())
-                run(db.close())
-        except Exception:
-            run(db.close())
-            raise
-    finally:
-        loop.close()
+# ADR-045 — ``_resolve_flow`` honouring ``current_flow`` to pick a sub-flow is
+# removed; the active workflow is the top call-stack frame. Coverage moved to
+# ``test_adr045_workflow_calls.py::test_resolve_flow_reads_top_call_stack_frame``
+# (a ``build`` task whose stack top is ``pr-monitor`` resolves pr-monitor's flow).
 
 
 # ---------------------------------------------------------------------------
-# Runtime: pr_fix happy path end-to-end. Drives a task through the canonical
-# sub-flow round-trip (pr-fix → review → push_pr → wait_for_pr_signal) and
-# asserts the task lands back in the host flow's monitor state with
-# ``current_flow`` reset to ``main``. Regression for two bugs where the
-# orchestrator validated transitions against the root flow's SM and rejected
-# legitimate sub-flow edges (AGENT_RESULT: PASSED → push_pr, push_pr → wait_for_pr_signal),
+# Runtime: pr-monitor happy path end-to-end. Drives a task through the canonical
+# round-trip (pr-fix → review → push_pr → wait_for_pr_signal) and asserts the
+# task lands back in the monitor state — all WITHIN the ``pr-monitor`` workflow
+# now (no sub-flow entry/exit, no ``current_flow`` reset). Regression for two bugs
+# where the orchestrator validated transitions against the root flow's SM and
+# rejected legitimate edges (AGENT_RESULT: PASSED → push_pr, push_pr → wait_for_pr_signal),
 # stranding the task at ``status=working`` with no advance.
 # ---------------------------------------------------------------------------
 
@@ -628,7 +474,7 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
             try:
                 # Stage a task mid-pr_fix, sitting at reviewing/working as if
                 # the pr_fix review agent has just finished.
-                task = run(svc.db.create_task("Test", state="reviewing", metadata={"current_flow": "pr_fix"}))
+                task = run(svc.db.create_task("Test", state="reviewing", metadata={"call_stack": _PR_MONITOR_STACK}))
                 run(
                     svc.db.claim_task_transition(
                         task.id,
@@ -639,8 +485,8 @@ def test_pr_fix_sub_flow_review_pass_advances_to_push_pr(tmp_path):
                         to_current_step="review",
                     )
                 )
-                item = Item(id=task.id, state="reviewing", title="Test", metadata={"current_flow": "pr_fix"})
-                review_step = next(rj for rj in svc.process.flows["pr_fix"].jobs if rj.name == "review")
+                item = Item(id=task.id, state="reviewing", title="Test", metadata={"call_stack": _PR_MONITOR_STACK})
+                review_step = next(rj for rj in svc._processes["pr-monitor"].flows["main"].jobs if rj.name == "review")
 
                 # Synthesise the drainer completion the agent would have produced.
                 info = InFlightStep(item=item, step=review_step, feedback=None, step_work_dir=tmp_path)
@@ -742,7 +588,7 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
 
         run(svc.start())
         try:
-            task = run(svc.db.create_task("Test", state="pr-fixing", metadata={"current_flow": "pr_fix"}))
+            task = run(svc.db.create_task("Test", state="pr-fixing", metadata={"call_stack": _PR_MONITOR_STACK}))
             run(
                 svc.db.claim_task_transition(
                     task.id,
@@ -757,8 +603,8 @@ def test_pr_fix_done_then_review_pass_real_dispatch_advances_to_push_pr(tmp_path
             # validates (in a real run the main-flow spec/plan steps produced them).
             run(svc.db.add_message(task.id, "agent", "spec", "s", "artifact", metadata={"artifact_name": "spec"}))
             run(svc.db.add_message(task.id, "agent", "plan", "p", "artifact", metadata={"artifact_name": "plan"}))
-            item = Item(id=task.id, state="pr-fixing", title="Test", metadata={"current_flow": "pr_fix"})
-            pr_fix_step = next(rj for rj in svc.process.flows["pr_fix"].jobs if rj.name == "pr-fix")
+            item = Item(id=task.id, state="pr-fixing", title="Test", metadata={"call_stack": _PR_MONITOR_STACK})
+            pr_fix_step = next(rj for rj in svc._processes["pr-monitor"].flows["main"].jobs if rj.name == "pr-fix")
 
             # Synthesise the pr-fix completion → drainer routes AGENT_RESULT: COMPLETED → review
             # (the REAL review dispatch under test) → review agent returns AGENT_RESULT: PASSED.
@@ -844,7 +690,7 @@ def test_retry_review_in_pr_fix_advances_to_push_pr(tmp_path):
                     state="reviewing",
                     status="blocked",
                     current_step="review",
-                    metadata={"current_flow": "pr_fix"},
+                    metadata={"call_stack": _PR_MONITOR_STACK},
                 )
             )
             run(svc.db.add_message(task.id, "agent", "spec", "s", "artifact", metadata={"artifact_name": "spec"}))
@@ -929,7 +775,7 @@ def test_answer_review_in_pr_fix_advances_to_push_pr(tmp_path):
                     state="reviewing",
                     status="needs_input",
                     current_step="review",
-                    metadata={"current_flow": "pr_fix"},
+                    metadata={"call_stack": _PR_MONITOR_STACK},
                 )
             )
             run(svc.db.add_message(task.id, "agent", "spec", "s", "artifact", metadata={"artifact_name": "spec"}))
@@ -988,7 +834,7 @@ def test_resolve_step_for_row_prefers_active_flow(tmp_path):
                     state="reviewing",
                     status="blocked",
                     current_step="review",
-                    metadata={"current_flow": "pr_fix"},
+                    metadata={"call_stack": _PR_MONITOR_STACK},
                 )
             )
 
@@ -1063,7 +909,7 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
         try:
             run(svc.start())
             try:
-                task = run(svc.db.create_task("Test", state="push_pr", metadata={"current_flow": "pr_fix"}))
+                task = run(svc.db.create_task("Test", state="push_pr", metadata={"call_stack": _PR_MONITOR_STACK}))
                 run(
                     svc.db.claim_task_transition(
                         task.id,
@@ -1074,8 +920,8 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
                         to_current_step="push_pr",
                     )
                 )
-                item = Item(id=task.id, state="push_pr", title="Test", metadata={"current_flow": "pr_fix"})
-                push_pr_step = next(j for j in svc.process.flows["pr_fix"].jobs if j.name == "push_pr")
+                item = Item(id=task.id, state="push_pr", title="Test", metadata={"call_stack": _PR_MONITOR_STACK})
+                push_pr_step = next(j for j in svc._processes["pr-monitor"].flows["main"].jobs if j.name == "push_pr")
                 run(svc._dispatch_step(item, push_pr_step))
                 # Pump the action task: it yields on metadata writes.
                 for _ in range(5):
@@ -1083,15 +929,14 @@ def test_pr_fix_sub_flow_push_pr_success_returns_to_monitor(tmp_path):
 
                 row = run(svc.db.get_task(task.id))
                 assert row.state == "wait_for_pr_signal", (
-                    f"Expected sub-flow exit to wait_for_pr_signal, got state={row.state!r}. "
-                    "Regression: action-step success path was routing pr_fix.push_pr to "
-                    "'complete' (the binding's natural success_state), which is rejected "
-                    "by main's SM and stranded the task at (push_pr, working)."
+                    f"Expected push_pr to loop back to wait_for_pr_signal, got state={row.state!r}. "
+                    "ADR-045: pr-monitor's ``push_pr`` routes ``COMPLETED: wait_for_pr_signal`` "
+                    "(an intra-workflow edge), not the removed sub-flow terminal override."
                 )
                 assert row.status == "waiting_for_pr"
-                assert row.metadata.get("current_flow") == "main", (
-                    "Sub-flow exit must reset current_flow to the host flow."
-                )
+                # ADR-045 — push_pr → wait_for_pr_signal stays inside pr-monitor;
+                # the call stack is unchanged (no unwind), still topped by pr-monitor.
+                assert [f["workflow"] for f in row.metadata["call_stack"]] == ["build", "pr-monitor"]
             finally:
                 run(svc.shutdown())
                 run(db.close())
@@ -1405,7 +1250,7 @@ def test_retry_on_blocked_pr_fix_task_resumes_pr_fix_not_spec(tmp_path):
                     svc.db.create_task(
                         "Test",
                         state="pr-fixing",
-                        metadata={"current_flow": "pr_fix"},
+                        metadata={"call_stack": _PR_MONITOR_STACK},
                     )
                 )
                 # pr-fix has inputs=[spec, plan]; without these artifacts
@@ -1520,15 +1365,16 @@ def test_jump_to_step_pr_fix_finds_subflow_step_via_process_catalog(tmp_path):
         loop.close()
 
 
-def test_jump_to_step_into_pr_fix_sets_current_flow_metadata(tmp_path):
-    """Regression: ``jump_to_step("pr-fix")`` must write ``current_flow="pr_fix"``.
+def test_jump_to_step_into_pr_fix_resolves_via_active_workflow(tmp_path):
+    """ADR-045: ``jump_to_step("pr-fix")`` on a PR-phase task resolves ``pr-fix``
+    against the task's ACTIVE workflow (``pr-monitor``, inferred from the monitor
+    state) and lands it at pr-fixing — writing NO ``current_flow`` slot.
 
-    Pre-fix behavior: ``_dispatch_pr_fix_locked`` set ``current_flow="pr_fix"``
-    so the subsequent ``review`` completion evaluated pr_fix-flow rule
-    overrides (e.g. ``AGENT_RESULT: FAILED → pr-fix``). ``jump_to_step("pr-fix")``
-    was the sixth entry point (per its own docstring) but never wrote the
-    metadata — silently letting the drainer evaluate main-flow overrides
-    (``AGENT_RESULT: FAILED → code``) instead. Round-7 review fix.
+    Replaces the pre-ADR-045 regression (jump had to write ``current_flow="pr_fix"``
+    so ``review`` evaluated the pr_fix-flow overrides). The active workflow is now
+    the top call-stack frame, so the frame — not a metadata string — selects the
+    rule overrides; jump resolves steps against it and no longer writes
+    ``current_flow`` (mirrors ``_dispatch_pr_fix_locked``).
     """
     import asyncio
 
@@ -1566,11 +1412,14 @@ def test_jump_to_step_into_pr_fix_sets_current_flow_metadata(tmp_path):
                 run(svc.jump_to_step(task.id, "pr-fix"))
 
                 row = run(svc.db.get_task(task.id))
-                assert row.metadata.get("current_flow") == "pr_fix", (
-                    f"jump_to_step('pr-fix') must set current_flow=pr_fix so subsequent "
-                    f"review evaluates pr_fix rule overrides, got "
-                    f"{row.metadata.get('current_flow')!r}"
+                assert row.current_step == "pr-fix" and row.state == "pr-fixing", (
+                    f"jump_to_step('pr-fix') must resolve pr-fix via the active pr-monitor "
+                    f"workflow and land at pr-fixing; got current_step={row.current_step!r} "
+                    f"state={row.state!r}"
                 )
+                # ADR-045 — no ``current_flow`` write; the active workflow is the
+                # top call-stack frame (or, here, inferred from the monitor state).
+                assert "current_flow" not in row.metadata
             finally:
                 run(svc.shutdown())
                 run(db.close())
@@ -1581,83 +1430,13 @@ def test_jump_to_step_into_pr_fix_sets_current_flow_metadata(tmp_path):
         loop.close()
 
 
-def test_jump_to_step_out_of_pr_fix_resets_current_flow_to_root(tmp_path):
-    """Regression: ``jump_to_step("code")`` from a pr_fix-flow task must reset
-    ``current_flow`` to the root flow so the dispatch loop can find "code".
-
-    Pre-fix behavior: a task with ``current_flow="pr_fix"`` (blocked pr-fix
-    agent) jumped to ``"code"`` left the metadata as ``"pr_fix"``;
-    ``_dispatch_next_step`` → ``_resolve_flow`` → pr_fix flow, and "code"
-    is not in pr_fix's bindings, so ``_find_step_for_state`` returned
-    ``None`` and the task silently stalled at ``status="working"`` with no
-    agent running. Round-7 review fix.
-    """
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    try:
-        run = loop.run_until_complete
-        svc, db, _ = _stub_full_process_service(tmp_path, run)
-        try:
-            run(svc.start())
-            try:
-                # Stage a task at (state=pr-fixing, status=blocked,
-                # current_flow=pr_fix) — the shape a blocked pr-fix round
-                # leaves behind. Operator decides to jump back into "code"
-                # for a redo.
-                task = run(
-                    svc.db.create_task(
-                        "Test",
-                        state="pr-fixing",
-                        metadata={"current_flow": "pr_fix"},
-                    )
-                )
-                run(
-                    svc.db.add_message(
-                        task.id, "agent", "spec", "spec content", "artifact", metadata={"artifact_name": "spec"}
-                    )
-                )
-                run(
-                    svc.db.add_message(
-                        task.id, "agent", "plan", "plan content", "artifact", metadata={"artifact_name": "plan"}
-                    )
-                )
-                run(
-                    svc.db.claim_task_transition(
-                        task.id,
-                        from_status=task.status,
-                        from_state=task.state,
-                        to_state="pr-fixing",
-                        to_status="blocked",
-                        to_current_step="pr-fix",
-                    )
-                )
-
-                run(svc.jump_to_step(task.id, "code"))
-
-                row = run(svc.db.get_task(task.id))
-                # Must land at code's queue_state — the silent-stall bug
-                # would leave it stuck after CAS at status=working with
-                # no dispatch ever firing.
-                assert row.current_step == "code", (
-                    f"jump_to_step('code') from pr_fix sub-flow must reach code's "
-                    f"queue_state; got current_step={row.current_step!r}. "
-                    "Regression: stale current_flow=pr_fix would cause "
-                    "_find_step_for_state to return None → silent stall."
-                )
-                assert row.metadata.get("current_flow") == "main", (
-                    f"jump_to_step out of pr_fix must reset current_flow to root "
-                    f"(main), got {row.metadata.get('current_flow')!r}"
-                )
-                assert row.status == "working"
-            finally:
-                run(svc.shutdown())
-                run(db.close())
-        except Exception:
-            run(db.close())
-            raise
-    finally:
-        loop.close()
+# ADR-045 — the "jump OUT of pr_fix back to a main step, resetting current_flow"
+# scenario is gone: pr-fix lives in the standalone ``pr-monitor`` workflow, and
+# ``jump_to_step`` resolves steps against the task's ACTIVE workflow (Phase 1
+# jumps are intra-workflow, not cross-workflow), so a PR-phase task cannot jump
+# to ``build``'s ``code``. The stale-current_flow silent-stall bug it guarded
+# against no longer exists (there is no ``current_flow`` slot to go stale). Test
+# deleted, not migrated.
 
 
 # ---------------------------------------------------------------------------
@@ -1682,7 +1461,7 @@ def _stage_needs_input_pr_fix_task(svc, run):
         svc.db.create_task(
             "Test",
             state="pr-fixing",
-            metadata={"current_flow": "pr_fix"},
+            metadata={"call_stack": _PR_MONITOR_STACK},
         )
     )
     run(svc.db.add_message(task.id, "agent", "spec", "spec content", "artifact", metadata={"artifact_name": "spec"}))
@@ -1808,11 +1587,11 @@ def test_pr_fix_round_cap_fires_writes_audit_row_and_blocks(tmp_path):
         try:
             run(svc.start())
             try:
-                # max_pr_fix_rounds is 10 in the bundled ``full`` process —
-                # confirm the fixture loaded the monitor config so the cap
-                # we're testing actually fires. ADR-021: config is keyed
-                # per-process.
-                pr_cfg = svc._pr_monitor_configs_by_process[svc._active_process_name]
+                # max_pr_fix_rounds is 10 in the bundled ``pr-monitor`` workflow —
+                # confirm the fixture loaded the monitor config so the cap we're
+                # testing actually fires. ADR-045: the monitor (and its config)
+                # live in ``pr-monitor`` now, not ``build`` main.
+                pr_cfg = svc._pr_monitor_configs_by_process["pr-monitor"]
                 assert pr_cfg is not None
                 assert pr_cfg.max_pr_fix_rounds == 10
 
@@ -1823,7 +1602,7 @@ def test_pr_fix_round_cap_fires_writes_audit_row_and_blocks(tmp_path):
                     svc.db.create_task(
                         "Cap test",
                         state="pr-fixing",
-                        metadata={"current_flow": "pr_fix"},
+                        metadata={"call_stack": _PR_MONITOR_STACK},
                     )
                 )
                 run(

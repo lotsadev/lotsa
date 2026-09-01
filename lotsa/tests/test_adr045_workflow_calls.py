@@ -501,6 +501,61 @@ def test_dispatch_sub_flow_enters_named_workflow_at_target_job(tmp_path, run):
         run(svc.db.close())
 
 
+def test_jump_to_step_resolves_target_via_active_workflow(tmp_path, run):
+    """``jump_to_step`` resolves its target step against the task's ACTIVE
+    workflow (top call-stack frame), mirroring ``dispatch_pr_fix`` /
+    ``_block_after_sync`` / retry's ``_resolve_step_for_row``.
+
+    A ``build`` task parked inside ``pr-monitor`` jumps to ``pr-fix`` (a job that
+    lives only in ``pr-monitor`` now) and lands at pr-fixing.
+
+    Fails pre-fix: ``jump_to_step`` resolved the target via ``_root_flow_for`` /
+    ``_process_for`` (the creation process = ``build``), which no longer carries
+    ``pr-fix``, so it raised ``ValueError("Unknown step: pr-fix")``.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        pr_monitor = svc._processes["pr-monitor"].flows["main"]
+        pr_fix_job = next(rj for rj in pr_monitor.jobs if rj.name == "pr-fix")
+        task = run(
+            svc.db.create_task(
+                "jump into pr-fix",
+                state="reviewing",
+                status="working",
+                current_step="review",
+                metadata={
+                    "pr_number": 3,
+                    "process_name": "build",
+                    "call_stack": [
+                        {"workflow": "build", "step": "push_pr", "called_from": None},
+                        {"workflow": "pr-monitor", "step": "review", "called_from": "push_pr"},
+                    ],
+                },
+            )
+        )
+        # pr-fix historically declares spec/plan inputs — seed them so the
+        # missing-artifact branch doesn't roll the dispatch back to blocked.
+        for art in ("spec", "plan"):
+            run(
+                svc.db.add_message(task.id, "agent", art, f"{art} content", "artifact", metadata={"artifact_name": art})
+            )
+
+        run(svc.jump_to_step(task.id, "pr-fix"))
+        row = run(svc.db.get_task(task.id))
+        assert row.current_step == "pr-fix" and row.state == pr_fix_job.active_state, (
+            f"jump must resolve pr-fix via the active pr-monitor workflow and land at "
+            f"{pr_fix_job.active_state!r}; got current_step={row.current_step!r} state={row.state!r}"
+        )
+        # ADR-045 — jump does not write the removed ``current_flow`` slot; the
+        # active workflow is the (unchanged) top call-stack frame.
+        assert "current_flow" not in row.metadata
+        assert [f["workflow"] for f in row.metadata["call_stack"]] == ["build", "pr-monitor"]
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
 # ===========================================================================
 # I. Legacy rows — current_flow with no call_stack routes to blocked
 # ===========================================================================

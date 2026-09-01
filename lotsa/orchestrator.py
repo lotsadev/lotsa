@@ -1197,10 +1197,12 @@ class OrchestratorService:
         for proc_name, process in self._processes.items():
             self._register_process_plumbing(proc_name, process)
 
-        # ADR-045 — validate the cross-workflow call graph once the full catalog
-        # is loaded (a single ``build_process`` cannot see its siblings): an
-        # unknown ``call <workflow>`` target or a call cycle fails startup, not a
-        # task. Repo workflows join the graph after ``_build_repo_processes``.
+        # ADR-045 — validate the cross-workflow call graph once the bundled/inline
+        # catalog is loaded (a single ``build_process`` cannot see its siblings):
+        # an unknown ``call <workflow>`` target or a call cycle fails startup, not
+        # a task. Repo-shipped workflows are validated separately, over the merged
+        # per-project namespace, inside ``_build_repo_processes`` (below) — fail-
+        # soft there, since a repo workflow must never abort ``start()``.
         validate_call_graph(self._processes)
 
         # ADR-029 — seed/sync projects (and run path-change resets + legacy
@@ -3449,26 +3451,31 @@ class OrchestratorService:
         # the helpers' ``None`` fallback, preserving the original "valid
         # step_name + missing task → silent return" behaviour below.
         task = await self.db.get_task(task_id)
-        root_flow = self._root_flow_for(task)
+        # ADR-045 — resolve the target step against the task's ACTIVE workflow
+        # (the top call-stack frame), mirroring ``_dispatch_pr_fix_locked`` /
+        # ``_block_after_sync`` / retry's ``_resolve_step_for_row``. A ``build``
+        # task parked inside ``pr-monitor`` resolves ``pr-fix`` / ``resolve_conflicts``
+        # here; resolving against the creation process's root flow (the old
+        # ``_root_flow_for``) would miss them now that those jobs live only in the
+        # standalone ``pr-monitor`` workflow — reintroducing the "Unknown step"
+        # bug the sub-flow catalog fallback originally closed.
+        active_process = self._active_process_for(task)
+        active_flow = active_process.flows.get("main") or next(iter(active_process.flows.values()))
 
         # Find the target step by name
         target_step = None
         target_index = None
-        for i, step in enumerate(root_flow.steps):
+        for i, step in enumerate(active_flow.steps):
             if step.name == step_name:
                 target_step = step
                 target_index = i
                 break
-        if target_step is None and self.process is not None:
-            # ADR-014 Layer A — ``step_name`` may identify a sub-flow job
-            # (e.g. ``pr-fix`` lives in the ``pr_fix`` sub-flow, not in
-            # ``main``'s bindings). Walk the task's process-level catalog so
-            # cross-flow jumps work. ``target_index`` stays ``None`` —
-            # cross-flow jumps have no comparable index in main's binding
-            # order; downstream direction-computation treats that as
-            # "forward". Mirrors the catalog fallback at
-            # ``_dispatch_pr_fix_locked``.
-            target_step = next((s for s in self._process_for(task).jobs if s.name == step_name), None)
+        if target_step is None:
+            # ``step_name`` may be a job of the active workflow that isn't in its
+            # ``main`` binding order (defensive — the standalone workflows keep
+            # every job in ``main`` now). ``target_index`` stays ``None`` — no
+            # comparable position to diff for direction, treated as "forward".
+            target_step = next((s for s in active_process.jobs if s.name == step_name), None)
         if target_step is None:
             raise ValueError(f"Unknown step: {step_name}")
 
@@ -3539,7 +3546,7 @@ class OrchestratorService:
                 # below and any downstream analytics keyed on the step.
                 current = self._find_step_for_state(task.state, item=item)
                 if current is None:
-                    current = find_step(root_flow, task.state)
+                    current = find_step(active_flow, task.state)
                 from_step_name = current.name if current else task.state
 
             # Drop any PR-monitor tracking before transitioning away from
@@ -3555,15 +3562,15 @@ class OrchestratorService:
                     engine.untrack(task_id)
 
             # Determine direction. ``target_index`` is None when the target
-            # step came from the cross-flow fallback (sub-flow job not in
-            # main's binding order) — there is no comparable position to
+            # step wasn't in the active flow's binding order (defensive
+            # catalog fallback) — there is no comparable position to
             # diff against ``current_index``, so default to "forward".
             if target_index is None:
                 direction = "forward"
             else:
                 current_index = None
                 if from_step_name:
-                    for i, step in enumerate(root_flow.steps):
+                    for i, step in enumerate(active_flow.steps):
                         if step.name == from_step_name:
                             current_index = i
                             break
@@ -3587,34 +3594,13 @@ class OrchestratorService:
                 },
             )
 
-            # Sync ``current_flow`` metadata to the target step's owning flow
-            # before dispatching. Two failure modes this closes:
-            #
-            #  (a) Jumping OUT of a sub-flow into the root flow: a task with
-            #      ``current_flow="pr_fix"`` (blocked pr-fix agent) jumped to
-            #      ``"code"`` would leave the metadata as ``"pr_fix"``;
-            #      ``_dispatch_next_step`` → ``_resolve_flow`` → pr_fix flow,
-            #      and ``"code"`` is not in pr_fix's bindings, so
-            #      ``_find_step_for_state`` returns ``None`` and the task
-            #      silently stalls at ``status="working"`` with no agent
-            #      running (only recoverable by server restart).
-            #
-            #  (b) Jumping INTO pr-fix: ``jump_to_step("pr-fix")`` previously
-            #      did not write ``current_flow="pr_fix"``, so the subsequent
-            #      ``review`` completion evaluated main-flow rule overrides
-            #      (``review FAILED → code``) instead of the pr_fix-flow
-            #      overrides (``review FAILED → pr-fix``). The
-            #      ``_dispatch_pr_fix_locked`` entry point already writes
-            #      ``current_flow="pr_fix"`` (see line ~1700); this brings
-            #      jump_to_step's pr-fix path to the same invariant.
-            #
-            # Conservative rule per the PR-round-7 review recommendation:
-            # pr-fix target → ``current_flow="pr_fix"``; any other target →
-            # reset to the root flow name (no-op when already root).
-            current_flow_name = (item.metadata or {}).get("current_flow") or root_flow.name
-            target_flow_name = "pr_fix" if is_pr_fix else root_flow.name
-            if target_flow_name != current_flow_name:
-                await self._merge_task_metadata(item, {"current_flow": target_flow_name})
+            # ADR-045 — no ``current_flow`` metadata sync. The active workflow is
+            # the top call-stack frame, resolved by ``_resolve_flow``; a jump lands
+            # a step WITHIN that active workflow (``active_flow`` above), so the
+            # frame — and therefore the flow whose rule overrides
+            # ``_dispatch_next_step`` evaluates — is already correct. The removed
+            # ``current_flow="pr_fix"`` write named a sub-flow that no longer
+            # exists and was unread by every ADR-045 resolver.
 
             # Phase 2 — for pr-fix: bump the round counter and snapshot the
             # comment IDs the monitor is tracking. Mirrors the post-CAS work
@@ -7673,6 +7659,32 @@ class OrchestratorService:
                     )
                     continue
                 built[wf_name] = process
+
+            # ADR-045 — validate the cross-workflow call graph over the MERGED
+            # per-project namespace (bundled/global + this project's repo
+            # workflows), the same guarantee bundled workflows get at line ~1204
+            # but extended to repo-shipped ``call`` edges (a repo workflow may
+            # ``call`` a bundled one). Unknown targets and cycles are caught at
+            # build time, never at task time. Consistent with the fail-soft repo
+            # policy (a malformed workflow never aborts ``start()``), a bad repo
+            # call graph drops the project's repo catalog rather than raising —
+            # so no invalid ``call`` can reach a task, and the bundled catalog
+            # (already validated) is unaffected.
+            if built:
+                try:
+                    validate_call_graph({**self._processes, **built})
+                except ValueError as exc:
+                    logger.error(
+                        "Invalid repo workflow call graph for project %r (%s); dropping the project's "
+                        "repo workflows so no invalid call can reach a task (ADR-045).",
+                        pid,
+                        exc,
+                    )
+                    built = {}
+
+            # Register plumbing only for the surviving workflows — deferred past
+            # validation so a dropped catalog leaves no dangling monitor engine.
+            for wf_name, process in built.items():
                 self._register_process_plumbing(wf_name, process, project_id=pid)
             self._project_processes[pid] = built
 
