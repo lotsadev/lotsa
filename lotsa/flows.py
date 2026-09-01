@@ -1032,12 +1032,14 @@ def _build_state_machine(
 ) -> StateMachine:
     """Derive a StateMachine from resolved jobs — no synthetic states.
 
-    Cross-flow rule targets (jobs not in ``resolved``) are intentionally
-    skipped here and stitched in by ``_register_cross_flow_edges`` after
-    every flow has been resolved. That pass has access to every flow's
-    ResolvedJob queue_state, which is the only source of truth for
-    cross-flow target queue states (a job's derived queue_state depends
-    on its position in its owning flow's bindings, not on the raw Job).
+    Rule targets that don't name a job in ``resolved`` have no in-flow SM
+    edge and are intentionally skipped here: since ADR-045 collapsed
+    sub-flows into top-level workflows, such a target is stack-crossing
+    (``call <workflow>``/``terminate``/``complete``) or a terminal sink
+    (``needs_input``), and the drainer routes it directly rather than through
+    a registered transition. There is no longer a cross-flow edge-stitching
+    pass — the removed ``_register_cross_flow_edges`` used to add those once
+    every flow had resolved.
     """
     states: set[str] = {"complete", "blocked", "abandoned"}
     transitions: dict[tuple[str, str], TransitionRule] = {}
@@ -1076,23 +1078,19 @@ def _build_state_machine(
             transitions[(rj.success_state, next_rj.queue_state)] = TransitionRule()
 
     all_queue_states = {rj.name: rj.queue_state for rj in resolved}
-    # Intra-flow rule targets — same flow, ResolvedJob queue_state is
-    # canonical. Cross-flow targets (e.g. pr_fix's SKIPPED rule pointing at
-    # ``wait_for_pr_signal`` which only appears in main) are handled later
-    # in ``_register_cross_flow_edges`` because their correct queue_state
-    # depends on the target flow's binding order — a first-agent binding
-    # derives ``"backlog"``, while the same job elsewhere derives
-    # ``job.name``. ``_build_state_machine`` runs per-flow without
-    # visibility into other flows' bindings, so it cannot mirror that
-    # derivation correctly; the stitching pass has both flows resolved
-    # and uses each ResolvedJob's actual queue_state.
+    # In-flow rule targets — the target names a job in this flow, whose
+    # ResolvedJob queue_state is canonical. A target that resolves to no job
+    # here is stack-crossing (``call``/``terminate``/``complete``) or a terminal
+    # sink; it has no in-flow SM edge and is skipped (the drainer routes it
+    # directly, ADR-045). Unknown-target typos are caught earlier by
+    # ``_validate_rule_targets`` / ``validate_call_graph`` at build time.
     for rj in resolved:
         for rule in rj.rules:
             if rule.target in ("next", "blocked"):
                 continue
             target_queue = all_queue_states.get(rule.target)
             if target_queue is None:
-                continue  # cross-flow — stitched by _register_cross_flow_edges
+                continue  # stack-crossing / terminal sink — no in-flow SM edge
             transitions[(rj.active_state, target_queue)] = TransitionRule()
 
     for rj in resolved:
@@ -1170,6 +1168,19 @@ def check_conversational_rules(step: ResolvedJob, stdout: str) -> str | None:
 _TERMINAL_TARGETS: tuple[str, ...] = ("complete", "blocked", "needs_input")
 
 
+def _is_synthetic_sink(target: str) -> bool:
+    """A routing ``target`` that is not a step in this flow but must still be
+    drawn as a node so its edge isn't dangling (ADR-044 Phase 6 / ADR-045).
+
+    Three kinds: a terminal state (``_TERMINAL_TARGETS``); an ADR-045
+    ``call <workflow>[@<step>]`` edge (control leaves this flow for the callee —
+    ``build``/``fix``'s ``push_pr COMPLETED → call pr-monitor``); or ``terminate``
+    (a stack unwind). All render as ``type: "terminal"`` sinks in v1 — the viewer
+    call-edge treatment is deferred to ADR-045 Phase 4.
+    """
+    return target in _TERMINAL_TARGETS or target == TERMINATE_TARGET or is_call_target(target)
+
+
 def _outcome_from_pattern(pattern: str) -> str | None:
     """Reverse :func:`_agent_result_pattern` — the outcome word, or ``None``.
 
@@ -1225,7 +1236,7 @@ def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     node_ids: set[str] = set(order)
-    referenced_terminals: list[str] = []
+    referenced_sinks: list[str] = []
 
     def _resolve_target(target: str, idx: int) -> str:
         if target == "next":
@@ -1282,8 +1293,8 @@ def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
             )
             if rule.target == "next":
                 routes_next = True
-            if target in _TERMINAL_TARGETS and target not in node_ids:
-                referenced_terminals.append(target)
+            if target not in node_ids and _is_synthetic_sink(target):
+                referenced_sinks.append(target)
 
         # Implicit forward (success) edge: an unmatched marker falls through to
         # the next step at runtime. Draw it so the happy path is visible —
@@ -1301,11 +1312,12 @@ def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
                 }
             )
 
-    # Materialize any referenced terminal sink as a node (dedup, stable order).
-    for terminal in dict.fromkeys(referenced_terminals):
+    # Materialize any referenced sink (terminal state, ``call <workflow>``, or
+    # ``terminate``) as a node (dedup, stable order) so no edge dangles.
+    for sink in dict.fromkeys(referenced_sinks):
         nodes.append(
             {
-                "id": terminal,
+                "id": sink,
                 "type": "terminal",
                 "prompt_name": None,
                 "agent": None,

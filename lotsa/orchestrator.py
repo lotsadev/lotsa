@@ -2609,9 +2609,10 @@ class OrchestratorService:
                 # Land in the YAML-defined monitor state (e.g.
                 # ``wait_for_pr_signal``), not the legacy synthetic
                 # ``"waiting_for_pr"``. ``_dispatch_pr_fix_locked`` carries this
-                # state straight into the pr_fix sub-flow's entry CAS, whose edge
-                # ``(monitor_state, "pr-fixing")`` is the one
-                # ``_register_cross_flow_edges`` registers. Hardcoding
+                # state straight into the pr-fix entry CAS, whose edge
+                # ``(monitor_state, "pr-fixing")`` is registered intra-flow by
+                # ``_build_state_machine`` (ADR-045 — pr-fix lives in the
+                # pr-monitor workflow now, not a stitched cross-flow edge). Hardcoding
                 # ``"waiting_for_pr"`` would leave ``item.state`` with no matching
                 # edge, so ``_dispatch_step`` would silently strand the task at
                 # ``status="working"`` with no agent. ``"waiting_for_pr"`` stays as
@@ -3756,13 +3757,14 @@ class OrchestratorService:
         # Validate the FSM transition exists before claiming.
         #
         # ADR-021: validate against the task's OWN process state machine
-        # (``_resolve_flow`` — sub-flow aware). ``_register_cross_flow_edges``
-        # stitches each process's monitor-driven sub-flow entry/exit edges
-        # (e.g. ``(wait_for_pr_signal, pr-fix)``, ``(<terminal>,
-        # wait_for_pr_signal)``) into that process's flow SMs at build time, so
-        # the resolved flow contains every edge an engine could plausibly
-        # target for this task. A monitor→orchestrator callback thus validates
-        # against the process that owns the polled task, not a global one.
+        # (``_resolve_flow`` — the active workflow, i.e. the top call-stack
+        # frame). Since ADR-045 the pr-monitor workflow owns its monitor-driven
+        # edges (e.g. ``(wait_for_pr_signal, pr-fix)``, ``(<terminal>,
+        # wait_for_pr_signal)``); ``_build_state_machine`` registers them
+        # intra-flow at build time, so the resolved flow contains every edge an
+        # engine could plausibly target for this task. A monitor→orchestrator
+        # callback thus validates against the workflow that owns the polled task,
+        # not a global one.
         #
         # ADR-030 — terminal PR outcomes (``complete`` / ``abandoned``) are NOT
         # gated on the flow SM. A merged/closed PR is a fact about the world,
@@ -5063,15 +5065,14 @@ class OrchestratorService:
 
         self.source.assign_id(item)
 
-        # Resolve the active flow once — sub-flow steps (e.g. pr_fix's
-        # ``pr-fix`` agent) live in the sub-flow's SM, not main's. Both
-        # transitions guarded below (missing-artifact → blocked, queue →
-        # active) must be validated against the SM that actually owns this
-        # step. Today main's SM happens to carry every pr_fix edge that
-        # ``_register_cross_flow_edges`` stitches in, but a future sub-flow
-        # step with no cross-flow rule target would silently no-op against
-        # ``self.flow`` (the root) here. Match the resolution shape used by
-        # ``_dispatch_next_step`` one level up.
+        # Resolve the active flow once — the active workflow (top call-stack
+        # frame) owns this step's SM, which may not be the root process's
+        # ``main`` (ADR-045: a called workflow, e.g. pr-monitor's ``pr-fix``
+        # agent, runs in its own SM). Both transitions guarded below
+        # (missing-artifact → blocked, queue → active) must be validated against
+        # the SM that actually owns this step; validating against ``self.flow``
+        # (the root) would silently no-op for a step outside it. Match the
+        # resolution shape used by ``_dispatch_next_step`` one level up.
         active_flow = self._resolve_flow(item)
 
         # Validate required input artifacts exist
@@ -5410,7 +5411,7 @@ class OrchestratorService:
                 db=self.db,
                 process_name=self._process_for(item).name,
                 flow_name=self._root_flow_for(item).name,
-                current_flow=metadata.get("current_flow") or self._root_flow_for(item).name,
+                current_flow=(stack_top(metadata) or {}).get("workflow") or self._root_flow_for(item).name,
                 last_run_step=step.name,
             )
             result = await tool(ctx, dict(step.config))
@@ -5770,7 +5771,7 @@ class OrchestratorService:
                     db=self.db,
                     process_name=self._process_for(item).name,
                     flow_name=self._root_flow_for(item).name,
-                    current_flow=item.metadata.get("current_flow") or self._root_flow_for(item).name,
+                    current_flow=(stack_top(item.metadata) or {}).get("workflow") or self._root_flow_for(item).name,
                     last_run_step=step.name,
                     worktree_manager=wtm,
                 )
@@ -5825,7 +5826,7 @@ class OrchestratorService:
                     db=self.db,
                     process_name=self._process_for(item).name,
                     flow_name=self._root_flow_for(item).name,
-                    current_flow=item.metadata.get("current_flow") or self._root_flow_for(item).name,
+                    current_flow=(stack_top(item.metadata) or {}).get("workflow") or self._root_flow_for(item).name,
                     last_run_step=step.name,
                 )
                 config = {"task_title": item.title or "", "commit_prefix": step.commit_prefix or "chore"}
@@ -6085,12 +6086,12 @@ class OrchestratorService:
                     if self.flow is None:
                         raise RuntimeError("OrchestratorService not started")
                     err_msg = _summarize_agent_error(result.return_code, result.stderr)
-                    # Validate against the active flow's SM — a sub-flow-only
-                    # agent step whose ``active_state`` isn't stitched into
-                    # main's SM (custom processes only; the bundled ``build``
-                    # process is covered by ``_register_cross_flow_edges``
-                    # for every pr_fix binding) would otherwise silently
-                    # ``continue`` and strand the task at ``status=working``.
+                    # Validate against the active workflow's SM (ADR-045: the top
+                    # call-stack frame's workflow, which owns this step's edges) —
+                    # validating a called workflow's step against the root
+                    # process's ``main`` SM would miss the ``(active_state,
+                    # blocked)`` edge and silently ``continue``, stranding the task
+                    # at ``status=working``.
                     active_flow_for_fail = self._resolve_flow(item)
                     if (item.state, "blocked") not in active_flow_for_fail.state_machine.transitions:
                         logger.warning(

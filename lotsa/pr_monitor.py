@@ -41,14 +41,14 @@ class PrMonitorOrchestrator(Protocol):
     no-ops for tests that pass partial fakes; static checking via this
     Protocol ensures real OrchestratorService still satisfies the contract.
 
-    ``dispatch_sub_flow`` is the ADR-014 Layer A entry point that the
-    ``pr_monitor`` engine (``lotsa.engines.pr_monitor``) uses directly when
-    a future Layer B wiring instantiates it from ``OrchestratorService.start()``.
-    Today the legacy ``PrMonitor`` class still calls ``dispatch_pr_fix`` — the
-    ``_SubFlowAdapter`` in ``lotsa.engines.pr_monitor`` translates that to
-    ``dispatch_sub_flow`` at runtime — so both methods are declared here. The
-    ``dispatch_pr_fix`` entry will retire once ``PrMonitor`` migrates to call
-    ``dispatch_sub_flow`` directly.
+    ``dispatch_pr_fix`` and ``dispatch_sub_flow`` are both real
+    ``OrchestratorService`` entry points, declared here so the Protocol matches.
+    The ``PrMonitor`` poller calls ``dispatch_pr_fix``; since ADR-045 collapsed
+    sub-flows into top-level workflows, pr-fix is an intra-workflow edge, so the
+    ``_SubFlowAdapter`` in ``lotsa.engines.pr_monitor`` forwards
+    ``dispatch_pr_fix`` straight through — it no longer rewrites the call to
+    ``dispatch_sub_flow``. ``dispatch_sub_flow`` remains the Layer B entry that
+    dispatches a task into any named workflow (``call <workflow>[@<step>]``).
     """
 
     db: TaskDB

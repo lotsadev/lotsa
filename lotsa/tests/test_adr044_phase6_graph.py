@@ -177,6 +177,24 @@ class TestSerializeProcessGraph:
         main = _flow(self._pr_monitor_graph(), "main")
         assert _edge(main, "resolve_conflicts", "COMPLETED")["target"] == "pr-fix"
 
+    def test_call_target_is_materialized_as_a_node(self):
+        """ADR-045 — build/fix end at ``push_pr COMPLETED → call pr-monitor``.
+        The ``call <workflow>`` target is not a step in this flow, so — like a
+        terminal sink — it must be materialized as a node; otherwise the viewer
+        renders a dangling edge for ``push_pr``. Reds pre-fix: the edge exists
+        with ``target="call pr-monitor"`` but no matching node."""
+        from lotsa.flows import build_process, serialize_process_graph
+
+        main = _flow(self._build_graph(), "main")
+        edge = _edge(main, "push_pr", "COMPLETED")
+        assert edge is not None and edge["target"] == "call pr-monitor"
+        sink = _node(main, "call pr-monitor")
+        assert sink is not None, "the call target must exist as a node so the edge isn't dangling"
+        assert sink["type"] == "terminal"
+        # fix ends the same way — the sink materialization is not build-specific.
+        fix_main = _flow(serialize_process_graph(build_process("fix")), "main")
+        assert _node(fix_main, "call pr-monitor") is not None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # B. Orchestrator service methods — workflow_graph / agent_detail / provenance

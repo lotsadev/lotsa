@@ -245,14 +245,15 @@ def test_action_step_invokes_registered_tool_and_advances_to_monitor(tmp_path, r
 
 
 def test_action_step_taskcontext_current_flow_reflects_active_subflow(tmp_path, run):
-    """``TaskContext.current_flow`` must reflect the task's active sub-flow,
-    not the root flow.
+    """``TaskContext.current_flow`` must reflect the task's active workflow (the
+    top call-stack frame), not the root flow.
 
     Regression for the claude[bot] review finding on PR #65: the
     ``_execute_action_step`` ``TaskContext`` constructor used to hardcode
-    ``current_flow=self.flow.name`` (always the root flow), so a tool
-    running inside ``pr_fix`` saw ``current_flow="main"`` even after
-    ``_dispatch_pr_fix_locked`` had set ``metadata["current_flow"]="pr_fix"``.
+    ``current_flow=self.flow.name`` (always the root flow), so a tool running
+    inside a called workflow saw the root name. ADR-045 replaced the
+    ``current_flow`` metadata slot with the ``call_stack``; ``current_flow`` now
+    resolves to the top frame's ``workflow``.
     """
     _register_capture_engine()
     captured: list[str] = []
@@ -269,10 +270,17 @@ def test_action_step_taskcontext_current_flow_reflects_active_subflow(tmp_path, 
     svc = _make_service(tmp_path, run)
     run(svc.start())
     try:
-        # Seed the task with current_flow="pr_fix" — the shape
-        # _dispatch_pr_fix_locked leaves behind on sub-flow entry.
-        task = run(svc.db.create_task("Pushy", state="push", metadata={"current_flow": "pr_fix"}))
-        item = Item(id=task.id, state="push", title="Pushy", metadata={"current_flow": "pr_fix"})
+        # Seed a call stack whose active (top) frame names this workflow
+        # (``typed_jobs_test``) at the ``push`` step — the shape a caller leaves
+        # behind after ``call typed_jobs_test``. The frame's ``workflow`` is the
+        # process name, distinct from the root flow's name (``main``), so a
+        # top-frame read and a root-flow read yield different strings.
+        active_stack = [
+            {"workflow": "chat", "step": "handoff", "called_from": None},
+            {"workflow": "typed_jobs_test", "step": "push", "called_from": "handoff"},
+        ]
+        task = run(svc.db.create_task("Pushy", state="push", metadata={"call_stack": active_stack}))
+        item = Item(id=task.id, state="push", title="Pushy", metadata={"call_stack": active_stack})
         run(
             svc.db.claim_task_transition(
                 task.id,
@@ -287,10 +295,10 @@ def test_action_step_taskcontext_current_flow_reflects_active_subflow(tmp_path, 
         run(svc._dispatch_step(item, push_step))
         run(asyncio.sleep(0.05))
 
-        assert captured == ["pr_fix"], (
-            f"TaskContext.current_flow must be the active sub-flow from metadata, got {captured!r}. "
+        assert captured == ["typed_jobs_test"], (
+            f"TaskContext.current_flow must be the active workflow (top call-stack frame), got {captured!r}. "
             "Regression: _execute_action_step hardcoded current_flow=self.flow.name (root flow), "
-            "so tools running inside a sub-flow saw the wrong value."
+            "so tools running inside a called workflow saw the wrong value."
         )
     finally:
         run(svc.shutdown())

@@ -11,9 +11,10 @@ feedback aggregation, debounce, the polling loop). This module is a thin
 wrapper that:
 
 - parses the monitor job's YAML ``config:`` block into ``PrMonitorConfig``;
-- adapts the legacy ``orchestrator.dispatch_pr_fix(task_id, feedback)``
-  call into the typed-job ``dispatch_sub_flow(task_id, "pr_fix", feedback=…)``
-  contract via ``_SubFlowAdapter``;
+- forwards the poller's ``dispatch_pr_fix(task_id, feedback)`` call to the real
+  orchestrator via ``_SubFlowAdapter`` (ADR-045: pr-fix is an intra-workflow
+  edge now, so it forwards straight through rather than rewriting the call to
+  ``dispatch_sub_flow``);
 - forwards the operational surface (``run``, ``untrack``,
   ``snapshot_triggering_ids``, ``gather_pending_feedback``) to the wrapped
   poller.
