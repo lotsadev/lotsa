@@ -1,6 +1,10 @@
 # ADR-045 — Workflows call workflows
 
-**Status:** Proposed — not implemented
+**Status:** Implemented (Phase 1) — call/return + persisted call stack, extracted
+`pr-monitor` workflow, `complete`/`terminate` split, legacy `current_flow` rows →
+`blocked` (no migration). Phases 2–4 (call-edge `gate: operator`, standalone
+pr-monitor against a foreign PR, viewer call edges) and the metadata/variable +
+rules-over-metadata layer remain deferred to later phases / their own ADR.
 
 **Scope:** CE
 
