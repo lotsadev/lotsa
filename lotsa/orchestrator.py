@@ -2118,8 +2118,9 @@ class OrchestratorService:
         Operator-only mid-life process change. The destination takes over from
         its first step via a single CAS-guarded, audited transition. The
         worktree, the ``messages`` log, and the task identity are unchanged;
-        only ``metadata.process_name`` / ``metadata.current_flow`` / the state
-        machine position move. Any work to carry forward is delivered as
+        only ``metadata.process_name`` / ``metadata.call_stack`` (re-rooted to a
+        fresh single frame, ADR-045) / the state machine position move. Any work
+        to carry forward is delivered as
         ``initial_artifacts`` (artifact-name → content), which the destination's
         first-step prompt reads (e.g. ``build``'s planning step reads ``draft_spec``).
 
@@ -4551,9 +4552,10 @@ class OrchestratorService:
         worktree; this method only routes and dispatches. ``from_step`` labels
         the stage-transition audit row (defaults to the monitor state).
 
-        If the process declares a ``resolve_conflicts`` job: bumps the round
-        counter, sets ``current_flow``, and dispatches the step. Returns
-        ``True``.
+        If the active workflow declares a ``resolve_conflicts`` job: bumps the
+        round counter and dispatches the step. Returns ``True``. (``resolve_conflicts``
+        is an intra-workflow edge since ADR-045 — no ``current_flow`` / stack
+        mutation.)
 
         If the process has no ``resolve_conflicts`` job (backward compat with
         custom processes): delegates to ``_block_after_sync``. Returns
@@ -5032,9 +5034,10 @@ class OrchestratorService:
             task.add_done_callback(_cleanup)
             return
 
-        # Resolve once — the item's current_flow drives every step lookup
-        # below so a task mid-sub-flow dispatches the sub-flow's bindings
-        # (with the right per-flow rule overrides), not the root flow's.
+        # Resolve once — the task's active workflow (top call-stack frame,
+        # ADR-045) drives every step lookup below, so a task parked inside a
+        # called workflow dispatches that workflow's bindings (with the right
+        # per-flow rule overrides), not the creation process's root flow.
         active_flow = self._resolve_flow(item)
 
         # 1. Queue state — dispatch matching step
@@ -5458,12 +5461,14 @@ class OrchestratorService:
             # have written since dispatch was queued.
             fresh = await self.db.get_task(item.id)
             metadata = dict(fresh.metadata) if fresh else dict(item.metadata)
-            # ``current_flow`` must reflect the task's active sub-flow, not the
-            # root flow — a tool running inside ``pr_fix`` needs to see
-            # ``current_flow="pr_fix"`` (set by ``_dispatch_pr_fix_locked``), not
-            # ``"main"``. The fresh-read ``metadata`` above already carries the
-            # right value; fall back to the root only when metadata is missing
-            # the key (e.g. legacy rows created before sub-flow plumbing landed).
+            # ADR-045 — ``current_flow`` on the ``TaskContext`` is the task's
+            # ACTIVE workflow: the top call-stack frame's ``workflow`` (read via
+            # ``stack_top(metadata)`` below), not the creation process's root
+            # flow. A tool running inside ``pr-monitor`` (after ``push_pr``
+            # called it) needs to see ``"pr-monitor"``, not ``"build"``. The
+            # fresh-read ``metadata`` above already carries the stack; fall back
+            # to the root only when there is no frame (a frameless legacy row is
+            # caught and blocked upstream, so this fallback is defensive).
             ctx = TaskContext(
                 task_id=item.id,
                 worktree=info.step_work_dir or self._fallback_work_dir(info.item),
@@ -7941,17 +7946,22 @@ class OrchestratorService:
            frame, ADR-045).
         2. **Root flow** (``main``) — covers rows with an empty call stack
            and the common case where active == root.
-        3. **Process catalog** (``_process_for``) — covers sub-flow-only jobs
-           (e.g. ``pr-fix``) that aren't in any flow's top-level job list.
+        3. **Process catalog** (``_process_for``) — a defensive fallback for a
+           job that isn't in the active or root flow's top-level job list. No
+           bundled workflow relies on it since ADR-045 (``pr-fix`` now resolves
+           via point 1 — it lives in the ``pr-monitor`` workflow's ``main`` flow,
+           which is the active flow once ``push_pr`` called it); kept for custom
+           processes whose catalog carries a job outside every flow's bindings.
 
-        The active-flow-first order is load-bearing. A sub-flow step's
-        ``success_state`` differs from the same-named root job (pr_fix
-        ``review`` → ``push_pr`` vs main ``review`` → ``verify``). Resolving
-        only against root dispatches *main's* job on a sub-flow task; the
-        ``review`` PASSED auto-advance then targets ``(reviewing → verify)`` — an
-        edge absent from pr_fix's SM — so the completion is silently dropped
-        and the task stalls at ``reviewing/working`` (an internal task's multi-day
-        stall, confirmed via the drainer strand-warning).
+        The active-flow-first order is load-bearing. A called workflow's step
+        ``success_state`` differs from a same-named job in the creation process
+        (``pr-monitor``'s ``review`` → ``push_pr`` vs ``build``'s ``review`` →
+        ``verify``). Resolving only against the root dispatches *build's* job on a
+        task parked inside ``pr-monitor``; the ``review`` PASSED auto-advance then
+        targets ``(reviewing → verify)`` — an edge absent from ``pr-monitor``'s SM
+        — so the completion is silently dropped and the task stalls at
+        ``reviewing/working`` (an internal task's multi-day stall, confirmed via
+        the drainer strand-warning).
 
         Every site that resolves ``current_step`` to a ``Job`` — the action
         methods that re-dispatch (``retry``/``revise``/``answer``/
@@ -7978,10 +7988,11 @@ class OrchestratorService:
         """Find the flow step whose queue_state matches ``state``.
 
         When ``item`` is supplied, the lookup runs against the item's
-        currently-active flow (see ``_resolve_flow``); this is what makes
-        sub-flow rule overrides (e.g. ``pr_fix.review`` FAILED → pr-fix)
-        take effect at dispatch time. Callers that don't have an item
-        (e.g. dispatch-table sanity checks) fall back to the root flow.
+        currently-active flow (see ``_resolve_flow`` — the top call-stack
+        frame's workflow, ADR-045); this is what makes a called workflow's rule
+        overrides (e.g. ``pr-monitor``'s ``review`` FAILED → pr-fix) take effect
+        at dispatch time. Callers that don't have an item (e.g. dispatch-table
+        sanity checks) fall back to the root flow.
         """
         if self.flow is None:
             raise RuntimeError("OrchestratorService not started")
