@@ -252,6 +252,27 @@ graph; it is the bundled catalog ceasing to be opinionated.
 Deferred to its own ADR: the metadata/variable layer and metadata-based routing
 rules.
 
+### Implementation notes (Phase 1)
+
+- **Legacy `current_flow` rows are not migrated.** Phase 1 replaces the single
+  `current_flow` metadata slot with a `call_stack`, but it does **not** convert
+  rows persisted under the old slot onto a synthetic stack. Any task carrying a
+  legacy `current_flow` slot (e.g. `"pr_fix"`, `"main"`) and no `call_stack`
+  routes to `blocked` with the standard recovery message on the first surface
+  that resolves its active workflow (`call_stack.is_legacy_flow_row`). This is a
+  deliberate pre-alpha breaking change: reconstructing a faithful multi-frame
+  stack for the new topology is user-visible churn we chose not to carry, and
+  blocking is the honest, already-supported answer. The upshot is that
+  restart-resume only ever reconstructs stacks *this* version wrote (which
+  narrows the sharpest risk above), and the legacy contract is a single tested
+  assertion (`test_legacy_current_flow_row_blocks_on_restart`) rather than a
+  reconstruction path.
+- **Changelog hint (for release notes).** Because in-flight tasks at upgrade
+  time land in `blocked`, the eventual release notes must tell operators to
+  **close or complete all in-flight tasks before upgrading**. Recorded here so
+  it survives to the release: changelog authoring is out of this PR's scope, but
+  the break is not.
+
 ## Consequences
 
 ### Positive
@@ -271,10 +292,12 @@ rules.
   of record and must be reconstructable from the DB, including a task
   interrupted mid-unwind. This is the sharpest implementation risk and needs
   explicit tests, not just idempotent steps.
-- **Legacy rows.** Tasks persisted with `current_flow="pr_fix"` predate the
+- **Legacy rows.** Tasks persisted with a legacy `current_flow` slot (notably
+  `current_flow="pr_fix"`, but also `"main"`) and no `call_stack` predate the
   stack. Per `CLAUDE.md`'s legacy-row contract, each surface comparing against
-  flow names needs a defined answer — mapping onto a synthetic single-frame
-  stack, or routing to `blocked` with the standard recovery message.
+  flow names needs a defined answer. **Decided (Phase 1): route to `blocked`
+  with the standard recovery message — no synthetic-stack migration.** See the
+  *Implementation notes* below; this is a pre-alpha breaking change.
 - **Cross-cutting rename.** `flow`/`sub-flow` appears in CAS payloads, audit
   fields, recovery branches, engine untrack checks, the viewer, and the API. Per
   `CLAUDE.md`, this sweep belongs in the implementation commit, not the review
