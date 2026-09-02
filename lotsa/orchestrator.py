@@ -4173,8 +4173,18 @@ class OrchestratorService:
         fresh = await self.db.get_task(item.id)
         if fresh is None:
             return
+        full_stack = get_stack(fresh.metadata)
         metadata = pop_frame(fresh.metadata)  # pop the completing frame (ADR-020 CAS below)
         new_stack = get_stack(metadata)
+        # The call site in the caller's flow is the POPPED frame's ``called_from``
+        # (recorded at call time by ``_dispatch_call``) — NOT the caller frame's own
+        # ``step``. A frame's ``step`` is the step it was pushed at (its entry) and is
+        # never advanced as the frame moves through its flow, so a call issued from a
+        # non-entry step (e.g. ``build``'s ``push_pr``) would otherwise resolve the
+        # return relative to the stale entry step. Thread it across tail-call folding:
+        # when a caller is itself a tail call, the next call site is THAT frame's
+        # ``called_from``.
+        popped: dict[str, Any] | None = full_stack[-1] if full_stack else None
         landing: tuple[Any, str] | None = None  # (successor ResolvedJob, workflow)
         while new_stack:
             caller = new_stack[-1]
@@ -4182,12 +4192,14 @@ class OrchestratorService:
             if caller_flow is None:
                 break  # unresolvable caller → treat as terminal
             order = [s.name for s in caller_flow.steps]
-            idx = order.index(caller.get("step")) if caller.get("step") in order else -1
+            call_site = popped.get("called_from") if popped else None
+            idx = order.index(call_site) if call_site in order else -1
             successor = caller_flow.steps[idx + 1] if 0 <= idx < len(order) - 1 else None
             if successor is not None:
                 landing = (successor, str(caller.get("workflow")))
                 break
-            new_stack = new_stack[:-1]  # tail call — the caller completes too
+            popped = caller  # tail call — the caller completes too; its call site is next
+            new_stack = new_stack[:-1]
         metadata[CALL_STACK_KEY] = new_stack
 
         if landing is None:
@@ -4266,6 +4278,7 @@ class OrchestratorService:
         fresh = await self.db.get_task(item.id)
         if fresh is None:
             return
+        full_stack = get_stack(fresh.metadata)
         metadata = pop_frame(fresh.metadata)  # pop the emitting frame (ADR-020 CAS below)
         new_stack = get_stack(metadata)
         # (destination ResolvedJob-or-bare-state, workflow, catch-site step name).
@@ -4274,13 +4287,21 @@ class OrchestratorService:
         # the dashboard shows where the task blocked, mirroring ``block()`` — or
         # an in-flow resume); a terminal catch (``complete``/``abandoned``) nulls
         # it, matching every other terminal transition in this file.
+        #
+        # A ``terminate`` catch is declared on the CALL-SITE step — the step that
+        # issued ``call <callee>`` — so we look it up via the POPPED frame's
+        # ``called_from`` (recorded at call time), not the caller frame's own
+        # ``step`` (its stale entry step; see the matching note in
+        # ``_return_to_caller``). Thread it across un-caught unwinding.
+        popped: dict[str, Any] | None = full_stack[-1] if full_stack else None
         catch: tuple[Any, str, str] | None = None
         while new_stack:
             caller = new_stack[-1]
             caller_flow = self._workflow_main_flow(fresh, caller.get("workflow"))
             if caller_flow is None:
                 break  # unresolvable caller → propagate to terminal
-            step_job = next((s for s in caller_flow.steps if s.name == caller.get("step")), None)
+            call_site = popped.get("called_from") if popped else None
+            step_job = next((s for s in caller_flow.steps if s.name == call_site), None)
             catch_target = terminate_catch_target(step_job.rules) if step_job is not None else None
             if catch_target is not None:
                 dest = next((s for s in caller_flow.steps if s.name == catch_target), None)
@@ -4295,7 +4316,8 @@ class OrchestratorService:
                     step_job.name,
                 )
                 break
-            new_stack = new_stack[:-1]  # no catch — this caller is unwound too
+            popped = caller  # no catch — this caller is unwound too; its call site is next
+            new_stack = new_stack[:-1]
         metadata[CALL_STACK_KEY] = new_stack
 
         if catch is None:
@@ -4310,7 +4332,7 @@ class OrchestratorService:
                 audit_on_win=AuditRow(
                     role="system",
                     step_name=item.state,
-                    content="terminate — call stack unwound to root; task complete.",
+                    content="Terminate — call stack unwound to root; task complete.",
                     msg_type="status_change",
                 ),
             )

@@ -1236,3 +1236,167 @@ flows:
     finally:
         run(svc.shutdown())
         run(db.close())
+
+
+# ===========================================================================
+# M. Return/catch resolve the call site from the popped frame's ``called_from``
+#
+# The frame's ``step`` is the step it was PUSHED at (its entry) and is never
+# advanced as the frame moves through its flow. So a ``call`` issued from a
+# non-entry step (``build``'s ``push_pr``, the real bundled case) leaves the
+# caller frame's ``step`` stale. ``_return_to_caller`` / ``_unwind_terminate``
+# must therefore locate the call site via the POPPED frame's ``called_from``
+# (recorded at call time by ``_dispatch_call``), not the caller's ``step``.
+#
+# The section-L tests above hand-built stacks where ``caller.step`` already
+# equalled the call site, so they never exercised this gap. These two drive the
+# REAL ``_dispatch_call`` push from a mid-flow step, so the caller frame's
+# ``step`` and the true call site genuinely differ.
+# ===========================================================================
+
+
+def _write_outer_inner(tmp_path: Path) -> tuple[Path, Path]:
+    """A three-step ``outer`` workflow that calls a one-step ``inner`` from its
+    MIDDLE step (``mid``), and ``mid`` also declares a ``terminate: blocked``
+    catch. ``outer``'s root frame is pushed at ``first`` (its entry) — so once a
+    call is issued from ``mid``, the frame's ``step`` ("first") differs from the
+    true call site ("mid")."""
+    outer = tmp_path / "outer.yaml"
+    outer.write_text(
+        """
+process: outer
+jobs:
+  - name: first
+    type: agent
+    prompt: coding
+    queue_state: first_queue
+    active_state: first_active
+  - name: mid
+    type: agent
+    prompt: coding
+    queue_state: mid_queue
+    active_state: mid_active
+    routes: { COMPLETED: call inner, terminate: blocked }
+  - name: last
+    type: agent
+    prompt: coding
+    queue_state: last_queue
+    active_state: last_active
+flows:
+  main:
+    steps: [first, mid, last]
+"""
+    )
+    inner = tmp_path / "inner.yaml"
+    inner.write_text(
+        """
+process: inner
+jobs:
+  - name: work
+    type: agent
+    prompt: coding
+    queue_state: work_queue
+    active_state: work_active
+flows:
+  main:
+    steps: [work]
+"""
+    )
+    return outer, inner
+
+
+def test_complete_after_real_dispatch_call_returns_after_the_call_site(tmp_path, run):
+    """``complete`` returns to the step AFTER the REAL call site, resolved from the
+    popped frame's ``called_from`` — not the caller frame's stale entry ``step``.
+
+    Drives the real ``_dispatch_call`` from ``outer``'s mid-flow ``mid`` step
+    (root frame still pushed at ``first``), then completes the callee. The task
+    must resume at ``last`` (the step after ``mid``).
+
+    Fails pre-fix: ``_return_to_caller`` read the caller frame's ``step`` ("first")
+    and resumed at ``mid`` (the step after ``first``) — silently re-running the
+    call site instead of advancing past it.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    svc.runner = _HangRunner()  # callee entry + resumed caller step hang → row stays put
+    outer_path, inner_path = _write_outer_inner(tmp_path)
+    run(svc.start())
+    try:
+        svc._processes["outer"] = build_process("outer", process_file=outer_path)
+        svc._processes["inner"] = build_process("inner", process_file=inner_path)
+        # Caller parked mid-flow at ``mid``; its frame still carries the stale
+        # entry step ``first`` (frames are never refreshed on step advance).
+        task = _seed(
+            svc,
+            run,
+            state="mid_active",
+            current_step="mid",
+            stack=[{"workflow": "outer", "step": "first", "called_from": None}],
+        )
+        row = run(svc.db.get_task(task.id))
+        assert run(svc._dispatch_call(row, "inner")) is True
+        pushed = run(svc.db.get_task(task.id))
+        # ``_dispatch_call`` records the REAL call site on the callee frame...
+        assert pushed.metadata["call_stack"][-1]["called_from"] == "mid"
+        # ...and does NOT rewrite the caller frame's stale entry step.
+        assert pushed.metadata["call_stack"][0]["step"] == "first"
+
+        # The callee completes → return to the caller AFTER the real call site.
+        run(svc._return_to_caller(_item_from(pushed), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert _wf_names(row) == ["outer"], f"only the caller frame remains; stack={row.metadata.get('call_stack')!r}"
+        assert row.current_step == "last", (
+            "complete must resume after the real call site 'mid' (→ 'last'); pre-fix it read the "
+            f"caller frame's stale entry step 'first' and resumed at 'mid'. got {row.current_step!r}"
+        )
+        assert row.status != "complete", "a mid-stack complete returns to the caller, it does not end the task"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
+def test_terminate_after_real_dispatch_call_catches_at_the_real_call_site(tmp_path, run):
+    """A ``terminate`` catch is looked up on the REAL call-site step (via the
+    popped frame's ``called_from``), not the caller frame's stale entry ``step``.
+
+    ``outer``'s ``mid`` declares ``routes: { terminate: blocked }``. After a real
+    ``_dispatch_call`` from ``mid``, an uncaught callee ``terminate`` must be
+    caught at ``mid`` → the task blocks there.
+
+    Fails pre-fix: the catch lookup used the caller frame's ``step`` ("first",
+    which has no catch), so the terminate propagated to the root and ended the
+    task instead of being caught.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    svc.runner = _HangRunner()  # callee entry hangs → row stays put
+    outer_path, inner_path = _write_outer_inner(tmp_path)
+    run(svc.start())
+    try:
+        svc._processes["outer"] = build_process("outer", process_file=outer_path)
+        svc._processes["inner"] = build_process("inner", process_file=inner_path)
+        task = _seed(
+            svc,
+            run,
+            state="mid_active",
+            current_step="mid",
+            stack=[{"workflow": "outer", "step": "first", "called_from": None}],
+        )
+        row = run(svc.db.get_task(task.id))
+        assert run(svc._dispatch_call(row, "inner")) is True
+        pushed = run(svc.db.get_task(task.id))
+        assert pushed.metadata["call_stack"][-1]["called_from"] == "mid"
+
+        # The callee terminates → the catch declared on the call site ``mid`` fires.
+        run(svc._unwind_terminate(_item_from(pushed), from_status="working"))
+        row = run(svc.db.get_task(task.id))
+        assert row.status == "blocked", (
+            "the terminate catch on the call-site step 'mid' must fire; pre-fix the lookup used the "
+            f"caller's stale entry step 'first' (no catch) and unwound to a terminal completion. status={row.status!r}"
+        )
+        assert row.current_step == "mid", (
+            f"a caught terminate → blocked keeps the call-site step; got {row.current_step!r}"
+        )
+        assert _wf_names(row) == ["outer"], "the caught frame stays on the stack (no further unwinding)"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
