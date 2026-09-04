@@ -1,10 +1,10 @@
 process: build
 description: |
   Execute at full depth. Autonomous SDLC discipline: plan, failing-tests-first,
-  code, review, post-implementation verify, then open a PR and watch it to
-  terminal. The task body (or a spec carried from chat) is the brief — there is
-  no separate spec/plan gate. Reach it from chat via the "Build it" handoff, or
-  select it directly for a well-understood change.
+  code, review, post-implementation verify, then open a PR and hand off to
+  PR watching. The task body (or a spec carried from chat) is the brief — there
+  is no separate spec/plan gate. Reach it from chat via the "Build it" handoff,
+  or select it directly for a well-understood change.
 promotion_inputs:
   - name: draft_spec
     description: A discussed-and-agreed spec the operator wants built rather than
@@ -46,16 +46,6 @@ jobs:
     active_state: reviewing
     routes: { PASSED: next, FAILED: blocked }
 
-  - name: pr-fix
-    type: agent
-    prompt: pr_fix
-    resume: true
-    queue_state: pr-fixing
-    active_state: pr-fixing
-    # All four outcomes stay explicit (pr-fix is a worker; INPUT/FAILED are
-    # driven by explicit rules + the drainer's needs_input branch — keep 1:1).
-    routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
-
   - name: verify
     type: agent
     prompt: verify
@@ -69,27 +59,14 @@ jobs:
     queue_state: summarizing
     active_state: summarizing
 
+  # ADR-045 — build ends by handing off to PR watching. ``push_pr`` opens the PR
+  # then *calls* the standalone ``pr-monitor`` workflow (automatic/ungated in
+  # Phase 1); the former inline ``wait_for_pr_signal`` step and the duplicated
+  # ``pr_fix`` flow now live in ``pr-monitor``.
   - name: push_pr
     type: action
     tool: push_pr
-
-  - name: resolve_conflicts
-    type: agent
-    prompt: resolve_conflicts
-    resume: true
-    queue_state: resolving_conflicts
-    active_state: resolving_conflicts
-    routes: { COMPLETED: pr-fix }
-
-  - name: wait_for_pr_signal
-    type: monitor
-    engine: pr_monitor
-    config:
-      poll_interval_seconds: 30
-      debounce_seconds: 120
-      triggers: [human_comment, bot_comment, review_decision, failing_check, merge_conflict]
-      max_pr_fix_rounds: 10
-      max_consecutive_skipped: 3
+    routes: { COMPLETED: call pr-monitor }
 
 flows:
   main:
@@ -101,15 +78,4 @@ flows:
         routes: { PASSED: next, FAILED: code }
       - verify
       - pr_summary
-      - push_pr
-      - wait_for_pr_signal
-
-  pr_fix:
-    steps:
-      - name: pr-fix
-        routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
-      - name: resolve_conflicts
-        routes: { COMPLETED: pr-fix }
-      - name: review
-        routes: { PASSED: next, FAILED: pr-fix }
       - push_pr

@@ -245,14 +245,15 @@ def test_action_step_invokes_registered_tool_and_advances_to_monitor(tmp_path, r
 
 
 def test_action_step_taskcontext_current_flow_reflects_active_subflow(tmp_path, run):
-    """``TaskContext.current_flow`` must reflect the task's active sub-flow,
-    not the root flow.
+    """``TaskContext.current_flow`` must reflect the task's active workflow (the
+    top call-stack frame), not the root flow.
 
     Regression for the claude[bot] review finding on PR #65: the
     ``_execute_action_step`` ``TaskContext`` constructor used to hardcode
-    ``current_flow=self.flow.name`` (always the root flow), so a tool
-    running inside ``pr_fix`` saw ``current_flow="main"`` even after
-    ``_dispatch_pr_fix_locked`` had set ``metadata["current_flow"]="pr_fix"``.
+    ``current_flow=self.flow.name`` (always the root flow), so a tool running
+    inside a called workflow saw the root name. ADR-045 replaced the
+    ``current_flow`` metadata slot with the ``call_stack``; ``current_flow`` now
+    resolves to the top frame's ``workflow``.
     """
     _register_capture_engine()
     captured: list[str] = []
@@ -269,10 +270,17 @@ def test_action_step_taskcontext_current_flow_reflects_active_subflow(tmp_path, 
     svc = _make_service(tmp_path, run)
     run(svc.start())
     try:
-        # Seed the task with current_flow="pr_fix" — the shape
-        # _dispatch_pr_fix_locked leaves behind on sub-flow entry.
-        task = run(svc.db.create_task("Pushy", state="push", metadata={"current_flow": "pr_fix"}))
-        item = Item(id=task.id, state="push", title="Pushy", metadata={"current_flow": "pr_fix"})
+        # Seed a call stack whose active (top) frame names this workflow
+        # (``typed_jobs_test``) at the ``push`` step — the shape a caller leaves
+        # behind after ``call typed_jobs_test``. The frame's ``workflow`` is the
+        # process name, distinct from the root flow's name (``main``), so a
+        # top-frame read and a root-flow read yield different strings.
+        active_stack = [
+            {"workflow": "chat", "step": "handoff", "called_from": None},
+            {"workflow": "typed_jobs_test", "step": "push", "called_from": "handoff"},
+        ]
+        task = run(svc.db.create_task("Pushy", state="push", metadata={"call_stack": active_stack}))
+        item = Item(id=task.id, state="push", title="Pushy", metadata={"call_stack": active_stack})
         run(
             svc.db.claim_task_transition(
                 task.id,
@@ -287,27 +295,27 @@ def test_action_step_taskcontext_current_flow_reflects_active_subflow(tmp_path, 
         run(svc._dispatch_step(item, push_step))
         run(asyncio.sleep(0.05))
 
-        assert captured == ["pr_fix"], (
-            f"TaskContext.current_flow must be the active sub-flow from metadata, got {captured!r}. "
+        assert captured == ["typed_jobs_test"], (
+            f"TaskContext.current_flow must be the active workflow (top call-stack frame), got {captured!r}. "
             "Regression: _execute_action_step hardcoded current_flow=self.flow.name (root flow), "
-            "so tools running inside a sub-flow saw the wrong value."
+            "so tools running inside a called workflow saw the wrong value."
         )
     finally:
         run(svc.shutdown())
         run(svc.db.close())
 
 
-def test_action_step_mid_subflow_success_advances_to_next_subflow_job(tmp_path, run):
-    """A non-terminal sub-flow action job advances to the NEXT sub-flow job's
-    queue_state — and writes the successor's name into ``current_step`` in the
-    SAME CAS that flips ``state``, not as a stale ``current_step=<self>``
-    fallback later corrected by ``_dispatch_next_step``.
+def test_action_step_in_called_workflow_advances_to_next_job(tmp_path, run):
+    """A non-terminal action job in a CALLED workflow (ADR-045 call stack)
+    advances to the NEXT job's queue_state — and writes the successor's name
+    into ``current_step`` in the SAME CAS that flips ``state``, not as a stale
+    ``current_step=<self>`` fallback later corrected by ``_dispatch_next_step``.
 
     Regression for the claude[bot] PR review finding on the ``next_step``
     lookup in ``_execute_action_step``. The pre-fix code looked up
-    ``next_step`` against ``self.flow.jobs`` (root flow) only. For a sub-flow
-    action whose successor lives only in the sub-flow, that lookup returned
-    ``None``, and the success CAS persisted ``to_current_step=step.name``
+    ``next_step`` against ``self.flow.jobs`` (root flow) only. For an action
+    whose successor lives only in the ACTIVE (non-root) workflow, that lookup
+    returned ``None``, and the success CAS persisted ``to_current_step=step.name``
     (the action that just finished). The subsequent ``_dispatch_next_step``
     call then re-CAS'd ``current_step`` to the correct successor, which
     *masks* the bug at end-of-flow but leaves a brief window where
@@ -315,26 +323,24 @@ def test_action_step_mid_subflow_success_advances_to_next_subflow_job(tmp_path, 
 
     The fix tries ``active_flow.jobs`` first, then falls back to
     ``self.flow.jobs`` so the success CAS writes the right ``current_step``
-    directly. To detect the regression deterministically, we patch
-    ``_dispatch_next_step`` to record the row state at the moment it's
-    called — i.e. the post-success-CAS state — before any downstream
-    correction runs.
+    directly. Under ADR-045 the active flow is the top call-stack frame's
+    workflow, which differs from the creation process — we seed a task whose
+    frame names a separate ``actions`` workflow (act_a → act_b) while its
+    creation process is a monitor-bearing ``outer`` workflow. To detect the
+    regression deterministically, we patch ``_dispatch_next_step`` to record
+    the row state at the moment it's called — the post-success-CAS state.
     """
 
     process_file = tmp_path / "process.yaml"
     process_file.write_text(
         """
-process: mid_subflow_action
+process: outer
 jobs:
   - { name: code, type: agent, prompt: coding, queue_state: coding, active_state: coding }
   - { name: watch, type: monitor, engine: capture_engine }
-  - { name: act_a, type: action, tool: tool_a }
-  - { name: act_b, type: action, tool: tool_b }
 flows:
   main:
     steps: [code, watch]
-  sub:
-    steps: [act_a, act_b]
 """
     )
     prompts_dir = tmp_path / "prompts"
@@ -371,6 +377,26 @@ flows:
     svc.runner = _FakeRunner()
     run(svc.start())
 
+    # The separate ``actions`` workflow act_a → act_b — the task is "called"
+    # into it (ADR-045 call frame), so it is the ACTIVE flow while the creation
+    # process (``outer``) stays root.
+    from lotsa.call_stack import CALL_STACK_KEY, make_frame
+    from lotsa.flows import build_process
+
+    actions_file = tmp_path / "actions.yaml"
+    actions_file.write_text(
+        """
+process: actions
+jobs:
+  - { name: act_a, type: action, tool: tool_a }
+  - { name: act_b, type: action, tool: tool_b }
+flows:
+  main:
+    steps: [act_a, act_b]
+"""
+    )
+    svc._processes["actions"] = build_process("actions", process_file=actions_file)
+
     # Capture the row state at the moment _dispatch_next_step is invoked —
     # this is the post-success-CAS state BEFORE any downstream re-CAS
     # corrects ``current_step``. Block further advancement so the test
@@ -384,8 +410,9 @@ flows:
     svc._dispatch_next_step = _intercepted_dispatch_next_step  # type: ignore[method-assign]
 
     try:
-        task = run(svc.db.create_task("MidSub", state="act_a", metadata={"current_flow": "sub"}))
-        item = Item(id=task.id, state="act_a", title="MidSub", metadata={"current_flow": "sub"})
+        frame_meta = {CALL_STACK_KEY: [make_frame("actions", "act_a")]}
+        task = run(svc.db.create_task("MidSub", state="act_a", metadata=dict(frame_meta)))
+        item = Item(id=task.id, state="act_a", title="MidSub", metadata=dict(frame_meta))
         run(
             svc.db.claim_task_transition(
                 task.id,
@@ -396,7 +423,7 @@ flows:
                 to_current_step="act_a",
             )
         )
-        act_a_step = next(j for j in svc.process.jobs if j.name == "act_a")
+        act_a_step = next(j for j in svc._processes["actions"].jobs if j.name == "act_a")
         run(svc._dispatch_step(item, act_a_step))
         run(asyncio.sleep(0.05))
 
@@ -612,35 +639,32 @@ def test_action_step_success_with_missing_sm_edge_routes_to_blocked(tmp_path, ru
 # ---------------------------------------------------------------------------
 
 
-def test_approve_subflow_gate_resolves_next_step_against_active_flow(tmp_path, run):
-    """``approve()`` on a gate step reached only via the catalog fallback must
-    derive the stage-transition ``to_step`` from the task's ACTIVE flow, not
-    the root flow.
+def test_approve_gate_in_called_workflow_resolves_next_step_against_active_flow(tmp_path, run):
+    """``approve()`` on a gate step in a CALLED workflow must derive the
+    stage-transition ``to_step`` from the task's ACTIVE flow, not the root flow.
 
     Regression for the claude[bot] PR review Low finding on ``approve()``'s
-    ``active_flow_for_approve`` path. A sub-flow-only ``evaluate: true`` job is
-    absent from ``self.flow.jobs`` (root/main), so a root-only scan would leave
-    ``current_idx`` ``None`` and emit ``to_step=item.state`` (the gate state
-    name) instead of the next sub-flow job's name. The fix reuses the
-    ``FlowConfig`` resolved for the SM check so both sites agree on ordering.
+    ``active_flow_for_approve`` path. An ``evaluate: true`` gate that lives only
+    in a called (non-root) workflow is absent from ``self.flow.jobs``
+    (root/main), so a root-only scan would leave ``current_idx`` ``None`` and
+    emit ``to_step=item.state`` (the gate state name) instead of the next job's
+    name. The fix reuses the ``FlowConfig`` resolved for the SM check so both
+    sites agree on ordering.
 
-    Unreachable in the bundled process (no sub-flow step has ``evaluate: true``)
-    so the test declares a custom process whose ``sub`` flow opens with a gate.
+    Under ADR-045 the active flow is the top call-stack frame's workflow. We
+    seed a task whose frame names a separate ``checks`` workflow (a gate ``check``
+    → ``finalize``) while its creation process is a monitor-bearing ``outer``.
     """
     process_file = tmp_path / "process.yaml"
     process_file.write_text(
         """
-process: approve_subflow_gate
+process: outer
 jobs:
   - { name: code, type: agent, prompt: coding, queue_state: coding, active_state: coding }
   - { name: watch, type: monitor, engine: capture_engine }
-  - { name: check, type: agent, prompt: coding, evaluate: true }
-  - { name: finalize, type: agent, prompt: coding }
 flows:
   main:
     steps: [code, watch]
-  sub:
-    steps: [check, finalize]
 """
     )
     prompts_dir = tmp_path / "prompts"
@@ -666,6 +690,27 @@ flows:
     svc.runner = _FakeRunner()
     run(svc.start())
 
+    # The separate ``checks`` workflow: a gate ``check`` → ``finalize``. The task
+    # is "called" into it (ADR-045 call frame), so it is the ACTIVE flow while
+    # the creation process (``outer``) stays root — ``check`` is absent from
+    # ``outer``'s jobs, so approve() must resolve against the active flow.
+    from lotsa.call_stack import CALL_STACK_KEY, make_frame
+    from lotsa.flows import build_process
+
+    checks_file = tmp_path / "checks.yaml"
+    checks_file.write_text(
+        """
+process: checks
+jobs:
+  - { name: check, type: agent, prompt: coding, evaluate: true }
+  - { name: finalize, type: agent, prompt: coding }
+flows:
+  main:
+    steps: [check, finalize]
+"""
+    )
+    svc._processes["checks"] = build_process("checks", process_file=checks_file, prompts_dir=prompts_dir)
+
     # Block downstream advancement so the test observes only approve()'s own
     # message-writing logic, not the gate auto-advance that would follow.
     async def _noop_dispatch_next_step(item, feedback=None):
@@ -674,10 +719,8 @@ flows:
     svc._dispatch_next_step = _noop_dispatch_next_step  # type: ignore[method-assign]
 
     try:
-        # Lay the row as a waiting gate inside the ``sub`` flow: the ``check``
-        # job is sub-flow-only, so approve() reaches it via the catalog
-        # fallback (process.jobs), not self.flow.jobs (main).
-        task = run(svc.db.create_task("Gate", state="check", metadata={"current_flow": "sub"}))
+        frame_meta = {CALL_STACK_KEY: [make_frame("checks", "check")]}
+        task = run(svc.db.create_task("Gate", state="check", metadata=dict(frame_meta)))
         run(
             svc.db.claim_task_transition(
                 task.id,
@@ -695,9 +738,9 @@ flows:
         meta = msgs[-1].metadata
         assert meta["from_step"] == "check"
         assert meta["to_step"] == "finalize", (
-            "to_step must be the next job in the ACTIVE sub-flow ('finalize'), not the gate "
-            f"state name; got {meta['to_step']!r} (pre-fix: a root-only scan emits the gate "
-            "state 'checkd' because 'check' isn't in main's jobs)"
+            "to_step must be the next job in the ACTIVE called workflow ('finalize'), not the "
+            f"gate state name; got {meta['to_step']!r} (pre-fix: a root-only scan emits the gate "
+            "state 'check' because it isn't in the creation process's jobs)"
         )
     finally:
         run(svc.shutdown())

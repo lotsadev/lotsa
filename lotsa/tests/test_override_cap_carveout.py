@@ -26,7 +26,7 @@ action is invoked so the cap check runs INSIDE the code under test — not by
 pre-flipping the task into a post-fix state (per lotsa/CLAUDE.md
 regression-test discipline).
 
-The full ``pr_fix`` infrastructure (cap=10) comes from the active
+The pr-monitor infrastructure (cap=10) comes from the active
 ``_stub_full_process_service`` helper in ``test_pr_flow_integration``.
 """
 
@@ -34,16 +34,22 @@ from __future__ import annotations
 
 import asyncio
 
-from lotsa.tests.test_pr_flow_integration import _stub_full_process_service
+from lotsa.tests.test_pr_flow_integration import _PR_MONITOR_STACK, _stub_full_process_service
 
-# The bundled ``full`` process sets max_pr_fix_rounds = 10.
+# ADR-045 extracted the pr-fix cap out of ``build``/``fix`` main into the
+# standalone ``pr-monitor`` workflow's monitor step (``wait_for_pr_signal``),
+# which still sets max_pr_fix_rounds = 10.
 _CAP = 10
 
 
 def _assert_cap_loaded(svc):
-    pr_cfg = svc._pr_monitor_configs_by_process[svc._active_process_name]
+    # ADR-045 — the cap config lives on the ``pr-monitor`` workflow now, not on
+    # ``build``. Runtime resolves it via the task's active call-stack frame
+    # (``_plumbing_key_for`` → ``pr-monitor``); the precondition checks the
+    # config is loaded under that plumbing key.
+    pr_cfg = svc._pr_monitor_configs_by_process["pr-monitor"]
     assert pr_cfg is not None and pr_cfg.max_pr_fix_rounds == _CAP, (
-        f"precondition: bundled full process must load max_pr_fix_rounds={_CAP}"
+        f"precondition: bundled pr-monitor workflow must load max_pr_fix_rounds={_CAP}"
     )
 
 
@@ -59,7 +65,12 @@ def _stage_pr_fix_task(svc, run, *, status, state="pr-fixing", rounds=_CAP):
             "Carve-out",
             state=state,
             metadata={
-                "current_flow": "pr_fix",
+                # ADR-045 — a task in the PR phase carries the two-frame
+                # build→pr-monitor call stack (replacing the removed
+                # ``current_flow="pr_fix"`` slot); the top frame makes
+                # ``pr-monitor`` the active workflow, so pr-fix / the cap resolve
+                # against it. Same staging the migrated pr-flow tests use.
+                "call_stack": _PR_MONITOR_STACK,
                 "pr_fix_round_count": rounds,
                 "pr_number": 1,
                 "github_owner": "o",

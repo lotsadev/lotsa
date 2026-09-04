@@ -34,8 +34,8 @@ class TaskContext:
     metadata: dict[str, Any]
     db: TaskDB
     process_name: str
-    flow_name: str  # root flow
-    current_flow: str  # may differ during sub-flows
+    flow_name: str  # root flow (bottom call-stack frame's workflow)
+    current_flow: str  # active workflow — top call-stack frame, else the root (ADR-045)
     last_run_step: str
     # ADR-044 Phase 3 — the task's WorktreeManager, injected by the orchestrator
     # only when running prehooks (a prehook may need to CREATE the worktree,

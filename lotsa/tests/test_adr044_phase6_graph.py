@@ -79,15 +79,21 @@ class TestSerializeProcessGraph:
 
         return serialize_process_graph(build_process("build"))
 
+    def _pr_monitor_graph(self) -> dict:
+        from lotsa.flows import build_process, serialize_process_graph
+
+        return serialize_process_graph(build_process("pr-monitor"))
+
     def test_serializes_every_flow_of_the_process(self):
-        graph = self._build_graph()
-        names = {f["name"] for f in graph["flows"]}
-        # build ships both the main pipeline and the pr_fix sub-flow.
-        assert {"main", "pr_fix"} <= names
+        # ADR-045 — build ships a single ``main`` flow; the PR-fix loop is the
+        # standalone ``pr-monitor`` workflow (also single-flow).
+        assert {f["name"] for f in self._build_graph()["flows"]} == {"main"}
+        assert {f["name"] for f in self._pr_monitor_graph()["flows"]} == {"main"}
 
     def test_main_flow_has_a_node_per_step(self):
         main = _flow(self._build_graph(), "main")
         ids = {n["id"] for n in main["nodes"]}
+        # ADR-045 — ``wait_for_pr_signal`` moved to the pr-monitor workflow.
         assert {
             "plan",
             "test",
@@ -96,8 +102,8 @@ class TestSerializeProcessGraph:
             "verify",
             "pr_summary",
             "push_pr",
-            "wait_for_pr_signal",
         } <= ids
+        assert "wait_for_pr_signal" not in ids
 
     def test_worker_node_resolves_its_catalog_agent(self):
         main = _flow(self._build_graph(), "main")
@@ -125,7 +131,8 @@ class TestSerializeProcessGraph:
         assert push["agent"] is None
 
     def test_monitor_node_type(self):
-        main = _flow(self._build_graph(), "main")
+        # ADR-045 — the monitor lives in the ``pr-monitor`` workflow now.
+        main = _flow(self._pr_monitor_graph(), "main")
         wait = _node(main, "wait_for_pr_signal")
         assert wait is not None
         assert wait["type"] == "monitor"
@@ -146,30 +153,47 @@ class TestSerializeProcessGraph:
         assert fwd["kind"] == "implicit"
         assert fwd["outcome"] == "COMPLETED"
 
-    def test_per_flow_routing_differs_between_main_and_pr_fix(self):
+    def test_per_flow_routing_differs_between_main_and_pr_monitor(self):
         """The whole "routing lives on the edge" thesis: ``review`` routes
-        ``FAILED → code`` in ``main`` but ``FAILED → pr-fix`` in ``pr_fix``.
-        Proves the serializer resolves per-binding effective rules, not the
-        job-level defaults."""
-        graph = self._build_graph()
-        assert _edge(_flow(graph, "main"), "review", "FAILED")["target"] == "code"
-        assert _edge(_flow(graph, "pr_fix"), "review", "FAILED")["target"] == "pr-fix"
+        ``FAILED → code`` in build's ``main`` but ``FAILED → pr-fix`` in the
+        ``pr-monitor`` workflow. Proves the serializer resolves each workflow's
+        effective rules, not shared job-level defaults."""
+        assert _edge(_flow(self._build_graph(), "main"), "review", "FAILED")["target"] == "code"
+        assert _edge(_flow(self._pr_monitor_graph(), "main"), "review", "FAILED")["target"] == "pr-fix"
 
     def test_terminal_targets_are_materialized_as_nodes(self):
         """pr-fix routes ``INPUT → needs_input`` and ``FAILED → blocked``. Both
         terminal targets must exist as nodes so the canvas can draw the edge to
-        them (they are not sibling steps)."""
-        pr_fix = _flow(self._build_graph(), "pr_fix")
-        assert _edge(pr_fix, "pr-fix", "INPUT")["target"] == "needs_input"
-        assert _edge(pr_fix, "pr-fix", "FAILED")["target"] == "blocked"
-        assert _node(pr_fix, "needs_input") is not None
-        assert _node(pr_fix, "blocked") is not None
+        them (they are not sibling steps). ADR-045 — pr-fix lives in pr-monitor."""
+        main = _flow(self._pr_monitor_graph(), "main")
+        assert _edge(main, "pr-fix", "INPUT")["target"] == "needs_input"
+        assert _edge(main, "pr-fix", "FAILED")["target"] == "blocked"
+        assert _node(main, "needs_input") is not None
+        assert _node(main, "blocked") is not None
 
     def test_back_edge_to_a_sibling_does_not_crash(self):
         """``resolve_conflicts COMPLETED → pr-fix`` is a cycle; the serializer
-        must emit it as an ordinary sibling edge."""
-        pr_fix = _flow(self._build_graph(), "pr_fix")
-        assert _edge(pr_fix, "resolve_conflicts", "COMPLETED")["target"] == "pr-fix"
+        must emit it as an ordinary sibling edge (ADR-045 — in pr-monitor)."""
+        main = _flow(self._pr_monitor_graph(), "main")
+        assert _edge(main, "resolve_conflicts", "COMPLETED")["target"] == "pr-fix"
+
+    def test_call_target_is_materialized_as_a_node(self):
+        """ADR-045 — build/fix end at ``push_pr COMPLETED → call pr-monitor``.
+        The ``call <workflow>`` target is not a step in this flow, so — like a
+        terminal sink — it must be materialized as a node; otherwise the viewer
+        renders a dangling edge for ``push_pr``. Reds pre-fix: the edge exists
+        with ``target="call pr-monitor"`` but no matching node."""
+        from lotsa.flows import build_process, serialize_process_graph
+
+        main = _flow(self._build_graph(), "main")
+        edge = _edge(main, "push_pr", "COMPLETED")
+        assert edge is not None and edge["target"] == "call pr-monitor"
+        sink = _node(main, "call pr-monitor")
+        assert sink is not None, "the call target must exist as a node so the edge isn't dangling"
+        assert sink["type"] == "terminal"
+        # fix ends the same way — the sink materialization is not build-specific.
+        fix_main = _flow(serialize_process_graph(build_process("fix")), "main")
+        assert _node(fix_main, "call pr-monitor") is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -189,7 +213,10 @@ class TestWorkflowGraphService:
         assert graph["source"] == "bundled"
         # A bundled workflow is not project-owned.
         assert graph.get("project") is None
-        assert {f["name"] for f in graph["flows"]} >= {"main", "pr_fix"}
+        # ADR-045 — build is single-flow; the pr-fix loop is the pr-monitor workflow.
+        assert {f["name"] for f in graph["flows"]} == {"main"}
+        pr_monitor = service.workflow_graph("pr-monitor")
+        assert {f["name"] for f in pr_monitor["flows"]} == {"main"}
 
     def test_unknown_workflow_raises_workflow_not_found(self, app_with_service):
         from lotsa.orchestrator import WorkflowNotFound
@@ -237,7 +264,7 @@ class TestWorkflowGraphAPI:
                 assert data["name"] == "build"
                 assert data["source"] == "bundled"
                 flow_names = {f["name"] for f in data["flows"]}
-                assert {"main", "pr_fix"} <= flow_names
+                assert flow_names == {"main"}  # ADR-045 — build is single-flow
                 main = next(f for f in data["flows"] if f["name"] == "main")
                 assert any(n["id"] == "review" for n in main["nodes"])
                 assert any(e["source"] == "review" for e in main["edges"])

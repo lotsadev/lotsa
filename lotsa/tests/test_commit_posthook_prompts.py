@@ -43,11 +43,19 @@ _NON_PRODUCERS = ("plan", "review", "verify")
 
 
 def _resolved_posthooks() -> dict[str, list[str]]:
-    """Effective posthooks per job in the bundled ``build`` process."""
+    """Effective posthooks per job across the bundled Execute workflows.
+
+    ADR-045 moved ``pr-fix`` (a producer) out of ``build`` into the standalone
+    ``pr-monitor`` workflow, so the producer set spans both.
+    """
     import lotsa.posthooks  # noqa: F401 — ensures the built-in ``commit`` exists
     from lotsa.flows import build_process
 
-    return {j.name: list(j.posthooks) for j in build_process("build").jobs}
+    resolved: dict[str, list[str]] = {}
+    for process_name in ("build", "pr-monitor"):
+        for j in build_process(process_name).jobs:
+            resolved[j.name] = list(j.posthooks)
+    return resolved
 
 
 # ---------------------------------------------------------------------------

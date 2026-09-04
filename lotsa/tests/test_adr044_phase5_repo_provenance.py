@@ -503,6 +503,55 @@ class TestPerProjectRepoCatalog:
         finally:
             _stop(run, svc, db)
 
+    def test_repo_workflow_with_bad_call_graph_drops_the_whole_catalog(self, tmp_path, run):
+        """A repo workflow with an invalid ``call`` edge (unknown target or a
+        cycle) fails ``validate_call_graph`` over the merged per-project
+        namespace. Consistent with the fail-soft repo policy, ``_build_repo_processes``
+        drops the *entire* project catalog rather than raising or partially
+        registering — so no invalid ``call`` can ever reach a task, and the
+        (already-validated) bundled catalog is untouched.
+
+        This exercises the ADR-045 fail-soft branch in ``_build_repo_processes``
+        directly: pre-fix (before the branch existed) the raised ``ValueError``
+        would abort ``start()``; a partial-registration bug would leave the good
+        ``myflow`` in the catalog beside the dropped bad one.
+        """
+        repo_a = _init_git_repo(tmp_path / "repo_a")
+        repo_b = _init_git_repo(tmp_path / "repo_b")
+        _write_repo_agent(repo_a, "mycoder", produces_changes=False)
+        _write_repo_workflow(repo_a, "myflow", _MYFLOW_YAML)  # good, buildable
+        _write_repo_workflow(  # builds fine, but its call target does not exist
+            repo_a,
+            "badcall",
+            "name: badcall\n"
+            "description: repo workflow with an invalid call edge\n"
+            "jobs:\n"
+            "  - name: work\n"
+            "    type: agent\n"
+            "    prompt: mycoder\n"
+            "    queue_state: working\n"
+            "    active_state: working\n"
+            "    routes:\n"
+            "      COMPLETED: call does-not-exist\n"
+            "flows:\n"
+            "  main:\n"
+            "    steps: [work]\n",
+        )
+        svc, db = _build_and_start(run, tmp_path / "data", _alpha_beta_yaml(repo_a, repo_b))
+        try:
+            # The whole alpha repo catalog is dropped — NOT partially registered.
+            assert svc._project_processes.get("alpha", {}) == {}, (
+                "an invalid repo call graph must drop the whole project catalog, "
+                f"got {sorted(svc._project_processes.get('alpha', {}))}"
+            )
+            # Startup still succeeded and the bundled catalog is intact.
+            assert {"chat", "build", "fix"}.issubset(set(svc._processes))
+            # No plumbing was registered for the dropped workflows (repo plumbing
+            # keys are ``(project_id, name)`` tuples; bundled keys are plain strings).
+            assert not any(isinstance(k, tuple) and k[0] == "alpha" for k in svc._pr_monitor_configs_by_process)
+        finally:
+            _stop(run, svc, db)
+
     def test_same_named_repo_workflows_have_isolated_monitor_plumbing(self, tmp_path, run):
         """Two projects shipping an identically-named repo workflow with
         different monitor configs must NOT overwrite each other's plumbing.

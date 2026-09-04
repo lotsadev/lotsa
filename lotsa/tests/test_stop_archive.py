@@ -289,7 +289,19 @@ class TestChatTornState:
                     state="blocked",
                     status="blocked",
                     current_step="resolve_conflicts",
-                    metadata={"current_flow": "pr_fix", "pr_number": 1},
+                    metadata={
+                        # ADR-045 — the PR phase is the standalone ``pr-monitor``
+                        # workflow now; a task parked at ``resolve_conflicts``
+                        # carries the build→pr-monitor call stack (top frame =
+                        # pr-monitor) so the step resolves against pr-monitor,
+                        # which owns it. Replaces the removed
+                        # ``current_flow="pr_fix"`` slot.
+                        "call_stack": [
+                            {"workflow": "build", "step": "push_pr", "called_from": None},
+                            {"workflow": "pr-monitor", "step": "resolve_conflicts", "called_from": "push_pr"},
+                        ],
+                        "pr_number": 1,
+                    },
                 )
                 calls: list[dict] = []
 
@@ -320,7 +332,19 @@ class TestChatTornState:
                     state="resolving_conflicts",
                     status="blocked",
                     current_step="resolve_conflicts",
-                    metadata={"current_flow": "pr_fix", "pr_number": 1},
+                    metadata={
+                        # ADR-045 — the PR phase is the standalone ``pr-monitor``
+                        # workflow now; a task parked at ``resolve_conflicts``
+                        # carries the build→pr-monitor call stack (top frame =
+                        # pr-monitor) so the step resolves against pr-monitor,
+                        # which owns it. Replaces the removed
+                        # ``current_flow="pr_fix"`` slot.
+                        "call_stack": [
+                            {"workflow": "build", "step": "push_pr", "called_from": None},
+                            {"workflow": "pr-monitor", "step": "resolve_conflicts", "called_from": "push_pr"},
+                        ],
+                        "pr_number": 1,
+                    },
                 )
                 seen: list[str] = []
 
@@ -347,7 +371,19 @@ class TestChatTornState:
                     state="blocked",
                     status="working",  # torn: working status, no agent
                     current_step="resolve_conflicts",
-                    metadata={"current_flow": "pr_fix", "pr_number": 1},
+                    metadata={
+                        # ADR-045 — the PR phase is the standalone ``pr-monitor``
+                        # workflow now; a task parked at ``resolve_conflicts``
+                        # carries the build→pr-monitor call stack (top frame =
+                        # pr-monitor) so the step resolves against pr-monitor,
+                        # which owns it. Replaces the removed
+                        # ``current_flow="pr_fix"`` slot.
+                        "call_stack": [
+                            {"workflow": "build", "step": "push_pr", "called_from": None},
+                            {"workflow": "pr-monitor", "step": "resolve_conflicts", "called_from": "push_pr"},
+                        ],
+                        "pr_number": 1,
+                    },
                 )
                 assert task.id not in svc._in_flight
 
