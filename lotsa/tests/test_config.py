@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from lotsa.config import LotsaConfig
@@ -319,3 +320,43 @@ def test_shutdown_grace_seconds_loads_from_yaml(tmp_path):
     config_file.write_text(yaml.dump({"shutdown_grace_seconds": 10.0}))
     config = LotsaConfig.load(config_path=config_file)
     assert config.shutdown_grace_seconds == 10.0
+
+
+# ---------------------------------------------------------------------------
+# ADR-046 — branch-freshness monitor knobs
+# ---------------------------------------------------------------------------
+
+
+def test_branch_monitor_interval_default_is_five_minutes():
+    """The branch-freshness poll interval defaults to 5 minutes (ADR-046)."""
+    config = LotsaConfig()
+    assert config.branch_monitor_interval_seconds == 300
+
+
+def test_branch_monitor_enabled_default_true():
+    """The standing branch monitor is on by default."""
+    config = LotsaConfig()
+    assert config.branch_monitor_enabled is True
+
+
+def test_branch_monitor_interval_loads_from_yaml(tmp_path):
+    """``branch_monitor_interval_seconds: N`` in lotsa.yaml overrides the default."""
+    config_file = tmp_path / "lotsa.yaml"
+    config_file.write_text(yaml.dump({"branch_monitor_interval_seconds": 600}))
+    config = LotsaConfig.load(config_path=config_file)
+    assert config.branch_monitor_interval_seconds == 600
+
+
+def test_branch_monitor_can_be_disabled_via_yaml(tmp_path):
+    config_file = tmp_path / "lotsa.yaml"
+    config_file.write_text(yaml.dump({"branch_monitor_enabled": False}))
+    config = LotsaConfig.load(config_path=config_file)
+    assert config.branch_monitor_enabled is False
+
+
+def test_branch_monitor_interval_rejects_non_positive(tmp_path):
+    """A zero/negative interval is a busy-wait against git — reject it at load."""
+    config_file = tmp_path / "lotsa.yaml"
+    config_file.write_text(yaml.dump({"branch_monitor_interval_seconds": 0}))
+    with pytest.raises(ValueError):
+        LotsaConfig.load(config_path=config_file)
