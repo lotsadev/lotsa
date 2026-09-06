@@ -10,6 +10,7 @@ import type {
   Attachment,
   WorkflowGraph,
   AgentDetail,
+  MonitorHeartbeat,
 } from './types'
 
 export const fetchTasks = () => apiFetch<TaskSummary[]>('/api/tasks')
@@ -167,6 +168,15 @@ export const archiveTask = (taskId: string) =>
 // (for GitHub-less setups / a task parked at `awaiting_operator`).
 export const markCompleteTask = (taskId: string) =>
   apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/mark-complete`, { method: 'POST' })
+
+// ADR-046 — one-click "Sync with default": merge origin/<default> into the
+// task's worktree (push when a PR exists, local merge pre-PR). A raced conflict
+// routes to the process's resolve_conflicts agent server-side.
+export const syncBranch = (taskId: string) =>
+  apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/sync-branch`, { method: 'POST' })
+
+// ADR-046 — read-only monitor liveness (heartbeat registry).
+export const fetchMonitors = () => apiFetch<MonitorHeartbeat[]>('/api/monitors')
 
 // ADR-027/043 — switch a task to a different loaded process mid-life. The Hand
 // off dialog sends no explicit artifacts (undefined), so promote_task seeds the

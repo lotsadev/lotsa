@@ -83,6 +83,7 @@ export function RightPanel({ taskId }: RightPanelProps) {
           status={data.task.status}
           prNumber={data.task.metadata?.pr_number as number | string | undefined}
           prUrl={data.task.metadata?.pr_url as string | undefined}
+          metadata={data.task.metadata}
         />
       </TabsContent>
       <TabsContent value="activity" className="flex-1 overflow-hidden mt-0">

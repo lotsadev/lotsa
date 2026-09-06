@@ -144,6 +144,10 @@ class PrMonitorEngine:
         self.config = parse_config(config or {})
         self.monitor_state = monitor_state
         self._adapter = _SubFlowAdapter(orchestrator)
+        # ADR-046 — thread the orchestrator's monitor registry through so this
+        # poller records a heartbeat. Absent on partial-fake orchestrators used
+        # in unit tests (``getattr`` default keeps those constructing cleanly).
+        registry = getattr(orchestrator, "_monitor_registry", None)
         # ``PrMonitor`` reads ``config.triggers`` / ``config.poll_interval_seconds``
         # / etc. as plain attribute access. ``PrMonitorConfig`` already exposes
         # those exact names so no adapter is needed — pass it through directly.
@@ -153,7 +157,7 @@ class PrMonitorEngine:
         # than one monitor, so the filter is functionally a no-op — the
         # wiring is here so a multi-monitor topology becomes a pure config
         # addition rather than a code change.
-        self._monitor = PrMonitor(self._adapter, self.config, monitor_state=monitor_state)
+        self._monitor = PrMonitor(self._adapter, self.config, monitor_state=monitor_state, registry=registry)
 
     async def run(self) -> None:
         await self._monitor.run()

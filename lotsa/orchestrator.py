@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from lotsa.tools import ToolResult
 
 from lotsa.attachments import materialize_into_worktree
+from lotsa.branch_monitor import BranchMonitor
 from lotsa.config import LotsaConfig, resolve_project_specs
 from lotsa.db import (
     PUSH_START,
@@ -52,6 +53,7 @@ from lotsa.flows import (
     resolve_output_target,
     serialize_process_graph,
 )
+from lotsa.monitors.registry import MonitorRegistry
 from lotsa.pr_monitor import (
     FEEDBACK_HEADER_FAILING_CHECKS,
     FEEDBACK_HEADER_INLINE_COMMENTS,
@@ -250,6 +252,26 @@ class MarkCompleteFailed(Exception):
     Kept distinct from ``MarkCompleteNotAllowed`` (a 400 "don't retry, already
     terminal" precondition) so the route can surface non-convergence as a
     retryable 503 instead of a non-retryable 400.
+    """
+
+
+class SyncNotAllowed(Exception):
+    """Raised when ``sync_branch()`` is called on a task that isn't idle (ADR-046).
+
+    The one-click "Sync with default" merges into the task's worktree, so it is
+    gated to idle tasks (waiting / awaiting_operator / needs_input / blocked /
+    waiting_for_pr) — never a ``working`` task, whose live agent would race the
+    merge. A 400 precondition on the API, mirroring ``RetryNotAllowed``.
+    """
+
+
+class SyncNotNeeded(Exception):
+    """Raised when ``sync_branch()`` runs on an already-current branch (ADR-046).
+
+    ``behind == 0`` means there's nothing to merge or push — a no-op the button
+    only reaches on a race (main hasn't moved since the last poll). Distinct
+    from ``SyncNotAllowed`` so the route can tell "nothing to do" apart from
+    "not permitted".
     """
 
 
@@ -935,7 +957,13 @@ class OrchestratorService:
         self._dispatching_pr_fix: set[str] = set()
         self._dispatching_push: set[str] = set()
         self._dispatching_jump: set[str] = set()
+        self._dispatching_sync: set[str] = set()
         self._acknowledging_override: set[str] = set()
+        # ADR-046 — monitor liveness registry (a rebuildable cache per ADR-040,
+        # never state-of-record) + the standing monitors' run() tasks so
+        # shutdown can cancel/drain them alongside the pr monitors.
+        self._monitor_registry = MonitorRegistry()
+        self._standing_monitor_tasks: dict[str, asyncio.Task] = {}
 
     @property
     def runner(self) -> AgentRunner:
@@ -1306,6 +1334,19 @@ class OrchestratorService:
         for plumbing_key, engine in self._pr_monitors_by_process.items():
             self._pr_monitor_tasks_by_process[plumbing_key] = asyncio.create_task(engine.run())
 
+        # ADR-046 — start the standing branch-freshness monitor (project-wide,
+        # gates nothing). Registered as a consumer of the ADR-040 restart
+        # invariant: it persists to task metadata (state-of-record) and keeps
+        # only an in-memory heartbeat (rebuildable cache). Spawned after the pr
+        # monitors so all monitors share one start-point.
+        if self.config.branch_monitor_enabled:
+            branch_monitor = BranchMonitor(
+                self,
+                self.config.branch_monitor_interval_seconds,
+                registry=self._monitor_registry,
+            )
+            self._standing_monitor_tasks["branch_freshness"] = asyncio.create_task(branch_monitor.run())
+
     async def shutdown(self) -> None:
         """Graceful drain then cancel all background work and clean up (ADR-040 R5).
 
@@ -1354,7 +1395,10 @@ class OrchestratorService:
         # Each monitor's `finally` block still runs (closing pooled httpx
         # clients) before the loop tears down; the 5s per-task budget now
         # overlaps across processes instead of summing.
-        monitor_tasks = list(self._pr_monitor_tasks_by_process.values())
+        # ADR-046 — standing monitors (branch-freshness) tear down alongside the
+        # pr monitors: cancel all first, then await concurrently under one 5s
+        # per-task budget (each monitor's ``aclose()`` still runs in its finally).
+        monitor_tasks = list(self._pr_monitor_tasks_by_process.values()) + list(self._standing_monitor_tasks.values())
         for task in monitor_tasks:
             task.cancel()
         if monitor_tasks:
@@ -1364,6 +1408,7 @@ class OrchestratorService:
             )
         self._pr_monitor_tasks_by_process.clear()
         self._pr_monitors_by_process.clear()
+        self._standing_monitor_tasks.clear()
 
         for task in self._push_tasks.values():
             if not task.done():
@@ -4014,8 +4059,15 @@ class OrchestratorService:
             feedback = ""
         return await self.dispatch_pr_fix(task_id, feedback)
 
-    async def _sync_branch_to_main(self, task_id: str) -> SyncResult:
+    async def _sync_branch_to_main(self, task_id: str, *, push: bool = True) -> SyncResult:
         """Sync the task's worktree branch to ``origin/<default_branch>`` (ADR-015).
+
+        ``push`` (default ``True``) controls whether a clean merge is published
+        to the task's PR branch. The pr-fix funnel and retry paths keep the
+        default (the PR already exists, so the merged ref must be pushed). The
+        manual ``sync_branch`` action (ADR-046) passes ``push=False`` for a task
+        with no PR yet — a **local merge, no push** — since there's no remote
+        branch to publish to.
 
         Deterministic, orchestrator-owned (ADR-013): fetch the canonical
         upstream branch (the task's project ``WorktreeManager.default_branch``,
@@ -4114,23 +4166,26 @@ class OrchestratorService:
                 raise RuntimeError(f"git merge origin/{branch} failed (no conflicts): {merge_err.strip()}")
             return SyncResult(status="conflicts", conflicting_files=conflicting)
 
-        # 5. Clean merge — push the merged ref to the task's PR branch. The PR
-        #    already exists (this runs inside the pr-fix funnel), so reuse the
-        #    deterministic push helper with the existing ``pr_number``; with it
-        #    set, ``execute_push`` pushes by SHA and locates (does not create)
-        #    the PR. CI re-runs and the bot re-reviews on the new SHA —
-        #    expected and acceptable.
-        task = await self.db.get_task(task_id)
-        pr_number = task.metadata.get("pr_number") if task is not None else None
-        # Base off the configured default branch (ADR-018 contract item 5).
-        # Per-task base branches remain out of scope per the ADR
-        # (``_pr_monitor_config_for`` is the future hook).
-        await execute_push(
-            work_dir=work_dir,
-            task_id=task_id,
-            pr_number=pr_number,
-            base_branch=branch,
-        )
+        # 5. Clean merge. When ``push`` (the pr-fix funnel / retry default), push
+        #    the merged ref to the task's PR branch: the PR already exists, so
+        #    reuse the deterministic push helper with the existing ``pr_number``;
+        #    with it set, ``execute_push`` pushes by SHA and locates (does not
+        #    create) the PR. CI re-runs and the bot re-reviews on the new SHA —
+        #    expected and acceptable. When ``push`` is False (ADR-046 manual sync
+        #    on a pre-PR task), the merge commit stays local — there's no remote
+        #    branch to publish to.
+        if push:
+            task = await self.db.get_task(task_id)
+            pr_number = task.metadata.get("pr_number") if task is not None else None
+            # Base off the configured default branch (ADR-018 contract item 5).
+            # Per-task base branches remain out of scope per the ADR
+            # (``_pr_monitor_config_for`` is the future hook).
+            await execute_push(
+                work_dir=work_dir,
+                task_id=task_id,
+                pr_number=pr_number,
+                base_branch=branch,
+            )
         return SyncResult(status="clean")
 
     async def _handle_conflict_dispatch(
@@ -4257,6 +4312,303 @@ class OrchestratorService:
             engine.untrack(item.id)
         await self.source.append_event(item.id, {"type": "dispatch", "job_type": step_name, "success": False})
         return False
+
+    # ── Branch-freshness (ADR-046) ───────────────────────────────────────
+
+    # The set of parked, non-``working`` statuses a manual ``sync_branch`` may
+    # run against. ``working`` is excluded — an agent is live in the worktree,
+    # and merging under it violates the concurrency rules (Constitution §3.3).
+    # Terminal statuses have no worktree to sync.
+    _SYNC_IDLE_STATUSES = frozenset({"waiting", "waiting_for_pr", "awaiting_operator", "needs_input", "blocked"})
+
+    async def list_branch_watch_project_ids(self) -> list[str]:
+        """Project ids that own at least one branch-watchable task (ADR-046).
+
+        Derived from the watch-task set so the branch monitor fetches only for
+        projects with live work, not every registered project.
+        """
+        tasks = await self.list_branch_watch_tasks()
+        seen: dict[str, None] = {}
+        for task in tasks:
+            pid = task.get("project_id") or "default"
+            seen.setdefault(pid, None)
+        return list(seen)
+
+    async def list_branch_watch_tasks(self) -> list[dict]:
+        """Non-terminal tasks that have a worktree to probe (ADR-046).
+
+        The non-terminal filter is pushed down to SQL (``status_not_in``) as in
+        ``list_waiting_pr_tasks``; the has-a-worktree predicate stays in Python
+        because it hits the filesystem. A ``chat`` task (no worktree) and any
+        task whose worktree hasn't been created resolve to no path and are
+        skipped — so the probe only ever runs where there's a branch to measure.
+        """
+        rows = await self.db.list_tasks(status_not_in=("complete", "abandoned", "archived"))
+        watch: list[dict] = []
+        for row in rows:
+            try:
+                wtm = self._worktree_manager_for_task(row)
+            except ProjectNotFound:
+                continue
+            path = wtm.get_path(row.id)
+            if path is None or not Path(path).exists():
+                continue
+            watch.append({"id": row.id, "project_id": row.project_id, "status": row.status})
+        return watch
+
+    async def fetch_project_default(self, project_id: str) -> None:
+        """Fetch ``origin/<default>`` once for a project (ADR-046).
+
+        Runs the fetch in the **project root** checkout: a project's task
+        worktrees share its object store, so one fetch updates the
+        ``origin/<default>`` remote-tracking ref for every worktree — the probe
+        (``refresh_branch_status``) then reads that ref without any network. A
+        missing/unknown project is a no-op (best-effort). Fetch failures raise
+        so the caller (the monitor) can isolate them per project.
+        """
+        project = self._projects.get(project_id)
+        if project is None:
+            return
+        work_dir = Path(project.path)
+        branch = self._project_default_branches.get(project_id, "main")
+        git_env = self._git_auth_env()
+        rc, _out, err = await self._run_git(work_dir, "fetch", "origin", branch, env=git_env)
+        if rc != 0:
+            raise RuntimeError(f"git fetch origin {branch} failed for project {project_id!r}: {err.strip()}")
+
+    async def refresh_branch_status(self, task_id: str) -> None:
+        """Probe how far a task is behind ``origin/<default>`` and persist it (ADR-046).
+
+        Non-mutating: reads the (already-fetched) ``origin/<default>`` ref with
+        ``git rev-list`` + ``git merge-tree --write-tree`` and never touches the
+        worktree/index — safe to run while an agent is live. Persists
+        ``branch_behind`` / ``branch_mergeable`` / ``branch_conflicts`` /
+        ``branch_checked_at`` / ``branch_checked_against_sha`` to task metadata
+        (spread-merge so no concurrent writer's keys are clobbered). A task
+        without a worktree, or whose ``origin/<default>`` ref isn't present
+        (never fetched / empty repo), is skipped.
+        """
+        row = await self.db.get_task(task_id)
+        if row is None:
+            return
+        try:
+            wtm = self._worktree_manager_for_task(row)
+        except ProjectNotFound:
+            return
+        path = wtm.get_path(task_id)
+        if path is None or not Path(path).exists():
+            return
+        work_dir = Path(path)
+        branch = wtm.default_branch
+
+        # Skip when the remote-tracking ref isn't present yet (never fetched, or
+        # a git-init repo with no origin/<branch>). rev-list/merge-tree below
+        # would error against a missing ref; a skip leaves prior status intact.
+        rc, sha_out, _err = await self._run_git(work_dir, "rev-parse", f"origin/{branch}")
+        if rc != 0:
+            return
+        checked_sha = sha_out.strip()
+
+        rc, out, _err = await self._run_git(work_dir, "rev-list", "--count", f"HEAD..origin/{branch}")
+        if rc != 0:
+            return
+        behind = int(out.strip() or "0")
+
+        mergeable, conflicts = await self._probe_mergeability(work_dir, branch)
+
+        fresh = await self.db.get_task(task_id)
+        if fresh is None:
+            return
+        merged = {
+            **fresh.metadata,
+            "branch_behind": behind,
+            "branch_mergeable": mergeable,
+            "branch_conflicts": list(conflicts),
+            "branch_checked_at": datetime.now(UTC).isoformat(),
+            "branch_checked_against_sha": checked_sha,
+        }
+        await self.db.update_task(task_id, metadata=merged)
+
+    async def _probe_mergeability(self, work_dir: Path, branch: str) -> tuple[bool | None, tuple[str, ...]]:
+        """Non-mutating merge probe via ``git merge-tree --write-tree`` (Git ≥2.38).
+
+        Returns ``(mergeable, conflicting_files)``:
+          - exit 0 → ``(True, ())`` — merges cleanly, no worktree touched.
+          - exit 1 → ``(False, <files>)`` — the conflicting paths are the lines
+            after the written-tree OID up to the first blank line (``--name-only``).
+          - exit ≥2 → ``(None, ())`` — git error (e.g. ``--write-tree`` unsupported
+            on Git <2.38). ``None`` is "unknown"; behind-count still persists and
+            we never fall back to a mutating merge for a status probe.
+        """
+        rc, out, err = await self._run_git(
+            work_dir, "merge-tree", "--write-tree", "--name-only", "HEAD", f"origin/{branch}"
+        )
+        if rc == 0:
+            return True, ()
+        if rc == 1:
+            conflicts: list[str] = []
+            for line in out.split("\n")[1:]:  # drop the written-tree OID on line 0
+                if line.strip() == "":
+                    break  # blank line ends the conflicted-file block; messages follow
+                conflicts.append(line.strip())
+            return False, tuple(conflicts)
+        logger.warning(
+            "merge-tree probe failed in %s against origin/%s (rc=%s): %s — "
+            "branch_mergeable left unknown (Git <2.38 lacks --write-tree)",
+            work_dir,
+            branch,
+            rc,
+            err.strip(),
+        )
+        return None, ()
+
+    def _git_auth_env(self) -> dict[str, str]:
+        """Env for authenticated git subprocesses (mirrors ``_sync_branch_to_main``).
+
+        Disables the terminal prompt (no TTY in a daemon) and adds the
+        ``GITHUB_TOKEN`` credential helper when present so a private/auth'd
+        remote doesn't die on "could not read Username".
+        """
+        from rigg.git import TokenCredentialStrategy
+
+        git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            git_env.update(TokenCredentialStrategy(token).env())
+        return git_env
+
+    async def _run_git(self, work_dir: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+        """Run a git subprocess in *work_dir* (async, positional tokens; §1.1/§2.1).
+
+        Returns ``(returncode, stdout, scrubbed_stderr)``. stderr is scrubbed at
+        the source because it can carry a tokenized remote URL that flows into
+        logs/audit rows (§1.2).
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=work_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await proc.communicate()
+        return proc.returncode or 0, stdout.decode(), scrub_secrets(stderr.decode())
+
+    async def sync_branch(self, task_id: str) -> None:
+        """Operator one-click "Sync with default" (ADR-046).
+
+        Runs the real merge (``_sync_branch_to_main``), pushing when the task
+        has a PR and doing a local-only merge pre-PR. Gated to idle tasks — a
+        ``working`` task raises ``SyncNotAllowed``. On an already-current branch
+        raises ``SyncNotNeeded``. On a merge conflict (main moved since the last
+        poll) it re-anchors the task into the pr_fix sub-flow and routes through
+        ``_handle_conflict_dispatch`` → the process's ``resolve_conflicts`` agent
+        (or blocks when the process has none), mirroring ``retry()``'s conflict
+        path. A fetch/push error blocks the task (generic sync-error contract).
+        """
+        if not self.flow:
+            raise RuntimeError("OrchestratorService not started")
+        row = await self.db.get_task(task_id)
+        if row is None:
+            raise SyncNotAllowed(f"Task {task_id} not found")
+        if row.status not in self._SYNC_IDLE_STATUSES:
+            raise SyncNotAllowed(
+                f"Sync is only available for an idle task "
+                f"({', '.join(sorted(self._SYNC_IDLE_STATUSES))}); task is {row.status!r}."
+            )
+        # Re-entrancy guard (Constitution §3.3): add before the first await that
+        # could yield to a competing sync/dispatch; discard in ``finally``.
+        if task_id in self._dispatching_sync or task_id in self._in_flight:
+            return
+        self._dispatching_sync.add(task_id)
+        try:
+            has_pr = bool(row.metadata.get("pr_number"))
+            item = Item(id=row.id, state=row.state, title=row.title, body=row.body, metadata=row.metadata)
+            try:
+                sync_result = await self._sync_branch_to_main(task_id, push=has_pr)
+            except Exception as exc:  # noqa: BLE001 — any fetch/push/merge failure blocks
+                logger.exception("Manual branch sync failed for task %s", task_id)
+                await self._block_after_sync(
+                    item,
+                    from_status=row.status,
+                    from_state=row.state,
+                    message=f"Branch sync to default failed: {type(exc).__name__}: {exc}",
+                    to_current_step=row.current_step or row.state,
+                    step_name=row.current_step or row.state,
+                )
+                return
+
+            if sync_result.status == "already_current":
+                raise SyncNotNeeded(f"Task {task_id} is already up to date with the default branch.")
+
+            if sync_result.status == "conflicts":
+                # (idle_state → resolving_conflicts) is not a state-machine edge —
+                # re-anchor at the pr_fix sub-flow's entry state (pr-fixing) so
+                # ``_handle_conflict_dispatch``'s ``_dispatch_step`` guard sees the
+                # real (pr-fixing → resolving_conflicts) edge. Mirrors retry()'s
+                # conflict path; the DB CAS is unguarded by the SM (consistent with
+                # that path's blocked→pr-fixing re-anchor).
+                reanchor = await self.db.atomic_transition(
+                    task_id,
+                    from_status=row.status,
+                    from_state=row.state,
+                    to_state="pr-fixing",
+                    to_status="working",
+                    to_current_step="pr-fix",
+                    audit_on_win=None,
+                )
+                if not reanchor.won:
+                    return
+                item.state = "pr-fixing"
+                current_rounds = int(item.metadata.get("pr_fix_round_count", 0))
+                await self._handle_conflict_dispatch(
+                    item,
+                    sync_result.conflicting_files,
+                    current_rounds,
+                    from_step=row.current_step or row.state,
+                )
+                return
+
+            # Clean merge (and pushed when ``has_pr``). The task stays parked;
+            # record the sync and refresh its now-current freshness metadata.
+            await self.db.add_message(
+                task_id,
+                "system",
+                row.current_step or "",
+                f"Synced worktree with origin/{self._worktree_manager_for_task(row).default_branch}.",
+                "status_change",
+            )
+            await self.refresh_branch_status(task_id)
+        finally:
+            self._dispatching_sync.discard(task_id)
+
+    def monitor_heartbeats(self) -> list[dict]:
+        """Serialize the monitor liveness registry for ``/api/monitors`` (ADR-046).
+
+        ``healthy`` is "last tick succeeded and no failures are stacking up";
+        ``stale`` is "the next tick is overdue by more than a full interval"
+        (a stalled or never-started loop). Both are derived, not stored.
+        """
+        now = time.time()
+        out: list[dict] = []
+        for hb in self._monitor_registry.snapshot():
+            stale = hb.next_due_at is not None and now > hb.next_due_at + max(hb.interval_seconds, 1.0)
+            healthy = hb.last_ok is True and hb.consecutive_failures == 0 and not stale
+            out.append(
+                {
+                    "name": hb.name,
+                    "kind": hb.kind,
+                    "interval_seconds": hb.interval_seconds,
+                    "last_tick_at": hb.last_tick_at,
+                    "next_due_at": hb.next_due_at,
+                    "consecutive_failures": hb.consecutive_failures,
+                    "last_error": hb.last_error,
+                    "healthy": healthy,
+                    "stale": stale,
+                }
+            )
+        return out
 
     async def _dispatch_pr_fix_locked(
         self,

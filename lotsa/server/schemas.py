@@ -16,6 +16,25 @@ from lotsa.orchestrator import TaskDetail, TaskSummary
 from lotsa.status import TaskStatusLiteral
 
 
+class MonitorHeartbeatResponse(BaseModel):
+    """One running monitor's liveness (ADR-046 ``GET /api/monitors``).
+
+    ``kind`` is ``standing`` (always-on, project-scoped — branch-freshness) or
+    ``step_scoped`` (bound to a flow state — pr_monitor). ``healthy`` /
+    ``stale`` are derived server-side; timestamps are epoch seconds.
+    """
+
+    name: str
+    kind: str
+    interval_seconds: float
+    last_tick_at: float | None = None
+    next_due_at: float | None = None
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    healthy: bool = False
+    stale: bool = False
+
+
 class TaskSummaryResponse(BaseModel):
     """Lightweight task info for list views."""
 
