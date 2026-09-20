@@ -561,7 +561,7 @@ def _pr_terminal_chat_stack(svc: OrchestratorService) -> tuple[str, str, list[di
     where ``chat``'s call-site step catches ``terminate``. Returns
     (monitor_state, monitor_step, stack)."""
     mon = svc._processes["pr-monitor"].flows["main"].jobs[0]
-    stack = [
+    stack: list[dict] = [
         {"workflow": "chat", "step": "chat", "called_from": None},
         {"workflow": "build", "step": "push_pr", "called_from": "chat"},
         {"workflow": "pr-monitor", "step": mon.name, "called_from": "push_pr"},

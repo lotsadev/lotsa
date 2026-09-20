@@ -16,7 +16,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { promoteTask } from '@/api/tasks'
+import { acceptCall, promoteTask } from '@/api/tasks'
 import { useProcesses } from '@/hooks/use-processes'
 import { useTask } from '@/hooks/use-task'
 
@@ -81,13 +81,22 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
   const selected = destination || suggested
   const isAccepting = selected !== '' && selected === suggested
 
+  // ADR-045 Phase 2 — when the task is parked at the operator gate
+  // (``awaiting_operator``), the hand-off is a *gated call*: accept PUSHES the
+  // chosen Execute workflow onto the stack atop the persisting chat frame
+  // (``acceptCall``) rather than promoting (which re-roots and discards chat).
+  // A proactive hand-off from a non-gate state still uses promoteTask (the
+  // ADR-027 escape hatch) — and when the status is unknown we default to it.
+  const atGate = taskData?.task?.status === 'awaiting_operator'
+
   const mutation = useMutation({
     // No artifacts: the destination's first step (build's plan, fix's coding)
-    // reads the full chat transcript, which promote_task seeds under
-    // promotion_context and each of the destination's declared promotion_inputs
-    // (draft_spec for build, instruction for fix) when called with no explicit
-    // fields.
-    mutationFn: () => promoteTask(taskId, selected, undefined),
+    // reads the full chat transcript. Under a gated call the chat frame stays
+    // on the stack, so its artifacts (incl. draft_spec) are already task-scoped
+    // and visible to the callee — nothing extra to seed. promoteTask seeds the
+    // transcript under promotion_context / the destination's promotion_inputs.
+    mutationFn: () =>
+      atGate ? acceptCall(taskId, selected, undefined) : promoteTask(taskId, selected, undefined),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task', taskId] })
       onOpenChange(false)
@@ -106,8 +115,9 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
           <DialogDescription>
             Choose how thorough: <strong>Build it</strong> for the full SDLC
             pass, or <strong>Quick fix</strong> for a mechanical change. The
-            worktree and the full audit log stay; the handoff is one-way (no
-            return to chat) but the running task stays steerable.
+            worktree and the full audit log stay, and this chat stays underneath:
+            when the PR merges or closes, control returns here so you can keep
+            talking. The running task stays steerable throughout.
           </DialogDescription>
         </DialogHeader>
 

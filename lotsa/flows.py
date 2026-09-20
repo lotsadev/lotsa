@@ -365,6 +365,11 @@ class Job:
     commit_prefix: str | None = None
     model: str | None = None
     runner: str | None = None
+    # ADR-045 Phase 2 — an operator gate on the step's outgoing *call* routes. A
+    # ``gate: operator`` step parks at ``awaiting_operator`` when it would
+    # otherwise ``call``/``handoff``; the operator accepts (push) or declines.
+    # Only ``operator`` is valid in Phase 2. ``None`` = ungated (the default).
+    gate: str | None = None
     # ADR-017 soft-timeout indicator. Both optional; when set, the orchestrator
     # surfaces a yellow (warn) / red (over) dot once a step's elapsed time
     # crosses the threshold. Informational only — no auto-kill.
@@ -398,6 +403,8 @@ class ResolvedJob:
     commit_prefix: str | None = None
     model: str | None = None
     runner: str | None = None
+    # ADR-045 Phase 2 — operator gate on outgoing call routes (see Job above).
+    gate: str | None = None
     # ADR-017 — see Job above; carried through to dispatch so the orchestrator
     # can read the active step's thresholds when computing ``timeout_status``.
     timeout_warn_seconds: int | None = None
@@ -450,6 +457,9 @@ class FlowBinding:
     config: dict[str, Any] = field(default_factory=dict)
     posthooks: list[str] | None = None
     prehooks: list[str] | None = None
+    # ADR-045 Phase 2 — per-flow override of the job's operator gate. ``None`` =
+    # "use the job's gate" (lookup-then-fallback, mirroring ``rules``).
+    gate: str | None = None
 
 
 @dataclass
@@ -690,6 +700,12 @@ def _parse_job(jd: dict) -> Job:
     if job_type == "monitor" and not jd.get("engine"):
         raise ValueError(f"Job {jd.get('name')!r} has type: monitor but no engine: <name> set")
 
+    # ADR-045 Phase 2 — ``gate: operator`` is the only legal gate value; reject
+    # any other loudly (a typo must never silently disable the gate).
+    gate = jd.get("gate")
+    if gate is not None and gate != "operator":
+        raise ValueError(f"Job {jd.get('name')!r}: gate must be 'operator' (got {gate!r})")
+
     commit = bool(jd.get("commit", False))
     output_file = jd.get("output_file")
     if commit and not output_file:
@@ -742,6 +758,7 @@ def _parse_job(jd: dict) -> Job:
         commit_prefix=jd.get("commit_prefix"),
         model=jd.get("model"),
         runner=jd.get("runner"),
+        gate=gate,
         timeout_warn_seconds=jd.get("timeout_warn_seconds"),
         timeout_kill_seconds=jd.get("timeout_kill_seconds"),
     )
@@ -773,12 +790,18 @@ def _parse_flow_step(raw: Any) -> FlowBinding:
             _parse_rules(raw.get("rules")),
             where=f"Flow step {raw['name']!r}",
         )
+        # ADR-045 Phase 2 — a per-flow binding may override the gate; ``None`` =
+        # "use the job's gate". Validate the value here too (same rule as the job).
+        binding_gate = raw.get("gate")
+        if binding_gate is not None and binding_gate != "operator":
+            raise ValueError(f"Flow step {raw['name']!r}: gate must be 'operator' (got {binding_gate!r})")
         return FlowBinding(
             name=raw["name"],
             rules=binding_rules,
             config=dict(raw.get("config", {})),
             posthooks=list(raw_posthooks) if raw_posthooks is not None else None,
             prehooks=list(raw_prehooks) if raw_prehooks is not None else None,
+            gate=binding_gate,
         )
     raise ValueError(f"Bad flow step: {raw!r}")
 
@@ -1018,6 +1041,7 @@ def _resolve_jobs(
                 commit_prefix=job.commit_prefix,
                 model=job.model,
                 runner=job.runner,
+                gate=binding.gate if binding.gate is not None else job.gate,
                 timeout_warn_seconds=job.timeout_warn_seconds,
                 timeout_kill_seconds=job.timeout_kill_seconds,
             )
@@ -1553,6 +1577,41 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
                 _check(rule.target, f"Flow {flow_name!r} step {binding.name!r}")
 
 
+def _validate_gate_steps(jobs: list[Job], flow_bindings: dict[str, list[FlowBinding]]) -> None:
+    """Raise ``ValueError`` if a ``gate: operator`` step gates nothing (ADR-045 Phase 2).
+
+    A gate only earns its place when there is a ``call`` (or ``handoff``) route
+    leaving the step for the operator to gate — the whole point is a human
+    checkpoint before a cross-workflow call. A gate with no such route would
+    silently gate an ordinary in-flow advance (or nothing), which is a config
+    mistake we surface loudly at build time.
+
+    Both surfaces are checked (job default + per-flow binding override), and each
+    uses its effective (post-override) gate and rules, mirroring
+    ``_validate_rule_targets``.
+    """
+    by_name = {j.name: j for j in jobs}
+
+    def _gateable(rules: list[OutputRule]) -> bool:
+        return any(is_call_target(r.target) or r.target == "handoff" for r in rules)
+
+    for flow_name, bindings in flow_bindings.items():
+        for binding in bindings:
+            job = by_name.get(binding.name)
+            if job is None:
+                continue  # unknown-job errors are raised elsewhere (_resolve_jobs)
+            gate = binding.gate if binding.gate is not None else job.gate
+            if gate != "operator":
+                continue
+            effective_rules = binding.rules if binding.rules is not None else list(job.rules)
+            if not _gateable(effective_rules):
+                raise ValueError(
+                    f"Flow {flow_name!r} step {binding.name!r} declares gate: operator but routes no "
+                    "call/handoff outcome — the gate gates nothing. Add a "
+                    "'routes: { <OUTCOME>: call <workflow> }' (or 'handoff') route, or drop the gate."
+                )
+
+
 def _validate_registry_references(jobs: list[Job]) -> None:
     """Raise ``ValueError`` if any job references an unregistered tool/engine.
 
@@ -1858,6 +1917,9 @@ def build_process(
     # (whose target is validated across the whole catalog by
     # ``validate_call_graph`` once every process is loaded).
     _validate_rule_targets(jobs, flow_bindings)
+
+    # ADR-045 Phase 2 — a ``gate: operator`` step must gate an actual call/handoff.
+    _validate_gate_steps(jobs, flow_bindings)
 
     # Validate ``posthooks:`` references (per-job and per-binding) against the
     # posthook registry so an unknown name fails fast at build time, same as
