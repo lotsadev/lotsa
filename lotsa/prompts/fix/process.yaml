@@ -4,7 +4,7 @@ description: |
   fixes, renames, config tweaks, dependency bumps): no design conversation, no
   test writing. The coder executes a precise instruction; review checks the diff
   against that instruction, not the broad architectural checklist. Then it opens
-  a PR and watches it to terminal. Reach it from chat via the "Quick fix"
+  a PR and hands off to PR watching. Reach it from chat via the "Quick fix"
   handoff, or select it directly.
 promotion_inputs:
   - name: instruction
@@ -16,36 +16,24 @@ jobs:
     queue_state: coding
     active_state: coding
 
-  # ``review``/``pr-fix``/``resolve_conflicts`` reference the shared, process-
-  # independent agents in the catalog (``lotsa/prompts/agents/<name>/``),
-  # resolved by ``AgentPromptRegistry`` (ADR-044) — fix ships only its
-  # distinctive ``fix_coding`` agent (the "execute this instruction" framing).
-  # Routing lives at the flow-step level below (per-flow overrides take
-  # precedence over job defaults — see lotsa/CLAUDE.md).
+  # ``review`` references the shared, process-independent agent in the catalog
+  # (``lotsa/prompts/agents/<name>/``), resolved by ``AgentPromptRegistry``
+  # (ADR-044) — fix ships only its distinctive ``fix_coding`` agent (the
+  # "execute this instruction" framing). The PR-phase agents (``pr-fix`` /
+  # ``resolve_conflicts``) now live in the ``pr-monitor`` workflow (ADR-045).
   - name: review
     type: agent
     prompt: review
     queue_state: reviewing
     active_state: reviewing
 
-  # ADR-044 Phase 4 — routing declared with the ``routes:`` sugar; all four
-  # pr-fix outcomes stay explicit (mirrors ``build``).
-  - name: pr-fix
-    type: agent
-    prompt: pr_fix
-    resume: true
-    queue_state: pr-fixing
-    active_state: pr-fixing
-    routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
-
   # ``pr_summary`` references the shared ``pr_summary`` agent in the catalog
   # (``lotsa/prompts/agents/pr_summary/``) via ``AgentPromptRegistry`` (ADR-044)
-  # — fix ships no copy of the prompt. It declares no ``inputs`` (a missing spec must never
-  # block it) and lives only in ``main``, not ``pr_fix`` (a re-push keeps the
-  # existing PR and must not regenerate its text — mirrors ``build``). No
-  # per-step ``model:`` is pinned: consistent with the bundled "ship no per-step
-  # models" policy (see build/process.yaml) — model-pinning fix's summary to a
-  # cheaper tier is left to operator policy in lotsa.yaml.
+  # — fix ships no copy of the prompt. It declares no ``inputs`` (a missing spec
+  # must never block it) and lives only in ``main``; a re-push keeps the existing
+  # PR and must not regenerate its text — the re-push lives in ``pr-monitor``,
+  # which has no ``pr_summary`` step (mirrors build). No per-step ``model:`` is
+  # pinned: consistent with the bundled "ship no per-step models" policy.
   - name: pr_summary
     type: agent
     prompt: pr_summary
@@ -53,27 +41,12 @@ jobs:
     queue_state: summarizing
     active_state: summarizing
 
+  # ADR-045 — fix ends by handing off to PR watching: ``push_pr`` opens the PR
+  # then *calls* the standalone ``pr-monitor`` workflow (automatic in Phase 1).
   - name: push_pr
     type: action
     tool: push_pr
-
-  - name: resolve_conflicts
-    type: agent
-    prompt: resolve_conflicts
-    resume: true
-    queue_state: resolving_conflicts
-    active_state: resolving_conflicts
-    routes: { COMPLETED: pr-fix }
-
-  - name: wait_for_pr_signal
-    type: monitor
-    engine: pr_monitor
-    config:
-      poll_interval_seconds: 30
-      debounce_seconds: 120
-      triggers: [human_comment, bot_comment, review_decision, failing_check, merge_conflict]
-      max_pr_fix_rounds: 10
-      max_consecutive_skipped: 3
+    routes: { COMPLETED: call pr-monitor }
 
 flows:
   main:
@@ -82,15 +55,4 @@ flows:
       - name: review
         routes: { PASSED: next, FAILED: code }
       - pr_summary
-      - push_pr
-      - wait_for_pr_signal
-
-  pr_fix:
-    steps:
-      - name: pr-fix
-        routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
-      - name: resolve_conflicts
-        routes: { COMPLETED: pr-fix }
-      - name: review
-        routes: { PASSED: next, FAILED: pr-fix }
       - push_pr

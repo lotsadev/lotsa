@@ -11,9 +11,10 @@ feedback aggregation, debounce, the polling loop). This module is a thin
 wrapper that:
 
 - parses the monitor job's YAML ``config:`` block into ``PrMonitorConfig``;
-- adapts the legacy ``orchestrator.dispatch_pr_fix(task_id, feedback)``
-  call into the typed-job ``dispatch_sub_flow(task_id, "pr_fix", feedback=…)``
-  contract via ``_SubFlowAdapter``;
+- forwards the poller's ``dispatch_pr_fix(task_id, feedback)`` call to the real
+  orchestrator via ``_SubFlowAdapter`` (ADR-045: pr-fix is an intra-workflow
+  edge now, so it forwards straight through rather than rewriting the call to
+  ``dispatch_sub_flow``);
 - forwards the operational surface (``run``, ``untrack``,
   ``snapshot_triggering_ids``, ``gather_pending_feedback``) to the wrapped
   poller.
@@ -102,22 +103,23 @@ def parse_config(raw: dict[str, Any]) -> PrMonitorConfig:
 
 
 class _SubFlowAdapter:
-    """Adapter — translates monitor's ``dispatch_pr_fix`` call into
-    ``dispatch_sub_flow("pr_fix", feedback=…)`` on the real orchestrator.
+    """Adapter around the real orchestrator for the ``PrMonitor`` poller.
 
-    The underlying ``PrMonitor`` (in lotsa.pr_monitor) calls
-    ``orchestrator.dispatch_pr_fix(task_id, feedback)``; the new orchestrator
-    Protocol exposes ``dispatch_sub_flow(task_id, flow_name, feedback=...)``.
-    This adapter forwards every other attribute access verbatim so the
-    rest of the PrMonitor surface (``transition_task``, ``db``,
-    ``list_waiting_pr_tasks``) is untouched.
+    ADR-045 — after ``pr-monitor`` became its own top-level workflow, the
+    monitor step and ``pr-fix`` live in the SAME workflow, so a feedback dispatch
+    is an INTRA-workflow edge (monitor state → pr-fixing), not a call into a
+    sub-flow. The adapter therefore forwards ``dispatch_pr_fix`` straight through
+    (which resolves ``pr-fix`` against the task's active workflow) instead of the
+    old ``dispatch_sub_flow("pr_fix", …)`` cross-flow indirection. Every other
+    attribute (``transition_task``, ``db``, ``list_waiting_pr_tasks``) forwards
+    verbatim.
     """
 
     def __init__(self, real_orchestrator: PrMonitorOrchestrator) -> None:
         self._real = real_orchestrator
 
     async def dispatch_pr_fix(self, task_id: str, feedback: str) -> bool:
-        return await self._real.dispatch_sub_flow(task_id, "pr_fix", feedback=feedback)
+        return await self._real.dispatch_pr_fix(task_id, feedback)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._real, name)

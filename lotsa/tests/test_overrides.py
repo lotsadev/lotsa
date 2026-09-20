@@ -477,7 +477,11 @@ class TestAcknowledgeOverrideEndpoint:
                 assert data["available_overrides"] == []
 
             after = await service.db.get_task(task.id)
-            assert after.metadata.get("pr_fix_round_count") == 0
+            # The override reset the cap counter to 0; the paired resume
+            # (acknowledge → retry) then re-dispatches pr-fix as one fresh round,
+            # so the counter reflects that single post-override round — well below
+            # the cap it fired at (10). The point is the reset, not the literal 0.
+            assert after.metadata.get("pr_fix_round_count") == 1
 
         run(_test())
 

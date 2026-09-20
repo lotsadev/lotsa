@@ -390,10 +390,15 @@ def test_mark_complete_from_waiting_for_pr_untracks_monitor(tmp_path, run):
     (resolved against the task's own process), not a hand-rolled fake, so the
     ``_monitor_engine_for`` resolution is exercised too.
     """
+    from lotsa.call_stack import CALL_STACK_KEY, make_frame
+
     svc = _catalog_service(tmp_path, run)
     run(svc.start())
     try:
-        engine = svc._pr_monitors_by_process["build"]
+        # ADR-045 — the PR monitor lives in the standalone ``pr-monitor``
+        # workflow, so its engine is keyed there (a build task reaches it via a
+        # ``call pr-monitor`` that pushes a frame).
+        engine = svc._pr_monitors_by_process["pr-monitor"]
         untracked: list[str] = []
         real_untrack = engine.untrack
 
@@ -403,15 +408,20 @@ def test_mark_complete_from_waiting_for_pr_untracks_monitor(tmp_path, run):
 
         engine.untrack = spy_untrack  # type: ignore[method-assign]
 
-        # ``wait_for_pr_signal`` is build's monitor state; ``waiting_for_pr`` the
-        # paired status. This is the exact shape a parked, PR-watching task holds.
+        # ``wait_for_pr_signal`` is pr-monitor's monitor state; ``waiting_for_pr``
+        # the paired status. This is the exact shape a parked, PR-watching task
+        # holds: created by ``build`` but mid-``pr-monitor`` (top call-stack frame).
         task = run(
             svc.db.create_task(
                 "Watching a PR",
                 state="wait_for_pr_signal",
                 status="waiting_for_pr",
                 current_step="wait_for_pr_signal",
-                metadata={"process_name": "build", "pr_number": 7},
+                metadata={
+                    "process_name": "build",
+                    "pr_number": 7,
+                    CALL_STACK_KEY: [make_frame("pr-monitor", "wait_for_pr_signal")],
+                },
             )
         )
 

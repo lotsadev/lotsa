@@ -597,11 +597,13 @@ def test_verify_routes_to_pr_summary_and_pr_summary_routes_to_push_pr():
     assert by_name["pr_summary"].success_state == by_name["push_pr"].queue_state
 
 
-def test_pr_fix_flow_has_no_pr_summary_step():
+def test_pr_monitor_flow_has_no_pr_summary_step():
+    # ADR-045 — the PR-watch loop lives in the ``pr-monitor`` workflow (formerly
+    # the ``pr_fix`` sub-flow); a re-push must not regenerate the PR text.
     from lotsa.flows import build_process
 
-    pr_fix = build_process("build").flows["pr_fix"]
-    assert not any(b.name == "pr_summary" for b in pr_fix.bindings)
+    main = build_process("pr-monitor").flows["main"]
+    assert not any(b.name == "pr_summary" for b in main.bindings)
 
 
 def test_pr_summary_prompt_files_exist():

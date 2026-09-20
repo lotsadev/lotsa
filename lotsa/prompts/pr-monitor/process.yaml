@@ -1,0 +1,69 @@
+process: pr-monitor
+description: |
+  Watch an open PR and react (ADR-045). ``wait_for_pr_signal`` is the entry
+  step: it parks the task while the pr_monitor engine polls the PR, then routes
+  each signal internally — fix inbound feedback, resolve conflicts, keep
+  monitoring on approval (APPROVED is never terminal, ADR-030), terminate on
+  merge/close. Reached as a ``call pr-monitor`` from build/fix after push_pr;
+  a top-level, independently-selectable workflow (Phase 3 will point it at a
+  foreign PR).
+jobs:
+  # The monitor is the ENTRY step. The pr_monitor engine drives it: on feedback
+  # it dispatches ``pr-fix``, on a merge conflict ``resolve_conflicts`` (both
+  # intra-flow edges registered by ``_build_state_machine``), and on merge/close
+  # it applies the ADR-030 terminal CAS directly (not an agent route).
+  - name: wait_for_pr_signal
+    type: monitor
+    engine: pr_monitor
+    config:
+      poll_interval_seconds: 30
+      debounce_seconds: 120
+      triggers: [human_comment, bot_comment, review_decision, failing_check, merge_conflict]
+      max_pr_fix_rounds: 10
+      max_consecutive_skipped: 3
+
+  # ``pr-fix`` / ``review`` / ``resolve_conflicts`` reference the shared,
+  # process-independent catalog agents (``lotsa/prompts/agents/<name>/``),
+  # resolved by ``AgentPromptRegistry`` (ADR-044) — pr-monitor ships no prompts
+  # of its own. All four pr-fix outcomes stay explicit (mirrors the former
+  # build/fix pr_fix flow): SKIPPED loops back to the monitor internally.
+  - name: pr-fix
+    type: agent
+    prompt: pr_fix
+    resume: true
+    queue_state: pr-fixing
+    active_state: pr-fixing
+    routes: { COMPLETED: review, INPUT: needs_input, FAILED: blocked, SKIPPED: wait_for_pr_signal }
+
+  - name: resolve_conflicts
+    type: agent
+    prompt: resolve_conflicts
+    resume: true
+    queue_state: resolving_conflicts
+    active_state: resolving_conflicts
+    routes: { COMPLETED: pr-fix }
+
+  - name: review
+    type: agent
+    prompt: review
+    queue_state: reviewing
+    active_state: reviewing
+    routes: { PASSED: push_pr, FAILED: pr-fix }
+
+  # A successful re-push loops back to the monitor to await merge / further
+  # feedback (the loop that replaces the old sub-flow terminal override). It
+  # regenerates no PR text — a re-push keeps the existing PR (``pr_number`` set),
+  # so there is no ``pr_summary`` step here (mirrors the old pr_fix sub-flow).
+  - name: push_pr
+    type: action
+    tool: push_pr
+    routes: { COMPLETED: wait_for_pr_signal }
+
+flows:
+  main:
+    steps:
+      - wait_for_pr_signal
+      - pr-fix
+      - resolve_conflicts
+      - review
+      - push_pr
