@@ -415,13 +415,12 @@ class TestConflictDispatchesResolveConflicts:
             f"Conflicting file 'shared.txt' must appear in the agent prompt. Prompt excerpt: {combined_prompt[:400]!r}"
         )
 
-    def test_current_flow_set_to_pr_fix_on_conflict_dispatch(self, full_service, tmp_path, run, monkeypatch):
-        """``current_flow`` must be set to ``pr_fix`` when dispatching
-        resolve_conflicts — the drainer resolves rules against the pr_fix
-        sub-flow's SM.
-
-        Pre-fix failure: Phase 1 blocks before setting current_flow; the
-        task row either lacks the key or has the wrong value.
+    def test_active_workflow_is_pr_monitor_on_conflict_dispatch(self, full_service, tmp_path, run, monkeypatch):
+        """ADR-045 — dispatching resolve_conflicts is an INTRA-workflow edge inside
+        ``pr-monitor`` (the task is already there), so the drainer resolves rules
+        against pr-monitor's flow. The removed ``current_flow="pr_fix"`` slot is
+        gone; the active workflow is resolved from the call stack (or, for a
+        frameless staged task parked in a PR phase, inferred as ``pr-monitor``).
         """
         svc = full_service
         task = _stage_waiting_pr_task(svc, run, pr_number=33)
@@ -434,8 +433,9 @@ class TestConflictDispatchesResolveConflicts:
         run(asyncio.sleep(0.1))
 
         row = run(svc.db.get_task(task.id))
-        assert row.metadata.get("current_flow") == "pr_fix", (
-            f"current_flow must be 'pr_fix' after conflict dispatch, got {row.metadata.get('current_flow')!r}"
+        assert "current_flow" not in row.metadata, "ADR-045 removed the current_flow metadata slot"
+        assert svc._active_workflow_name_for(row) == "pr-monitor", (
+            "resolve_conflicts must run inside the pr-monitor workflow"
         )
 
 
@@ -466,7 +466,15 @@ class TestPublishConflictDispatchesResolveConflicts:
                 state="pr-fixing",
                 status="working",
                 current_step="pr-fix",
-                metadata={"pr_number": pr_number, "current_flow": "pr_fix", "pr_fix_round_count": 0},
+                metadata={
+                    "pr_number": pr_number,
+                    "process_name": "build",
+                    "call_stack": [
+                        {"workflow": "build", "step": "push_pr", "called_from": None},
+                        {"workflow": "pr-monitor", "step": "pr-fix", "called_from": "push_pr"},
+                    ],
+                    "pr_fix_round_count": 0,
+                },
             )
         )
         run(svc.db.add_message(task.id, "agent", "spec", "spec", "artifact", metadata={"artifact_name": "spec"}))
@@ -492,7 +500,7 @@ class TestPublishConflictDispatchesResolveConflicts:
         svc._run_step_posthooks = _publish_conflict  # type: ignore[assignment]
 
         item = Item(id=task.id, state="pr-fixing", title=task.title, body=task.body, metadata=dict(task.metadata))
-        pr_fix_step = next(s for s in svc._process_for(item).jobs if s.name == "pr-fix")
+        pr_fix_step = next(s for s in svc._active_process_for(item).jobs if s.name == "pr-fix")
         info = InFlightStep(
             item=item,
             step=pr_fix_step,
@@ -533,7 +541,7 @@ class TestPublishConflictDispatchesResolveConflicts:
         )
         assert row.state == "resolving_conflicts", f"expected resolving_conflicts, got {row.state!r}"
         assert len(svc.runner.calls) == 1, "resolve_conflicts agent must be dispatched"
-        assert row.metadata.get("current_flow") == "pr_fix"
+        assert svc._active_workflow_name_for(row) == "pr-monitor"
         assert int(row.metadata.get("pr_fix_round_count", 0)) == 1, "conflict dispatch consumes one round"
 
     def test_publish_conflict_file_list_reaches_the_agent(self, full_service, tmp_path, run):
@@ -1244,11 +1252,11 @@ def test_resolve_conflicts_monitor_entry_edge_in_main_sm():
     Pre-fix failure: ``resolve_conflicts`` job doesn't exist in the process,
     so ``resolving_conflicts`` is not a known state; the edge is absent.
     """
-    process = build_process("build")
+    process = build_process("pr-monitor")
     main_sm = process.flows["main"].state_machine
-    resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
+    resolve_step = next((rj for rj in process.flows["main"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None, (
-        "resolve_conflicts must be a job in the pr_fix sub-flow of the full process. Add it to full/process.yaml."
+        "resolve_conflicts must be a job in the pr-monitor workflow's main flow. Add it to pr-monitor/process.yaml."
     )
     assert ("wait_for_pr_signal", resolve_step.queue_state) in main_sm.transitions, (
         f"main's SM must contain the sub-flow entry edge "
@@ -1257,7 +1265,7 @@ def test_resolve_conflicts_monitor_entry_edge_in_main_sm():
     )
 
 
-def test_resolve_conflicts_monitor_entry_edge_in_pr_fix_sm():
+def test_resolve_conflicts_monitor_entry_edge_in_main_sm2():
     """The entry edge must also be in pr_fix's SM, because ``_dispatch_step``
     resolves ``active_flow`` to pr_fix (via metadata.current_flow) and validates
     the pre-CAS transition against that SM.
@@ -1265,17 +1273,17 @@ def test_resolve_conflicts_monitor_entry_edge_in_pr_fix_sm():
     Pre-fix failure: even if main's SM carries the edge, pr_fix's SM won't,
     so the transition guard silently no-ops.
     """
-    process = build_process("build")
-    pr_fix_sm = process.flows["pr_fix"].state_machine
-    resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
-    assert resolve_step is not None, "resolve_conflicts must be in pr_fix sub-flow"
-    assert ("wait_for_pr_signal", resolve_step.queue_state) in pr_fix_sm.transitions, (
+    process = build_process("pr-monitor")
+    main_sm2 = process.flows["main"].state_machine
+    resolve_step = next((rj for rj in process.flows["main"].jobs if rj.name == "resolve_conflicts"), None)
+    assert resolve_step is not None, "resolve_conflicts must be in pr-monitor main flow"
+    assert ("wait_for_pr_signal", resolve_step.queue_state) in main_sm2.transitions, (
         f"pr_fix's SM must also contain (wait_for_pr_signal, {resolve_step.queue_state!r}). "
         "_dispatch_step resolves active_flow=pr_fix via current_flow metadata before CAS."
     )
 
 
-def test_pr_fixing_to_resolving_conflicts_edge_in_pr_fix_sm():
+def test_pr_fixing_to_resolving_conflicts_edge_in_main_sm2():
     """The retry() conflict path dispatches resolve_conflicts from state
     ``pr-fixing`` (the task was mid pr-fix when a new sync found conflicts).
     ``_dispatch_step`` validates ``(item.state, resolve_step.active_state)``
@@ -1287,9 +1295,9 @@ def test_pr_fixing_to_resolving_conflicts_edge_in_pr_fix_sm():
     step between them would change pr-fix's success_state and drop this edge.
     This test protects that invariant.
     """
-    process = build_process("build")
-    pr_fix_sm = process.flows["pr_fix"].state_machine
-    assert ("pr-fixing", "resolving_conflicts") in pr_fix_sm.transitions, (
+    process = build_process("pr-monitor")
+    main_sm2 = process.flows["main"].state_machine
+    assert ("pr-fixing", "resolving_conflicts") in main_sm2.transitions, (
         "pr_fix SM must have ('pr-fixing', 'resolving_conflicts'). "
         "The retry() conflict path dispatches resolve_conflicts from pr-fixing state; "
         "without this edge _dispatch_step silently no-ops."
@@ -1302,37 +1310,37 @@ def test_conflicts_resolved_rule_edge_in_sm():
 
     Pre-fix failure: no rule → no edge registered by _build_state_machine.
     """
-    process = build_process("build")
-    resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
+    process = build_process("pr-monitor")
+    resolve_step = next((rj for rj in process.flows["main"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None, "resolve_conflicts must exist in pr_fix"
 
-    pr_fix_job = next(rj for rj in process.flows["pr_fix"].jobs if rj.name == "pr-fix")
+    pr_fix_job = next(rj for rj in process.flows["main"].jobs if rj.name == "pr-fix")
 
     # The rule target is "pr-fix" (job name); its queue_state is "pr-fixing".
-    pr_fix_sm = process.flows["pr_fix"].state_machine
-    assert (resolve_step.active_state, pr_fix_job.queue_state) in pr_fix_sm.transitions, (
+    main_sm2 = process.flows["main"].state_machine
+    assert (resolve_step.active_state, pr_fix_job.queue_state) in main_sm2.transitions, (
         f"pr_fix SM must have ({resolve_step.active_state!r}, {pr_fix_job.queue_state!r}) "
         "for the AGENT_RESULT: COMPLETED → pr-fix rule routing."
     )
 
 
 # ---------------------------------------------------------------------------
-# 11. full process.yaml — resolve_conflicts job and flow binding
+# 11. pr-monitor workflow.yaml — resolve_conflicts job and flow binding
 # ---------------------------------------------------------------------------
 
 
 def test_full_process_has_resolve_conflicts_job():
-    """``resolve_conflicts`` must be in the full process's job catalog.
+    """``resolve_conflicts`` must be in the pr-monitor workflow's job catalog.
 
     Pre-fix failure: it's not in full/process.yaml.
     """
-    process = build_process("build")
+    process = build_process("pr-monitor")
     names = [j.name for j in process.jobs]
-    assert "resolve_conflicts" in names, f"resolve_conflicts must be in full process jobs. Got: {names}"
+    assert "resolve_conflicts" in names, f"resolve_conflicts must be in pr-monitor workflow jobs. Got: {names}"
 
 
 def test_full_process_resolve_conflicts_is_agent_type():
-    process = build_process("build")
+    process = build_process("pr-monitor")
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert job.type == "agent", f"resolve_conflicts must be type=agent, got {job.type!r}"
 
@@ -1340,7 +1348,7 @@ def test_full_process_resolve_conflicts_is_agent_type():
 def test_full_process_resolve_conflicts_has_commit_posthook():
     """The ``commit`` posthook must be declared so the orchestrator
     completes the merge commit deterministically after the agent edits."""
-    process = build_process("build")
+    process = build_process("pr-monitor")
     # The job-level posthooks are on the raw Job; resolve through process.jobs.
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert "commit" in (job.posthooks or []), (
@@ -1349,7 +1357,7 @@ def test_full_process_resolve_conflicts_has_commit_posthook():
 
 
 def test_full_process_resolve_conflicts_has_no_model():
-    process = build_process("build")
+    process = build_process("pr-monitor")
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert job.model is None, (
         f"resolve_conflicts must not pin a model (bundled process ships no per-step models — "
@@ -1358,7 +1366,7 @@ def test_full_process_resolve_conflicts_has_no_model():
 
 
 def test_full_process_resolve_conflicts_has_resume():
-    process = build_process("build")
+    process = build_process("pr-monitor")
     job = next(j for j in process.jobs if j.name == "resolve_conflicts")
     assert job.resume_session is True, (
         "resolve_conflicts must have resume=true so the agent can continue a session "
@@ -1368,22 +1376,22 @@ def test_full_process_resolve_conflicts_has_resume():
 
 def test_full_process_pr_fix_flow_contains_resolve_conflicts():
     """``resolve_conflicts`` must appear in the ``pr_fix`` sub-flow's bindings."""
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
+    process = build_process("pr-monitor")
+    pr_fix = process.flows["main"]
     names = [b.name for b in pr_fix.bindings]
     assert "resolve_conflicts" in names, (
-        f"pr_fix sub-flow must contain resolve_conflicts binding. Got bindings: {names}"
+        f"pr-monitor main flow must contain resolve_conflicts binding. Got bindings: {names}"
     )
 
 
 def test_full_process_resolve_conflicts_has_conflicts_resolved_rule():
     """``resolve_conflicts`` must declare a ``AGENT_RESULT: COMPLETED:`` output rule
     routing to ``pr-fix``."""
-    process = build_process("build")
+    process = build_process("pr-monitor")
     # The per-flow rule override in the pr_fix binding takes precedence, but the
     # job-level default is also acceptable. Check the resolved FlowStep via the
     # pr_fix flow's job list.
-    resolve_step = next((rj for rj in process.flows["pr_fix"].jobs if rj.name == "resolve_conflicts"), None)
+    resolve_step = next((rj for rj in process.flows["main"].jobs if rj.name == "resolve_conflicts"), None)
     assert resolve_step is not None
     rule_targets = {r.target for r in resolve_step.rules}
     assert "pr-fix" in rule_targets, (
@@ -1397,23 +1405,18 @@ def test_full_process_resolve_conflicts_has_conflicts_resolved_rule():
 
 
 def test_full_process_pr_fix_binding_is_still_first():
-    """``pr-fix`` must remain bindings[0] of the pr_fix sub-flow so the existing
-    cross-flow entry edge (monitor → pr-fixing) is preserved by the registrar's
-    bindings[0] registration.
-
-    Adding resolve_conflicts must NOT reorder pr-fix away from position 0.
-    """
-    process = build_process("build")
-    first_binding = process.flows["pr_fix"].bindings[0]
-    assert first_binding.name == "pr-fix", (
-        f"pr-fix must remain bindings[0] of pr_fix. Got bindings[0].name={first_binding.name!r}. "
-        "Moving pr-fix from position 0 breaks the cross-flow entry-edge registration for "
-        "the existing clean-path dispatch."
-    )
+    """ADR-045 — pr-monitor's entry binding is the ``wait_for_pr_signal`` monitor,
+    with ``pr-fix`` following. The monitor→pr-fix entry edge is intra-flow now
+    (``_build_state_machine``), so the invariant is "monitor first, pr-fix
+    present"."""
+    process = build_process("pr-monitor")
+    bindings = [b.name for b in process.flows["main"].bindings]
+    assert bindings[0] == "wait_for_pr_signal", f"pr-monitor must start at wait_for_pr_signal; got {bindings}"
+    assert "pr-fix" in bindings, f"pr-monitor must contain pr-fix; got {bindings}"
 
 
 # ---------------------------------------------------------------------------
-# 12. full process.yaml — wait_for_pr_signal carries merge_conflict trigger
+# 12. pr-monitor workflow.yaml — wait_for_pr_signal carries merge_conflict trigger
 # ---------------------------------------------------------------------------
 
 
@@ -1423,7 +1426,7 @@ def test_full_process_wait_for_pr_signal_has_merge_conflict_trigger():
 
     Pre-fix failure: the trigger isn't in full/process.yaml's monitor config.
     """
-    process = build_process("build")
+    process = build_process("pr-monitor")
     monitor_job = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     triggers = monitor_job.config.get("triggers", []) if hasattr(monitor_job, "config") else []
     assert "merge_conflict" in triggers, (
@@ -1438,7 +1441,7 @@ def test_full_process_monitor_config_parses_merge_conflict_trigger():
 
     Pre-fix failure: parse_config raises ValueError on the unknown trigger.
     """
-    process = build_process("build")
+    process = build_process("pr-monitor")
     monitor_job = next(j for j in process.jobs if j.name == "wait_for_pr_signal")
     raw_config = dict(monitor_job.config) if hasattr(monitor_job, "config") else {}
     # Should not raise.

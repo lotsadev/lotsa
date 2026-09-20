@@ -15,8 +15,8 @@ interface WorkflowGraphProps {
 
 // ADR-044 Phase 6 — the read-only workflow board. The four `*={false}` props +
 // hidden handles ARE the editor seam: editor mode enables them and adds
-// onConnect/onNodesChange, no rewrite. A build/fix workflow ships main + pr_fix,
-// so a flow selector picks which to render.
+// onConnect/onNodesChange, no rewrite. A workflow may declare more than one flow
+// (e.g. main + pr_fix), so a flow selector picks which to render.
 export function WorkflowGraph({ graph }: WorkflowGraphProps) {
   const flowNames = graph.flows.map((f) => f.name)
   const [selectedFlow, setSelectedFlow] = useState(

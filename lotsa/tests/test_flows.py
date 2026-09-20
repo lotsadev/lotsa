@@ -33,18 +33,21 @@ from lotsa.flows import (
 
 def test_fix_process_loads():
     """The ``fix`` preset (ADR-043 Execute-at-shallow-depth) loads with a
-    ``code``-first main flow and a pr_fix sub-flow."""
+    ``code``-first, single ``main`` flow. ADR-045 moved the former ``pr_fix``
+    sub-flow into the standalone ``pr-monitor`` workflow."""
     process = build_process("fix")
     assert process.name == "fix"
     main = process.flows["main"]
     assert main.bindings[0].name == "code"
-    assert "pr_fix" in process.flows
+    assert "pr_fix" not in process.flows
 
 
-def test_build_process_loads_with_two_flows():
+def test_build_process_loads_single_main_flow():
+    """ADR-045 — build carries only a ``main`` flow now; the ``pr_fix`` sub-flow
+    lives in the standalone ``pr-monitor`` workflow reached via ``call``."""
     process = build_process("build")
-    assert "main" in process.flows
-    assert "pr_fix" in process.flows
+    assert list(process.flows) == ["main"]
+    assert "pr_fix" not in process.flows
 
 
 def test_unknown_process_raises():
@@ -81,9 +84,11 @@ def test_state_derivation_build_main():
     assert main.bindings[0].name == "plan"
     assert by_name["plan"].queue_state == "backlog"
     assert by_name["plan"].active_state == "planning"
-    # The last step in main is wait_for_pr_signal (monitor)
-    assert main.bindings[-1].name == "wait_for_pr_signal"
-    assert by_name["wait_for_pr_signal"].type == "monitor"
+    # ADR-045 — main ends at the ``push_pr`` action, which routes
+    # ``COMPLETED: call pr-monitor`` (the PR watch moved to a standalone
+    # workflow); the former inline ``wait_for_pr_signal`` monitor is gone.
+    assert main.bindings[-1].name == "push_pr"
+    assert by_name["push_pr"].type == "action"
 
 
 def test_build_main_has_no_gate_states():
@@ -342,10 +347,11 @@ def test_fix_review_routes_to_pr_summary_and_pr_summary_routes_to_push_pr():
     assert by_name["pr_summary"].success_state == by_name["push_pr"].queue_state
 
 
-def test_fix_pr_fix_flow_has_no_pr_summary_step():
-    """The ``pr_fix`` sub-flow must NOT regenerate the PR text on a re-push."""
-    pr_fix = build_process("fix").flows["pr_fix"]
-    assert not any(b.name == "pr_summary" for b in pr_fix.bindings)
+def test_pr_monitor_flow_has_no_pr_summary_step():
+    """ADR-045 — the ``pr-monitor`` workflow (the former ``pr_fix`` sub-flow)
+    must NOT regenerate the PR text on a re-push."""
+    main = build_process("pr-monitor").flows["main"]
+    assert not any(b.name == "pr_summary" for b in main.bindings)
 
 
 def test_fix_pr_summary_prompt_resolves_via_build_fallback():
@@ -647,7 +653,7 @@ def test_every_bundled_marker_survives_markdown_wrapping():
 
     from rigg.models import AgentResult
 
-    bundled = ("chat", "build", "fix")
+    bundled = ("chat", "build", "fix", "pr-monitor")
     swept = 0
     for process_name in bundled:
         process = build_process(process_name)
@@ -853,21 +859,20 @@ def test_resolve_output_target_unknown_routes_to_blocked():
 # ---------------------------------------------------------------------------
 
 
-def test_full_pr_fix_needs_decision_routes_to_needs_input():
+def test_pr_monitor_pr_fix_needs_decision_routes_to_needs_input():
     # ADR-044: pr-fix's blocking-question outcome is AGENT_RESULT: INPUT.
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
-    needs = next(r for r in (pr_fix_binding.rules or []) if "INPUT" in r.pattern)
+    # ADR-045: pr-fix lives in the standalone ``pr-monitor`` workflow now.
+    main = build_process("pr-monitor").flows["main"]
+    pr_fix_job = next(j for j in main.jobs if j.name == "pr-fix")
+    needs = next(r for r in pr_fix_job.rules if "INPUT" in r.pattern)
     assert needs.target == "needs_input"
 
 
-def test_full_pr_fix_needs_decision_precedes_blocked():
+def test_pr_monitor_pr_fix_needs_decision_precedes_blocked():
     # INPUT (needs_input) must precede the FAILED→blocked edge (first-match wins).
-    process = build_process("build")
-    pr_fix = process.flows["pr_fix"]
-    pr_fix_binding = next(b for b in pr_fix.bindings if b.name == "pr-fix")
-    rules = list(pr_fix_binding.rules or [])
+    main = build_process("pr-monitor").flows["main"]
+    pr_fix_job = next(j for j in main.jobs if j.name == "pr-fix")
+    rules = list(pr_fix_job.rules)
     needs_idx = next(i for i, r in enumerate(rules) if "INPUT" in r.pattern)
     blocked_idx = next(i for i, r in enumerate(rules) if r.target == "blocked")
     assert needs_idx < blocked_idx

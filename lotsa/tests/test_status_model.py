@@ -1113,6 +1113,18 @@ def test_revise_rebasing_dispatches_pr_fix_agent(tmp_path, _loop, run):
                 status="blocked",
                 current_step="push_pr",
                 state="rebasing",
+                # ADR-045 — a rebasing task in the PR phase carries the
+                # build→pr-monitor call stack; the top frame makes ``pr-monitor``
+                # the active workflow, so the rebasing→pr-fix recovery resolves
+                # pr-fix (and the monitor state) against pr-monitor, which now
+                # owns them (extracted out of build/fix main). Replaces the
+                # removed ``current_flow="pr_fix"`` slot.
+                metadata={
+                    "call_stack": [
+                        {"workflow": "build", "step": "push_pr", "called_from": None},
+                        {"workflow": "pr-monitor", "step": "push_pr", "called_from": "push_pr"},
+                    ],
+                },
             )
         )
         # pr-fix declares ``inputs: [spec, plan]``; seed both so the dispatch

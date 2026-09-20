@@ -4769,9 +4769,11 @@ class TestConversationalAutoAdvanceDuringPrFix:
 
 
 class TestDispatchSubFlow:
-    """``dispatch_sub_flow`` is the ADR-014 Layer B forward-compatible entry
-    point engines call to drive into a sub-flow. In Layer A only ``pr_fix``
-    is wired; the call forwards to ``dispatch_pr_fix``.
+    """``dispatch_sub_flow`` is the entry point engines call to drive into a
+    named workflow (ADR-045 Layer B). ``flow_name`` names a top-level workflow
+    in the catalog, not a sub-flow. A **re-entry** — ``flow_name`` equal to the
+    task's active workflow (top call-stack frame) with ``target_job="pr-fix"`` —
+    forwards to ``dispatch_pr_fix``; an unknown workflow declines.
     """
 
     @pytest.fixture()
@@ -4794,7 +4796,23 @@ class TestDispatchSubFlow:
         run(svc.shutdown())
         run(db.close())
 
-    def test_dispatch_sub_flow_forwards_pr_fix_to_dispatch_pr_fix(self, svc, run):
+    def _pr_monitor_task(self, svc, run):
+        """A task parked in the ``pr-monitor`` workflow (top call-stack frame),
+        the shape the engine re-enters at ``pr-fix``."""
+        from lotsa.call_stack import CALL_STACK_KEY, make_frame
+
+        return run(
+            svc.db.create_task(
+                "watch a PR",
+                state="pr-fixing",
+                status="working",
+                current_step="wait_for_pr_signal",
+                metadata={CALL_STACK_KEY: [make_frame("pr-monitor", "wait_for_pr_signal")]},
+            )
+        )
+
+    def test_dispatch_sub_flow_reentry_forwards_pr_fix_to_dispatch_pr_fix(self, svc, run):
+        task = self._pr_monitor_task(svc, run)
         calls: list[tuple[str, str]] = []
 
         async def fake_dispatch_pr_fix(task_id: str, feedback: str) -> bool:
@@ -4802,13 +4820,14 @@ class TestDispatchSubFlow:
             return True
 
         svc.dispatch_pr_fix = fake_dispatch_pr_fix  # type: ignore[method-assign]
-        ok = run(svc.dispatch_sub_flow("task-1", "pr_fix", feedback="hello"))
+        ok = run(svc.dispatch_sub_flow(task.id, "pr-monitor", target_job="pr-fix", feedback="hello"))
         assert ok is True
-        assert calls == [("task-1", "hello")]
+        assert calls == [(task.id, "hello")]
 
     def test_dispatch_sub_flow_propagates_decline_from_dispatch_pr_fix(self, svc, run):
         """When dispatch_pr_fix declines (CAS lost, cap fired), dispatch_sub_flow
         must surface ``False`` so callers (Layer B engines) can react."""
+        task = self._pr_monitor_task(svc, run)
         calls: list[tuple[str, str]] = []
 
         async def fake_dispatch_pr_fix(task_id: str, feedback: str) -> bool:
@@ -4816,12 +4835,13 @@ class TestDispatchSubFlow:
             return False
 
         svc.dispatch_pr_fix = fake_dispatch_pr_fix  # type: ignore[method-assign]
-        ok = run(svc.dispatch_sub_flow("task-1", "pr_fix", feedback="hello"))
+        ok = run(svc.dispatch_sub_flow(task.id, "pr-monitor", target_job="pr-fix", feedback="hello"))
         assert ok is False
-        assert calls == [("task-1", "hello")]
+        assert calls == [(task.id, "hello")]
 
     def test_dispatch_sub_flow_rejects_unknown_flow_name(self, svc, run):
-        ok = run(svc.dispatch_sub_flow("task-1", "no_such_flow"))
+        task = self._pr_monitor_task(svc, run)
+        ok = run(svc.dispatch_sub_flow(task.id, "no_such_workflow"))
         assert ok is False
 
 
@@ -4891,9 +4911,15 @@ class TestPromote:
 
         row = run(service.db.get_task(task.id))
         assert row is not None
-        # Process identity switched to the destination, sub-flow context reset.
+        # Process identity switched to the destination; the call stack is reset
+        # to a single fresh frame for the destination workflow (ADR-045 replaces
+        # the ``current_flow`` slot).
+        from lotsa.call_stack import stack_top
+
         assert row.metadata.get("process_name") == "build"
-        assert row.metadata.get("current_flow") == "main"
+        top = stack_top(row.metadata)
+        assert top is not None and top["workflow"] == "build"
+        assert "current_flow" not in row.metadata
         # Entered the destination pipeline. ``plan`` is ungated (ADR-043), so with
         # the FakeRunner it auto-advances rather than pausing at the first step —
         # the invariant is that the task now runs a build step, not the chat REPL.
@@ -4999,7 +5025,12 @@ class TestPromote:
             f"promotion to bundled preset {dest!r} must land (ADR-034 §5); got "
             f"process_name={row.metadata.get('process_name')!r}"
         )
-        assert row.metadata.get("current_flow") == "main"
+        # ADR-045 — the call stack is reset to a single frame for the destination.
+        from lotsa.call_stack import stack_top
+
+        top = stack_top(row.metadata)
+        assert top is not None and top["workflow"] == dest
+        assert "current_flow" not in row.metadata
 
     def test_records_process_promotion_audit_with_old_and_new(self, service, run):
         full = _load_build_destination(service)  # noqa: F841 — loaded as destination
@@ -6301,22 +6332,27 @@ class TestPrLifetimeMonitoringTerminalCompletion:
     def test_transition_task_abandons_a_needs_input_task(self, full_service, run):
         """A closed PR must abandon a task parked at ``needs_input``.
 
-        The NEEDS_DECISION park preserves ``state="pr-fixing"`` (the pr_fix
-        active state), which has no ``(pr-fixing, abandoned)`` edge.
+        The NEEDS_DECISION park preserves ``state="pr-fixing"`` (the pr-fix
+        active state in the ``pr-monitor`` workflow), which has no
+        ``(pr-fixing, abandoned)`` edge.
 
         Pre-fix: the missing edge → log-and-return → the task stays
         ``needs_input``. Post-fix it abandons.
         """
+        from lotsa.call_stack import CALL_STACK_KEY, make_frame
+
         svc = full_service
         task = run(
             svc.db.create_task(
                 "needs-input PR task",
                 state="pr-fixing",
                 status="needs_input",
-                metadata={"pr_number": 200, "current_flow": "pr_fix"},
+                current_step="pr-fix",
+                metadata={"pr_number": 200, CALL_STACK_KEY: [make_frame("pr-monitor", "pr-fix")]},
             )
         )
-        assert ("pr-fixing", "abandoned") not in svc.process.flows["pr_fix"].state_machine.transitions
+        pr_monitor_sm = svc._processes["pr-monitor"].flows["main"].state_machine
+        assert ("pr-fixing", "abandoned") not in pr_monitor_sm.transitions
 
         run(svc.transition_task(task.id, "abandoned"))
 
@@ -6342,25 +6378,30 @@ class TestPrLifetimeMonitoringDeferredCompletion:
         calls the hook, so the task lands wherever its routing left it
         (``waiting_for_pr``) and never completes — the assertion fails.
         """
+        from lotsa.call_stack import CALL_STACK_KEY, make_frame
         from lotsa.orchestrator import InFlightStep
         from rigg.models import AgentResult, Item
 
         svc = full_service
+        # ADR-045 — the task is parked mid-``pr-monitor`` workflow (top call-stack
+        # frame), the shape a ``call pr-monitor`` leaves after push_pr.
+        pr_monitor_meta = {CALL_STACK_KEY: [make_frame("pr-monitor", "pr-fix")], "pr_number": 77}
         task = run(
             svc.db.create_task(
                 "deferred complete",
                 state="pr-fixing",
                 status="working",
-                metadata={"current_flow": "pr_fix", "pr_number": 77},
+                current_step="pr-fix",
+                metadata=dict(pr_monitor_meta),
             )
         )
         item = Item(
             id=task.id,
             state="pr-fixing",
             title="deferred complete",
-            metadata={"current_flow": "pr_fix", "pr_number": 77},
+            metadata=dict(pr_monitor_meta),
         )
-        pr_fix_step = next(j for j in svc.process.flows["pr_fix"].jobs if j.name == "pr-fix")
+        pr_fix_step = next(j for j in svc._processes["pr-monitor"].flows["main"].jobs if j.name == "pr-fix")
 
         # Stub the engine's consume hook so the drainer sees a pending terminal
         # for this task regardless of the monitor's in-memory tracking state.

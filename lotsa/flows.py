@@ -512,7 +512,44 @@ class Process:
 # Bundled presets
 # ---------------------------------------------------------------------------
 
-PRESET_NAMES = ("chat", "build", "fix")
+PRESET_NAMES = ("chat", "build", "fix", "pr-monitor")
+
+# ADR-045 — reserved routing targets for workflow call/return. ``call <workflow>``
+# (and ``call <workflow>@<step>`` for named re-entry) pushes a frame and dispatches
+# the callee; ``terminate`` unwinds the stack (subject to catches). Both are
+# declared in YAML only — an agent-chosen ``AGENT_RESULT: CALL`` form is never
+# honoured (targets stay static and build-time analysable).
+CALL_PREFIX = "call "
+TERMINATE_TARGET = "terminate"
+
+
+def is_call_target(target: str) -> bool:
+    """True when a routing target is a ``call <workflow>[@<step>]`` edge."""
+    return isinstance(target, str) and target.startswith(CALL_PREFIX)
+
+
+def parse_call_target(target: str) -> tuple[str, str | None]:
+    """Split ``call <workflow>[@<step>]`` into ``(workflow, step | None)``."""
+    body = target[len(CALL_PREFIX) :].strip()
+    if "@" in body:
+        workflow, step = body.split("@", 1)
+        return workflow.strip(), step.strip() or None
+    return body, None
+
+
+def terminate_catch_target(rules: list[OutputRule]) -> str | None:
+    """Return the target of a step's ``terminate`` catch, or ``None`` (ADR-045).
+
+    A ``routes: { terminate: <target> }`` catch compiles to an inert
+    ``OutputRule(source="terminate", …)``. When a stack unwind propagates
+    ``terminate`` up to a frame, the drainer consults this to decide whether the
+    frame catches the unwind (routing to ``<target>`` within the frame's
+    workflow) or lets it propagate further toward the root.
+    """
+    for rule in rules:
+        if rule.source == TERMINATE_TARGET:
+            return rule.target
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +642,14 @@ def _parse_routes(raw: Any, *, where: str) -> list[OutputRule] | None:
         raise ValueError(f"{where}: 'routes:' must be a mapping of outcome → target, got {type(raw).__name__}")
     rules: list[OutputRule] = []
     for outcome, target in raw.items():
+        # ADR-045 — ``terminate`` is a reserved routing KEY (a catch), not an
+        # AGENT_RESULT outcome: ``routes: { terminate: <target> }`` says "when a
+        # stack unwind reaches this frame, route here instead of propagating".
+        # It compiles to an inert ``source="terminate"`` rule (never matches
+        # stdout); the drainer's unwind logic consults it by source.
+        if outcome == TERMINATE_TARGET:
+            rules.append(OutputRule(source=TERMINATE_TARGET, pattern=TERMINATE_TARGET, target=str(target)))
+            continue
         if outcome not in AGENT_OUTCOMES:
             raise ValueError(
                 f"{where}: 'routes:' key {outcome!r} is not a valid AGENT_RESULT outcome; "
@@ -987,12 +1032,14 @@ def _build_state_machine(
 ) -> StateMachine:
     """Derive a StateMachine from resolved jobs — no synthetic states.
 
-    Cross-flow rule targets (jobs not in ``resolved``) are intentionally
-    skipped here and stitched in by ``_register_cross_flow_edges`` after
-    every flow has been resolved. That pass has access to every flow's
-    ResolvedJob queue_state, which is the only source of truth for
-    cross-flow target queue states (a job's derived queue_state depends
-    on its position in its owning flow's bindings, not on the raw Job).
+    Rule targets that don't name a job in ``resolved`` have no in-flow SM
+    edge and are intentionally skipped here: since ADR-045 collapsed
+    sub-flows into top-level workflows, such a target is stack-crossing
+    (``call <workflow>``/``terminate``/``complete``) or a terminal sink
+    (``needs_input``), and the drainer routes it directly rather than through
+    a registered transition. There is no longer a cross-flow edge-stitching
+    pass — the removed ``_register_cross_flow_edges`` used to add those once
+    every flow had resolved.
     """
     states: set[str] = {"complete", "blocked", "abandoned"}
     transitions: dict[tuple[str, str], TransitionRule] = {}
@@ -1008,6 +1055,15 @@ def _build_state_machine(
             # Allow engines to transition to terminal states.
             transitions[(rj.queue_state, "complete")] = TransitionRule()
             transitions[(rj.queue_state, "abandoned")] = TransitionRule()
+            # ADR-045 — the engine dispatches from the monitor state into other
+            # steps of the SAME flow (e.g. pr_monitor → pr-fix / resolve_conflicts).
+            # Before extraction these were cross-flow edges stitched by the
+            # (now-removed) ``_register_cross_flow_edges``; inside pr-monitor they
+            # are intra-flow, so register (monitor.queue → step.queue) for every
+            # non-monitor step here. The engine gates which one actually fires.
+            for other in resolved:
+                if other.type != "monitor" and other.name != rj.name:
+                    transitions[(rj.queue_state, other.queue_state)] = TransitionRule()
             continue
 
         transitions[(rj.queue_state, rj.active_state)] = TransitionRule()
@@ -1022,23 +1078,19 @@ def _build_state_machine(
             transitions[(rj.success_state, next_rj.queue_state)] = TransitionRule()
 
     all_queue_states = {rj.name: rj.queue_state for rj in resolved}
-    # Intra-flow rule targets — same flow, ResolvedJob queue_state is
-    # canonical. Cross-flow targets (e.g. pr_fix's SKIPPED rule pointing at
-    # ``wait_for_pr_signal`` which only appears in main) are handled later
-    # in ``_register_cross_flow_edges`` because their correct queue_state
-    # depends on the target flow's binding order — a first-agent binding
-    # derives ``"backlog"``, while the same job elsewhere derives
-    # ``job.name``. ``_build_state_machine`` runs per-flow without
-    # visibility into other flows' bindings, so it cannot mirror that
-    # derivation correctly; the stitching pass has both flows resolved
-    # and uses each ResolvedJob's actual queue_state.
+    # In-flow rule targets — the target names a job in this flow, whose
+    # ResolvedJob queue_state is canonical. A target that resolves to no job
+    # here is stack-crossing (``call``/``terminate``/``complete``) or a terminal
+    # sink; it has no in-flow SM edge and is skipped (the drainer routes it
+    # directly, ADR-045). Unknown-target typos are caught earlier by
+    # ``_validate_rule_targets`` / ``validate_call_graph`` at build time.
     for rj in resolved:
         for rule in rj.rules:
             if rule.target in ("next", "blocked"):
                 continue
             target_queue = all_queue_states.get(rule.target)
             if target_queue is None:
-                continue  # cross-flow — stitched by _register_cross_flow_edges
+                continue  # stack-crossing / terminal sink — no in-flow SM edge
             transitions[(rj.active_state, target_queue)] = TransitionRule()
 
     for rj in resolved:
@@ -1116,6 +1168,19 @@ def check_conversational_rules(step: ResolvedJob, stdout: str) -> str | None:
 _TERMINAL_TARGETS: tuple[str, ...] = ("complete", "blocked", "needs_input")
 
 
+def _is_synthetic_sink(target: str) -> bool:
+    """A routing ``target`` that is not a step in this flow but must still be
+    drawn as a node so its edge isn't dangling (ADR-044 Phase 6 / ADR-045).
+
+    Three kinds: a terminal state (``_TERMINAL_TARGETS``); an ADR-045
+    ``call <workflow>[@<step>]`` edge (control leaves this flow for the callee —
+    ``build``/``fix``'s ``push_pr COMPLETED → call pr-monitor``); or ``terminate``
+    (a stack unwind). All render as ``type: "terminal"`` sinks in v1 — the viewer
+    call-edge treatment is deferred to ADR-045 Phase 4.
+    """
+    return target in _TERMINAL_TARGETS or target == TERMINATE_TARGET or is_call_target(target)
+
+
 def _outcome_from_pattern(pattern: str) -> str | None:
     """Reverse :func:`_agent_result_pattern` — the outcome word, or ``None``.
 
@@ -1171,7 +1236,7 @@ def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     node_ids: set[str] = set(order)
-    referenced_terminals: list[str] = []
+    referenced_sinks: list[str] = []
 
     def _resolve_target(target: str, idx: int) -> str:
         if target == "next":
@@ -1228,8 +1293,8 @@ def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
             )
             if rule.target == "next":
                 routes_next = True
-            if target in _TERMINAL_TARGETS and target not in node_ids:
-                referenced_terminals.append(target)
+            if target not in node_ids and _is_synthetic_sink(target):
+                referenced_sinks.append(target)
 
         # Implicit forward (success) edge: an unmatched marker falls through to
         # the next step at runtime. Draw it so the happy path is visible —
@@ -1247,11 +1312,12 @@ def _serialize_flow(process: Process, flow: FlowConfig) -> dict[str, Any]:
                 }
             )
 
-    # Materialize any referenced terminal sink as a node (dedup, stable order).
-    for terminal in dict.fromkeys(referenced_terminals):
+    # Materialize any referenced sink (terminal state, ``call <workflow>``, or
+    # ``terminate``) as a node (dedup, stable order) so no edge dangles.
+    for sink in dict.fromkeys(referenced_sinks):
         nodes.append(
             {
-                "id": terminal,
+                "id": sink,
                 "type": "terminal",
                 "prompt_name": None,
                 "agent": None,
@@ -1274,6 +1340,14 @@ def evaluate_output_rules(
     work_dir: Path,
 ) -> str | None:
     for rule in rules:
+        # ADR-045 — a ``routes: { terminate: <target> }`` catch compiles to an
+        # inert ``source="terminate"`` rule. It is consulted by the stack-unwind
+        # logic (``_unwind_terminate``), never matched against agent output — so
+        # skip it here (otherwise the ``else`` below would treat ``"terminate"``
+        # as a worktree-relative file path and a stray file named ``terminate``
+        # could spuriously fire the catch).
+        if rule.source == TERMINATE_TARGET:
+            continue
         if rule.source == "stdout":
             content = result.stdout or ""
         else:
@@ -1319,6 +1393,14 @@ def resolve_output_target(
         return "blocked"
     if target == "complete":
         return "complete"
+    # ADR-045 — call/return sinks. ``terminate`` resolves to the unwind sentinel;
+    # ``call <workflow>[@<step>]`` resolves to itself (the drainer / action-success
+    # path intercepts it, pushes a frame, and dispatches the callee). Neither maps
+    # to a state in the current flow's SM — they cross the stack, not an edge.
+    if target == TERMINATE_TARGET:
+        return TERMINATE_TARGET
+    if is_call_target(target):
+        return target
     for rj in flow.jobs:
         if rj.name == target:
             return rj.queue_state
@@ -1347,134 +1429,70 @@ def resolve_output_target(
 # ---------------------------------------------------------------------------
 
 
-def _register_cross_flow_edges(flows: dict[str, FlowConfig]) -> None:
-    """Stitch sub-flow entry/exit edges into each flow's state machine.
+def validate_call_graph(processes: dict[str, Process]) -> None:
+    """Validate every ``call <workflow>[@<step>]`` edge across the whole catalog.
 
-    The orchestrator references a single ``self.flow.state_machine`` for
-    every CAS check, but tasks routinely cross flow boundaries (e.g. the
-    pr_monitor engine dispatches from ``main``'s ``wait_for_pr_signal`` into
-    the ``pr_fix`` sub-flow, and pr-fix's SKIPPED rule routes back). Each
-    flow's per-flow SM only knows its own bindings, so without this pass:
+    Runs once the full catalog is loaded (a single ``build_process`` cannot see
+    its siblings), so it is the home for the cross-workflow checks ADR-045
+    requires:
 
-    * sub-flow entry (monitor_state, sub_first.queue_state) is missing →
-      ``_dispatch_step``'s pre-CAS transition check rejects the dispatch
-      and the task stalls at ``status=working`` until the next restart.
-    * sub-flow exit (sub_step.active_state, host_job.queue_state) is missing
-      → the drainer's post-rule CAS check rejects the routing (e.g.
-      pr-fix SKIPPED → wait_for_pr_signal, pr-fix COMPLETED → reviewing).
+    * an **unknown call target** — ``call <workflow>`` naming a workflow not in
+      the catalog — fails the build (never a task);
+    * an unknown ``@<step>`` re-entry point fails the build;
+    * a **call cycle** (A → B → A) fails the build, so the graph stays a DAG and
+      a call can never diverge into an unbounded loop.
 
-    The fix is to mutate the underlying ``StateMachine`` after construction:
-    register the missing edges and add any newly-referenced states. This is
-    safe because ``StateMachine`` exposes both ``states`` and ``transitions``
-    as live (uncopied) mutable references via its public properties — no
-    immutable invariants beyond the construction-time validation, which we
-    satisfy by adding every referenced state.
+    This replaces the removed ``_register_cross_flow_edges`` — cross-workflow
+    calls are their own top-level edges now, not sub-flow plumbing stitched into
+    a shared state machine.
     """
-    if len(flows) < 2:
-        return  # No cross-flow boundaries to stitch.
 
-    for flow_name, flow in flows.items():
-        sm_states = flow.state_machine.states
-        sm_trans = flow.state_machine.transitions
-
-        # (a) Sub-flow entry: every monitor in this flow can dispatch into
-        # any other flow's first step. Register (monitor_state, first.queue)
-        # in BOTH this flow's SM (the source of the dispatch CAS) AND the
-        # destination sub-flow's SM. The second registration is required
-        # because ``_dispatch_pr_fix_locked`` sets ``current_flow=sub_flow``
-        # in metadata BEFORE calling ``_dispatch_step``; the latter then
-        # resolves ``active_flow`` via ``_resolve_flow(item)`` and validates
-        # the pre-CAS transition against the sub-flow's SM, not the host
-        # flow's. Without the edge registered there, the guard rejects the
-        # dispatch silently and the task stalls at status=working until the
-        # next server restart flips it to blocked.
-        monitors = [rj for rj in flow.jobs if rj.type == "monitor"]
-        for other_name, other in flows.items():
-            if other_name == flow_name or not other.bindings:
-                continue
-            # Register entry edges for ALL sub-flow bindings, not only bindings[0].
-            # Phase 2 (ADR-015) dispatches resolve_conflicts (bindings[1]) from
-            # the monitor state when a merge conflict is detected — without
-            # registering its entry edge here, _dispatch_step's pre-CAS guard
-            # rejects the (wait_for_pr_signal, resolving_conflicts) transition
-            # and the task stalls at status=working.
-            for binding in other.bindings:
-                bound_job = next((rj for rj in other.jobs if rj.name == binding.name), None)
-                if bound_job is None:
-                    continue
-                sm_states.add(bound_job.queue_state)
-                sm_states.add(bound_job.active_state)
-                for m in monitors:
-                    sm_trans[(m.queue_state, bound_job.queue_state)] = TransitionRule()
-                    # Mirror into the sub-flow's SM (see docstring above).
-                    other.state_machine.states.add(m.queue_state)
-                    other.state_machine.transitions[(m.queue_state, bound_job.queue_state)] = TransitionRule()
-
-        # (b) Sub-flow exit: any other flow's job whose rule targets a job
-        # in THIS flow needs (other.active_state, this.queue_state) registered
-        # in THIS flow's SM so the drainer's main-flow CAS can land it.
-        # Also mirror the same edge into the SOURCE (other) flow's SM —
-        # ``_build_state_machine`` skips cross-flow rule targets entirely
-        # because their correct queue_state depends on the target flow's
-        # binding order (first-agent → ``"backlog"``, otherwise
-        # ``job.name``), which is not visible in the per-flow build. The
-        # source flow's SM still needs the edge so the drainer's pre-CAS
-        # transition check against the source's ``state_machine`` can
-        # land the routing decision.
-        my_names = {rj.name: rj for rj in flow.jobs}
-        for other_name, other in flows.items():
-            if other_name == flow_name:
-                continue
-            for rj in other.jobs:
+    def _calls(process: Process) -> list[tuple[str, str | None]]:
+        out: list[tuple[str, str | None]] = []
+        for flow in process.flows.values():
+            for rj in flow.jobs:
                 for rule in rj.rules:
-                    if rule.target in ("next", "blocked", "complete", "abandoned"):
-                        continue
-                    target = my_names.get(rule.target)
-                    if target is None:
-                        continue
-                    sm_states.add(rj.active_state)
-                    sm_states.add(target.queue_state)
-                    sm_trans[(rj.active_state, target.queue_state)] = TransitionRule()
-                    # The other-flow step may also need to terminate at
-                    # blocked from this flow's perspective (pr-fix FAILED → blocked).
-                    sm_trans[(rj.active_state, "blocked")] = TransitionRule()
-                    # And needs the self-loop for retry on its own active state.
-                    sm_trans[(rj.active_state, rj.active_state)] = TransitionRule()
-                    # Mirror into the source flow's SM so the drainer's
-                    # pre-CAS check against ``other.state_machine`` (when
-                    # the task is resolved to the source flow) also sees
-                    # the edge.
-                    other.state_machine.states.add(target.queue_state)
-                    other.state_machine.transitions[(rj.active_state, target.queue_state)] = TransitionRule()
+                    if is_call_target(rule.target):
+                        out.append(parse_call_target(rule.target))
+        return out
 
-    # (c) Sub-flow terminal exit: a sub-flow's last binding naturally resolves
-    # to success_state="complete" via _resolve_jobs, but operationally the
-    # sub-flow's terminal step should return to the host flow's monitor (the
-    # one that dispatched it) — not mark the task complete. Register
-    # ``(last_binding.active_state, host_monitor.queue_state)`` in the
-    # sub-flow's SM so the drainer / action-step pre-CAS check sees a valid
-    # transition. ``_execute_action_step`` overrides ``success_state`` to
-    # the host monitor's queue_state when running in a sub-flow with a
-    # terminal "complete", matching this edge.
-    #
-    # Today there is exactly one host flow (``main``) and at most one host
-    # monitor, so the host lookup is unambiguous. A future multi-host
-    # topology (e.g. two distinct monitors that both dispatch into the same
-    # sub-flow, or sub-flows hosted by another sub-flow) would need to
-    # record the dispatching monitor at sub-flow entry so this resolver
-    # could pick the correct return target. No bundled process needs it.
-    main_flow = flows.get("main") or next(iter(flows.values()))
-    host_monitor = next((rj for rj in main_flow.jobs if rj.type == "monitor"), None)
-    if host_monitor is not None:
-        for flow in flows.values():
-            if flow is main_flow or not flow.bindings:
-                continue
-            last_binding = flow.bindings[-1]
-            last_job = next((rj for rj in flow.jobs if rj.name == last_binding.name), None)
-            if last_job is None:
-                continue
-            flow.state_machine.states.add(host_monitor.queue_state)
-            flow.state_machine.transitions[(last_job.active_state, host_monitor.queue_state)] = TransitionRule()
+    # Edge validation — target workflow (and any @step) must exist.
+    edges: dict[str, set[str]] = {}
+    for name, process in processes.items():
+        targets: set[str] = set()
+        for target_wf, target_step in _calls(process):
+            if target_wf not in processes:
+                raise ValueError(
+                    f"Workflow {name!r} calls unknown workflow {target_wf!r} (known workflows: {sorted(processes)})."
+                )
+            if target_step is not None:
+                callee = processes[target_wf]
+                callee_main = callee.flows.get("main") or next(iter(callee.flows.values()))
+                if not any(rj.name == target_step for rj in callee_main.jobs):
+                    raise ValueError(
+                        f"Workflow {name!r} calls {target_wf!r}@{target_step!r} but "
+                        f"{target_wf!r} has no step named {target_step!r}."
+                    )
+            targets.add(target_wf)
+        edges[name] = targets
+
+    # Cycle detection over the call graph (DFS with a recursion stack).
+    WHITE, GREY, BLACK = 0, 1, 2
+    colour = {name: WHITE for name in edges}
+
+    def _visit(node: str, path: list[str]) -> None:
+        colour[node] = GREY
+        for nxt in sorted(edges.get(node, ())):
+            if colour.get(nxt) == GREY:
+                cycle = " → ".join([*path, node, nxt])
+                raise ValueError(f"Workflow call cycle detected: {cycle}.")
+            if colour.get(nxt, BLACK) == WHITE:
+                _visit(nxt, [*path, node])
+        colour[node] = BLACK
+
+    for name in edges:
+        if colour[name] == WHITE:
+            _visit(name, [])
 
 
 def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBinding]]) -> None:
@@ -1507,11 +1525,17 @@ def _validate_rule_targets(jobs: list[Job], flow_bindings: dict[str, list[FlowBi
     the bundled ``chat`` process's ``COMPLETED → handoff`` edge is the canonical
     user.
     """
-    sentinels = {"next", "blocked", "complete", "abandoned", "needs_input", "handoff"}
+    sentinels = {"next", "blocked", "complete", "abandoned", "needs_input", "handoff", TERMINATE_TARGET}
     job_names = {j.name for j in jobs}
 
     def _check(target: str, where: str) -> None:
         if target in sentinels or target in job_names:
+            return
+        # ADR-045 — a ``call <workflow>[@<step>]`` target is deliberately a
+        # cross-workflow reference. Its existence (and any ``@step``) is checked
+        # once the whole catalog is loaded by ``validate_call_graph`` (a single
+        # process cannot see its siblings here), so accept the syntax now.
+        if is_call_target(target):
             return
         raise ValueError(
             f"{where} has an output rule whose target {target!r} "
@@ -1815,13 +1839,10 @@ def build_process(
             gate_states=gate_states,
         )
 
-    # Register cross-flow edges so the orchestrator can CAS through sub-flow
-    # boundaries while still using a single ``self.flow.state_machine``
-    # (the main flow's SM). Without this, the orchestrator's ``_dispatch_step``
-    # and drainer reject every (monitor_state → sub_flow_first.queue) and
-    # (sub_flow_step.active → host_flow.queue) transition because each flow's
-    # SM only knows its own bindings.
-    _register_cross_flow_edges(flows)
+    # ADR-045 — no cross-flow edge stitching. Workflow calls are their own
+    # top-level edges (``call <workflow>``), validated once the whole catalog is
+    # loaded by ``validate_call_graph``; monitor→step dispatch edges are now
+    # intra-flow (registered in ``_build_state_machine``).
 
     # Validate ``tool:`` / ``engine:`` job references against the registry.
     # Callers (``OrchestratorService.start()``, custom CLI entry points)
@@ -1833,12 +1854,9 @@ def build_process(
     _validate_registry_references(jobs)
 
     # ADR-021 R6 — reject output-rule targets that don't resolve to a job in
-    # THIS process (cross-process dispatch is unsupported). Runs after
-    # ``_register_cross_flow_edges`` (which only ever stitches edges between
-    # flows of THIS process, using ``my_names``/sibling-flow job names — it
-    # never reaches across processes) so within-process sub-flow targets are
-    # already accounted for and only genuine cross-process / typo'd targets
-    # trip the validator.
+    # THIS process, EXCEPT the ADR-045 ``call <workflow>`` cross-workflow edge
+    # (whose target is validated across the whole catalog by
+    # ``validate_call_graph`` once every process is loaded).
     _validate_rule_targets(jobs, flow_bindings)
 
     # Validate ``posthooks:`` references (per-job and per-binding) against the

@@ -144,22 +144,24 @@ def test_build_verify_routes_on_generic_pass_fail():
     assert _has_edge(verify.rules, "FAILED", "code")
 
 
-def test_build_pr_fix_routes_the_full_outcome_set():
+def test_pr_monitor_pr_fix_routes_the_full_outcome_set():
+    # ADR-045 — pr-fix lives in the standalone ``pr-monitor`` workflow now; its
+    # routing is declared at the job level (the flow lists it as a bare step).
     from lotsa.flows import build_process
 
-    pr_fix_flow = build_process("build").flows["pr_fix"]
-    rules = pr_fix_flow.binding_for("pr-fix").rules
+    main = build_process("pr-monitor").flows["main"]
+    rules = next(j for j in main.jobs if j.name == "pr-fix").rules
     assert _has_edge(rules, "COMPLETED", "review")
     assert _has_edge(rules, "SKIPPED", "wait_for_pr_signal")
     assert _has_edge(rules, "FAILED", "blocked")
     assert _has_edge(rules, "INPUT", "needs_input")
 
 
-def test_build_resolve_conflicts_completed_routes_to_pr_fix():
+def test_pr_monitor_resolve_conflicts_completed_routes_to_pr_fix():
     from lotsa.flows import build_process
 
-    pr_fix_flow = build_process("build").flows["pr_fix"]
-    rules = pr_fix_flow.binding_for("resolve_conflicts").rules
+    main = build_process("pr-monitor").flows["main"]
+    rules = next(j for j in main.jobs if j.name == "resolve_conflicts").rules
     assert _has_edge(rules, "COMPLETED", "pr-fix")
 
 
