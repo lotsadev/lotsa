@@ -30,6 +30,37 @@ export function ChatInput({ data }: ChatInputProps) {
   const { task } = data
   const availableOverrides = data.available_overrides ?? []
 
+  // ADR-045 Phase 2 — a chat hand-off is now a *gated call* that PUSHES
+  // build/fix onto a persisting ``chat`` frame (not a re-root, unlike an
+  // ADR-027 promotion). Two consequences the input panel must reflect:
+  //
+  //   * ``flow_name`` (the ROOT process) stays ``chat`` even while a pushed
+  //     build/fix runs underneath, so "am I at the chat REPL?" is the ACTIVE
+  //     call-stack frame, not ``flow_name``. Chat-only affordances (Hand off,
+  //     keep-talking) key off the active frame so they never leak onto a
+  //     running callee — a re-root there would orphan the pushed build.
+  //   * ``awaiting_operator`` is overloaded across three shapes:
+  //       - chat hand-off GATE (active frame chat, not terminated): nothing is
+  //         committed yet — accept a call (Hand off), decline by continuing the
+  //         conversation (send_message re-enters the REPL), or abandon;
+  //       - chat return-path park (active frame chat, ``execute_terminated``):
+  //         the callee's PR merged/closed and unwound back here — may talk (Q&A)
+  //         but may NOT launch a new call, so Hand off is suppressed;
+  //       - ADR-043 post-build escape hatch (any non-chat frame): work is
+  //         committed on the branch, Mark complete closes it. Unchanged.
+  const meta = task.metadata as Record<string, unknown> | undefined
+  const callStack = (meta?.call_stack as Array<{ workflow?: string }> | undefined) ?? []
+  const activeWorkflow =
+    callStack.length > 0 ? callStack[callStack.length - 1]?.workflow : task.flow_name
+  const atChatFrame = (activeWorkflow ?? task.flow_name) === 'chat'
+  const executeTerminated = Boolean(meta?.execute_terminated)
+  // The chat frame is parked awaiting the operator — talkable in BOTH shapes
+  // (send_message re-enters the REPL from ``awaiting_operator``): the gate and
+  // the return-path park. ``atChatGate`` narrows to the shape that can still
+  // launch a call (Hand off), i.e. not yet ``execute_terminated``.
+  const chatOperatorPark = atChatFrame && task.status === 'awaiting_operator'
+  const atChatGate = chatOperatorPark && !executeTerminated
+
   // Upload any pending attachments to this task before the message dispatches,
   // so the next step materializes them. Throws (aborting the send) if an upload
   // fails, surfacing the error inline rather than sending a message that
@@ -67,16 +98,18 @@ export function ChatInput({ data }: ChatInputProps) {
     return uploaded
   }
 
-  // ADR-043 — the Hand off button is the one-way Think→Execute gesture, so it
-  // only shows while the task is still in the chat (Think) process. Once a task
-  // is handed off to build/fix the button disappears: we don't surface
-  // build↔fix re-routing from the UI (the backend still permits it). We also
-  // require a non-terminal task, mirroring promote_task's server-side guard,
-  // which rejects terminal tasks on BOTH columns (status in
-  // complete/abandoned/archived OR state in complete/abandoned) since "terminal"
-  // is observable on either depending on the path that finalized the task.
+  // ADR-043 — the Hand off button is the Think→Execute gesture. It shows only
+  // while the ACTIVE call-stack frame is chat (ADR-045 Phase 2: ``flow_name``
+  // stays ``chat`` while a pushed build/fix runs underneath, so gating on the
+  // root name would keep showing Hand off during that run — clicking it would
+  // re-root and orphan the pushed build). It is also suppressed once the chat
+  // frame's Execute work has terminated (``execute_terminated`` — may talk, may
+  // not call again). We require a non-terminal task, mirroring the server-side
+  // guard (rejects terminal on BOTH status in complete/abandoned/archived OR
+  // state in complete/abandoned, since "terminal" is observable on either).
   const canPromote =
-    task.flow_name === 'chat' &&
+    atChatFrame &&
+    !executeTerminated &&
     !['complete', 'abandoned', 'archived'].includes(task.status) &&
     !['complete', 'abandoned'].includes(task.state)
 
@@ -208,6 +241,14 @@ export function ChatInput({ data }: ChatInputProps) {
         // revision feedback (a bare Retry re-runs without the input).
         sendMutation.mutate()
         break
+      case 'awaiting_operator':
+        // ADR-045 Phase 2 — a message at a chat operator park re-enters the chat
+        // REPL (send_message now accepts ``awaiting_operator``): declining the
+        // hand-off gate, or a Q&A follow-up after the callee terminated back
+        // here. Only reachable when the textarea is enabled (``chatOperatorPark``);
+        // a non-chat post-build park keeps it disabled so this never fires there.
+        if (chatOperatorPark) sendMutation.mutate()
+        break
       // working/complete/abandoned: submit disabled.
     }
   }
@@ -259,11 +300,16 @@ export function ChatInput({ data }: ChatInputProps) {
       task.status === 'waiting_for_pr' ||
       task.status === 'needs_input' ||
       task.status === 'blocked' ||
+      // ADR-045 Phase 2 — a chat operator park (gate or return-path) is a live
+      // REPL: Send routes to send_message (submitForStatus's awaiting_operator
+      // case). A non-chat post-build park is NOT a text-input state and stays
+      // excluded here (matching the disabled textarea below).
+      chatOperatorPark ||
       isRebasing
     )
 
-  // Metadata helper for waiting_for_pr status row.
-  const meta = task.metadata as Record<string, unknown> | undefined
+  // Metadata helpers for the waiting_for_pr status row (``meta`` is defined
+  // above alongside the ADR-045 chat-frame flags).
   const prNumber = meta?.pr_number as number | string | undefined
   const prUrl = meta?.pr_url as string | undefined
   const prDecision = meta?.pr_review_decision as string | undefined
@@ -342,13 +388,33 @@ export function ChatInput({ data }: ChatInputProps) {
         </div>
       )}
 
-      {task.status === 'awaiting_operator' && (
-        <div className="mb-2 text-xs text-muted-foreground">
-          Awaiting you — the work is committed on{' '}
-          <span className="font-mono">lotsa/{task.id}</span>. Review it and click{' '}
-          <strong>Mark complete</strong> to close the task (the GitHub-less escape hatch).
-        </div>
-      )}
+      {task.status === 'awaiting_operator' &&
+        (atChatGate ? (
+          // ADR-045 Phase 2 — the chat hand-off gate. NOTHING is committed yet
+          // (chat never writes code); the operator accepts a call, declines by
+          // continuing the conversation, or abandons.
+          <div className="mb-2 text-xs text-muted-foreground">
+            Ready to hand off — click <strong>Hand off</strong> to choose{' '}
+            <strong>Build it</strong> or <strong>Quick fix</strong> (this chat stays
+            underneath and control returns here when the PR merges or closes), or
+            keep chatting to refine the plan first.
+          </div>
+        ) : executeTerminated ? (
+          // ADR-045 Phase 2 — the callee's PR merged/closed and unwound back into
+          // this live chat frame. May talk (Q&A) but may not launch a new call.
+          <div className="mb-2 text-xs text-muted-foreground">
+            The Execute work has shipped (PR merged or closed) and control is back
+            here. Ask a follow-up, or click <strong>Mark complete</strong> to close
+            the task.
+          </div>
+        ) : (
+          // ADR-043 post-build escape hatch (a non-chat Execute task).
+          <div className="mb-2 text-xs text-muted-foreground">
+            Awaiting you — the work is committed on{' '}
+            <span className="font-mono">lotsa/{task.id}</span>. Review it and click{' '}
+            <strong>Mark complete</strong> to close the task (the GitHub-less escape hatch).
+          </div>
+        ))}
 
       {/* ``flex-wrap`` lets the action button group drop below the textarea on
           narrow screens instead of overflowing a single line; ``min-w-0`` on
@@ -374,18 +440,24 @@ export function ChatInput({ data }: ChatInputProps) {
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onSubmit={submitForStatus}
-          placeholder={placeholders[task.status] ?? ''}
+          placeholder={
+            chatOperatorPark
+              ? atChatGate
+                ? 'Reply to refine, or Hand off to Execute…'
+                : 'Ask a follow-up, or Mark complete to close…'
+              : (placeholders[task.status] ?? '')
+          }
           disabled={
             isPending ||
             task.status === 'complete' ||
             task.status === 'abandoned' ||
-            // ``awaiting_operator`` is not a text-input state — the operator's
-            // action is the "Mark complete" button, not a typed message. The
-            // textarea stays disabled (matching ``complete``/``abandoned``) so
-            // typing + Enter/Send can't silently no-op (submitForStatus/
-            // submitDisabled have no ``awaiting_operator`` case). The static
-            // placeholder is a hint on the disabled field, like the terminal ones.
-            task.status === 'awaiting_operator'
+            // ADR-045 Phase 2 — a chat operator park (``chatOperatorPark``: the
+            // hand-off gate or the return-path Q&A park) IS a live REPL, so it
+            // stays enabled (Send → send_message). Any OTHER ``awaiting_operator``
+            // (the ADR-043 post-build escape hatch) is not a text-input state —
+            // its action is "Mark complete" — so it stays disabled like the
+            // terminal statuses.
+            (task.status === 'awaiting_operator' && !chatOperatorPark)
           }
           className="min-w-0 flex-1"
         />
