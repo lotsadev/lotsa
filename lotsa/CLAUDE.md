@@ -1061,3 +1061,35 @@ rules.
   `elementsSelectable` off + hidden handles = the editor seam). The **editor**
   (write affordances, DB-backed workflow storage, agent authoring surface) stays
   deferred. Amends ADR-043/039/014/027.
+- ADR-046 — Standing monitors & the heartbeat protocol (**Implemented** —
+  `lotsa doctor`/dashboard-strip deferred). Extracts the latent monitor
+  framework into a first-class `Monitor` base + `MonitorHeartbeat`/
+  `MonitorRegistry` (`lotsa/monitors/`): an interval loop, exception isolation,
+  an `aclose()` teardown hook, and a per-tick heartbeat, with two named
+  lifetimes (`kind` = `standing` — always-on, project-scoped, gates nothing;
+  `step_scoped` — bound to a `queue_state`, gates a flow edge). `pr_monitor` is
+  migrated onto the base **behaviour-preservingly** (loop → base; it supplies
+  `tick()`/`interval_seconds`/`aclose()`; gated by its existing suites — it's on
+  the critical PR-fix path). The first standing consumer is the branch-freshness
+  monitor (`lotsa/branch_monitor.py`): one `git fetch origin/<default>` per
+  project per interval (worktrees share the object store, so a project-root
+  fetch updates every worktree's remote-tracking ref), then a **non-mutating**
+  probe per non-terminal worktree-bearing task — `git rev-list --count` for
+  behind-count + `git merge-tree --write-tree` (Git ≥2.38; `branch_mergeable=null`
+  fallback) for mergeability — persisting `branch_behind`/`branch_mergeable`/
+  `branch_conflicts`/`branch_checked_at`/`branch_checked_against_sha` to task
+  metadata. Git logic lives on the orchestrator (ADR-013): `fetch_project_default`,
+  `list_branch_watch_tasks`, `refresh_branch_status`, `_probe_mergeability`,
+  reached via the typed `BranchMonitorOrchestrator` Protocol. The dashboard reads
+  the pre-computed metadata (no per-open fetch) for a sidebar "↓N behind" badge +
+  a Changes-tab strip, and offers a **Sync with default** button
+  (`POST /api/tasks/{id}/sync-branch` → `sync_branch`) only when a task is
+  behind, mergeable, and idle (never `working`). `sync_branch` reuses
+  `_sync_branch_to_main(push=…)` — push when a PR exists, **local merge, no push**
+  pre-PR — and a raced conflict re-anchors into the pr_fix sub-flow and routes
+  through `_handle_conflict_dispatch` → `resolve_conflicts` (or blocks), exactly
+  like `retry()`. `GET /api/monitors` serves the heartbeat registry (derived
+  `healthy`/`stale`); `branch_monitor_interval_seconds` (default 300, rejected if
+  non-positive) + `branch_monitor_enabled` are the knobs. The registry is an
+  ADR-040 rebuildable cache (rebuilt each `start()`, never persisted); this is the
+  **polling** cousin of ADR-044's **event** pre/posthooks.

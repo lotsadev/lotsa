@@ -21,6 +21,7 @@ import {
   SidebarMenuSkeleton,
 } from '@/components/ui/sidebar'
 import { cn } from '@/lib/utils'
+import { readBranchStatus } from '@/api/types'
 import type { TaskSummary } from '@/api/types'
 
 interface SidebarProps {
@@ -122,8 +123,35 @@ function TaskItem({
           />
         )}
         {!task.current_step && <span className="capitalize">{task.state.replace(/_/g, ' ')}</span>}
+        <BranchFreshnessBadge task={task} />
       </span>
     </button>
+  )
+}
+
+// ADR-046 — "↓N behind" + a conflict dot, driven by the branch monitor's
+// pre-computed task-metadata fields (no per-row fetch). Hidden when a task is
+// level with the default branch or has no freshness data yet.
+function BranchFreshnessBadge({ task }: { task: TaskSummary }) {
+  const branch = readBranchStatus(task.metadata)
+  if (!branch || branch.behind <= 0) return null
+  const conflicting = branch.mergeable === false
+  return (
+    <>
+      <Badge
+        variant="outline"
+        className="ml-1.5 h-5 border-amber-500/40 text-[10px] text-amber-500 align-middle"
+        title={`${branch.behind} commit${branch.behind === 1 ? '' : 's'} behind the default branch`}
+      >
+        ↓{branch.behind} behind
+      </Badge>
+      {conflicting && (
+        <span
+          className="ml-1 inline-block size-1.5 rounded-full bg-destructive align-middle"
+          title={`Conflicts with the default branch: ${branch.conflicts.join(', ') || 'unknown files'}`}
+        />
+      )}
+    </>
   )
 }
 

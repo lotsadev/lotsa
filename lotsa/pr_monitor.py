@@ -19,10 +19,12 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 
 from lotsa.github_client import CheckStatus, GitHubClient, PrInfo, ReviewComment, compute_review_decision
+from lotsa.monitors.base import Monitor
 
 if TYPE_CHECKING:
     from lotsa.db import TaskDB
     from lotsa.engines.pr_monitor import PrMonitorConfig as PrConfig
+    from lotsa.monitors.registry import MonitorRegistry
 else:
     # Structural type for runtime — PrMonitor only reads attributes
     # (triggers, poll_interval_seconds, debounce_seconds, max_*).
@@ -422,8 +424,14 @@ async def _record_pr_feedback(
 # ---------------------------------------------------------------------------
 
 
-class PrMonitor:
+class PrMonitor(Monitor):
     """Background service that polls GitHub for PR signal changes.
+
+    A ``step_scoped`` :class:`~lotsa.monitors.base.Monitor` (ADR-046): the
+    interval loop, exception isolation, heartbeat recording, and ``aclose()``
+    teardown come from the base; this class supplies ``tick()`` (one poll of
+    every watched PR) + the ``interval_seconds`` property. Behaviour is
+    unchanged from the pre-ADR-046 bespoke loop.
 
     Lifecycle::
 
@@ -450,7 +458,9 @@ class PrMonitor:
         orchestrator: PrMonitorOrchestrator,
         config: PrConfig,
         monitor_state: str | None = None,
+        registry: MonitorRegistry | None = None,
     ) -> None:
+        super().__init__(name=f"pr_monitor:{monitor_state or 'default'}", kind="step_scoped", registry=registry)
         self._orchestrator = orchestrator
         self._config = config
         # ADR-014 Layer A: the monitor-job state this poller owns (e.g.
@@ -511,33 +521,33 @@ class PrMonitor:
             return []
         return list(tracked.last_updated_at_by_comment_id.keys())
 
-    async def run(self) -> None:
-        """Async polling loop.  Runs until cancelled."""
-        try:
-            while True:
-                # Guard the body so a raise from _poll_all degrades to a logged,
-                # skipped cycle instead of permanently killing PR monitoring. The
-                # inner calls self-isolate today, but that is incidental, not
-                # structural (finding #8). CancelledError must still propagate.
-                try:
-                    await self._poll_all()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("PrMonitor: poll cycle failed; continuing")
-                await asyncio.sleep(self._config.poll_interval_seconds)
-        except asyncio.CancelledError:
-            logger.debug("PrMonitor cancelled")
-            raise
-        finally:
-            # Close any cached clients on shutdown.  Cancellation propagates
-            # after this; we still want pooled connections released.
-            for client, _token in self._clients.values():
-                try:
-                    await client.close()
-                except Exception:
-                    logger.exception("PrMonitor: error closing cached GitHub client")
-            self._clients.clear()
+    @property
+    def interval_seconds(self) -> float:
+        """Seconds between polls (ADR-046 ``Monitor`` contract)."""
+        return self._config.poll_interval_seconds
+
+    async def tick(self) -> None:
+        """One poll cycle over every watched PR.
+
+        The base ``run()`` loop wraps this in the interval sleep + exception
+        isolation that the bespoke ``run()`` used to hold inline (finding #8):
+        a raise here degrades to a logged, skipped cycle, never killing PR
+        monitoring, and ``CancelledError`` still propagates.
+        """
+        await self._poll_all()
+
+    async def aclose(self) -> None:
+        """Close any cached GitHub clients on shutdown (ADR-046 teardown hook).
+
+        Cancellation propagates after this; we still want pooled connections
+        released. Run in the base ``run()`` loop's ``finally``.
+        """
+        for client, _token in self._clients.values():
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("PrMonitor: error closing cached GitHub client")
+        self._clients.clear()
 
     async def _get_client(self, owner: str, repo: str, token: str) -> GitHubClient:
         """Return a cached GitHubClient, creating one on first use.

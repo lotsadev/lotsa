@@ -1351,3 +1351,54 @@ class TestAttachmentVisibility:
                 assert names == ["mockup.png"]
 
         run(_test())
+
+
+class TestBranchFreshnessApi:
+    """ADR-046 — the monitor-liveness read + the sync-branch action endpoint.
+
+    Pre-fix red shape: both routes are unregistered, so ``GET /api/monitors``
+    and ``POST /api/tasks/{id}/sync-branch`` return 404 — the assertions on
+    200 / 400 fail.
+    """
+
+    def test_monitors_endpoint_lists_heartbeats(self, app_with_service, run):
+        app, _ = app_with_service
+
+        async def _test():
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/api/monitors")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert isinstance(data, list)
+                # The standing branch monitor is on by default, so at least one
+                # heartbeat is reported, carrying an identity + kind.
+                assert len(data) >= 1
+                for hb in data:
+                    assert "name" in hb
+                    assert "kind" in hb
+                    assert "healthy" in hb
+
+        run(_test())
+
+    def test_sync_branch_endpoint_rejects_working_task(self, app_with_service, run):
+        app, service = app_with_service
+
+        async def _test():
+            task = await service.db.create_task("busy", state="coding")
+            await service.db.claim_task_transition(
+                task.id,
+                from_status=task.status,
+                from_state=task.state,
+                to_state="coding",
+                to_status="working",
+                to_current_step="coding",
+            )
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(f"/api/tasks/{task.id}/sync-branch")
+                assert resp.status_code == 400
+                assert resp.json()["detail"]["code"] == "SYNC_NOT_ALLOWED"
+
+        run(_test())

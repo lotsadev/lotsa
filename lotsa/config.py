@@ -75,6 +75,15 @@ class LotsaConfig:
     # ``timeout_kill_seconds:`` in process.yaml; the idle window is global.
     agent_timeout_seconds: int = 5400
     agent_idle_timeout_seconds: int = 900
+    # ADR-046 — the standing branch-freshness monitor. It fetches
+    # ``origin/<default>`` once per project per interval and probes how far each
+    # non-terminal worktree-bearing task is behind (and whether it still merges
+    # cleanly), so the dashboard can surface freshness + offer one-click sync.
+    # ``branch_monitor_interval_seconds`` feeds ``asyncio.sleep()`` in the poll
+    # loop, so a non-positive value is a busy-wait against git — rejected at
+    # load. Set ``branch_monitor_enabled: false`` to turn the poller off.
+    branch_monitor_interval_seconds: int = 300
+    branch_monitor_enabled: bool = True
     # Cap on tokens Claude Code may emit in a single response. ``None`` means
     # "don't set it — let Claude Code use its built-in default (32000 as of
     # mid-2026) or any value the operator has exported via the
@@ -182,6 +191,15 @@ class LotsaConfig:
                 if fld and fld.type in ("Path", "Path | None") and isinstance(value, str):
                     value = Path(value)
                 setattr(config, key, value)
+
+        # ADR-046 — ``branch_monitor_interval_seconds`` feeds ``asyncio.sleep()``
+        # directly in the poll loop, so 0/negative is a tight busy-wait that
+        # hammers ``git fetch``. Reject it at load (matching the pr_monitor's
+        # ``poll_interval_seconds`` validation) rather than letting a bad scalar
+        # reach the running monitor.
+        interval = config.branch_monitor_interval_seconds
+        if not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0:
+            raise ValueError(f"branch_monitor_interval_seconds must be a positive int (got {interval!r})")
 
         return config
 

@@ -1,10 +1,12 @@
 import { useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { PatchDiff } from '@pierre/diffs/react'
-import { GitPullRequest } from 'lucide-react'
-import { fetchDiff } from '@/api/tasks'
+import { GitPullRequest, GitMerge, Loader2 } from 'lucide-react'
+import { fetchDiff, syncBranch } from '@/api/tasks'
+import { readBranchStatus } from '@/api/types'
 import type { TaskStatus } from '@/api/types'
 import { useTheme } from '@/hooks/use-theme'
+import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 
@@ -14,6 +16,98 @@ interface ChangesTabProps {
   status: TaskStatus
   prNumber?: number | string
   prUrl?: string
+  metadata?: Record<string, unknown>
+}
+
+// ADR-046 — the sync button is offered only when a task is parked (not
+// `working`, an agent is live in its worktree) and not terminal.
+const SYNC_IDLE_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  'waiting',
+  'waiting_for_pr',
+  'awaiting_operator',
+  'needs_input',
+  'blocked',
+])
+
+// ADR-046 — branch-freshness strip + one-click "Sync with default". Data is
+// pre-computed by the standing branch monitor and rides on task metadata, so
+// this adds no per-open network cost. The button appears only when the task is
+// behind, cleanly mergeable, and idle; the server re-validates all three.
+function BranchFreshness({
+  taskId,
+  status,
+  metadata,
+}: {
+  taskId: string
+  status: TaskStatus
+  metadata?: Record<string, unknown>
+}) {
+  const queryClient = useQueryClient()
+  const mutation = useMutation({
+    mutationFn: () => syncBranch(taskId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['task', taskId] })
+      queryClient.invalidateQueries({ queryKey: ['diff', taskId] })
+    },
+  })
+
+  const branch = metadata ? readBranchStatus(metadata) : null
+  if (!branch || branch.behind <= 0) return null
+
+  const conflicting = branch.mergeable === false
+  const canSync =
+    branch.mergeable === true && SYNC_IDLE_STATUSES.has(status)
+  const checkedAt = branch.checkedAt ? new Date(branch.checkedAt) : null
+
+  return (
+    <div className="flex shrink-0 flex-col gap-1.5 border-b border-border px-3 py-2 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-muted-foreground">
+          <span className="text-amber-500">
+            ↓{branch.behind} behind default
+          </span>
+          {conflicting ? (
+            <span className="text-destructive">conflicts</span>
+          ) : (
+            branch.mergeable === true && (
+              <span className="text-green-600 dark:text-green-500">mergeable</span>
+            )
+          )}
+        </div>
+        {canSync && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 text-xs"
+            disabled={mutation.isPending}
+            onClick={() => mutation.mutate()}
+          >
+            {mutation.isPending ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <GitMerge className="size-3" />
+            )}
+            Sync with default
+          </Button>
+        )}
+      </div>
+      {conflicting && branch.conflicts.length > 0 && (
+        <div className="text-destructive">
+          Conflicts in: <span className="font-mono">{branch.conflicts.join(', ')}</span>
+        </div>
+      )}
+      {mutation.isError && (
+        <div className="text-destructive">
+          {mutation.error instanceof Error ? mutation.error.message : 'Sync failed'}
+        </div>
+      )}
+      {checkedAt && (
+        <div className="text-muted-foreground">
+          Checked {checkedAt.toLocaleTimeString()}
+        </div>
+      )}
+    </div>
+  )
 }
 
 // Statuses under which the orchestrator deletes the worktree, so the diff
@@ -44,7 +138,7 @@ function chunkKey(chunk: string, index: number): string {
   return firstLine || `file-${index}`
 }
 
-export function ChangesTab({ taskId, active, status, prNumber, prUrl }: ChangesTabProps) {
+export function ChangesTab({ taskId, active, status, prNumber, prUrl, metadata }: ChangesTabProps) {
   const { theme } = useTheme()
   const [layout, setLayout] = useState<Layout>('unified')
 
@@ -99,14 +193,18 @@ export function ChangesTab({ taskId, active, status, prNumber, prUrl }: ChangesT
       )
     }
     return (
-      <div className="flex h-full items-center justify-center p-4 text-sm text-muted-foreground">
-        No changes yet
+      <div className="flex h-full flex-col">
+        <BranchFreshness taskId={taskId} status={status} metadata={metadata} />
+        <div className="flex flex-1 items-center justify-center p-4 text-sm text-muted-foreground">
+          No changes yet
+        </div>
       </div>
     )
   }
 
   return (
     <div className="flex h-full flex-col">
+      <BranchFreshness taskId={taskId} status={status} metadata={metadata} />
       <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
         <div className="text-xs text-muted-foreground">
           {files.length} {files.length === 1 ? 'file' : 'files'} changed

@@ -39,6 +39,8 @@ from lotsa.orchestrator import (
     RetryNotAllowed,
     ReviseNotAllowed,
     StopNotAllowed,
+    SyncNotAllowed,
+    SyncNotNeeded,
     WorkflowNotFound,
 )
 from lotsa.server.schemas import (
@@ -51,6 +53,7 @@ from lotsa.server.schemas import (
     FlowResponse,
     FlowStepResponse,
     MessageResponse,
+    MonitorHeartbeatResponse,
     TaskDetailFullResponse,
     TaskDetailResponse,
     TaskSummaryResponse,
@@ -682,6 +685,31 @@ async def mark_complete_task(request: Request, task_id: str) -> TaskDetailFullRe
         # (mirrors ``archive_task``'s ``ArchiveFailed`` → 503).
         raise HTTPException(status_code=503, detail={"error": str(exc), "code": "MARK_COMPLETE_FAILED"}) from None
     return await _build_task_detail(service, task_id)
+
+
+@router.post("/tasks/{task_id}/sync-branch")
+async def sync_branch(request: Request, task_id: str) -> TaskDetailFullResponse:
+    """ADR-046 — merge the default branch into an idle task's worktree.
+
+    Pushes when the task has a PR; a pre-PR task gets a local merge. A raced
+    conflict routes to the process's ``resolve_conflicts`` agent (or blocks).
+    Rejected (400) while the task is ``working`` or when already up to date.
+    """
+    service = _get_service(request)
+    try:
+        await service.sync_branch(task_id)
+    except SyncNotAllowed as exc:
+        raise _bad_request(exc, "SYNC_NOT_ALLOWED") from None
+    except SyncNotNeeded as exc:
+        raise _bad_request(exc, "SYNC_NOT_NEEDED") from None
+    return await _build_task_detail(service, task_id)
+
+
+@router.get("/monitors")
+async def list_monitors(request: Request) -> list[MonitorHeartbeatResponse]:
+    """ADR-046 — read-only liveness of every running monitor (heartbeat registry)."""
+    service = _get_service(request)
+    return [MonitorHeartbeatResponse(**hb) for hb in service.monitor_heartbeats()]
 
 
 @router.post("/tasks/{task_id}/answer")

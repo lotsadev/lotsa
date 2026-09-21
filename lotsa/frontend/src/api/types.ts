@@ -25,6 +25,47 @@ export interface TaskSummary {
   metadata: Record<string, unknown>
 }
 
+// ADR-046 — branch-freshness fields the standing branch monitor persists onto
+// task metadata. `task.metadata` is untyped, so `readBranchStatus` narrows it.
+export interface BranchStatus {
+  behind: number
+  mergeable: boolean | null // null = unknown (Git <2.38 merge-tree unavailable)
+  conflicts: string[]
+  checkedAt: string | null
+}
+
+export function readBranchStatus(
+  metadata: Record<string, unknown>,
+): BranchStatus | null {
+  const behind = metadata.branch_behind
+  if (typeof behind !== 'number') return null
+  const mergeable = metadata.branch_mergeable
+  return {
+    behind,
+    mergeable: typeof mergeable === 'boolean' ? mergeable : null,
+    conflicts: Array.isArray(metadata.branch_conflicts)
+      ? (metadata.branch_conflicts as string[])
+      : [],
+    checkedAt:
+      typeof metadata.branch_checked_at === 'string'
+        ? metadata.branch_checked_at
+        : null,
+  }
+}
+
+// ADR-046 — GET /api/monitors liveness row.
+export interface MonitorHeartbeat {
+  name: string
+  kind: string
+  interval_seconds: number
+  last_tick_at: number | null
+  next_due_at: number | null
+  consecutive_failures: number
+  last_error: string | null
+  healthy: boolean
+  stale: boolean
+}
+
 export interface TaskDetail extends TaskSummary {
   body: string
   flow_name: string
