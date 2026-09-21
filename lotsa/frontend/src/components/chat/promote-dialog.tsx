@@ -112,12 +112,29 @@ export function PromoteDialog({ taskId, open, onOpenChange }: PromoteDialogProps
       <DialogContent className="max-h-[85dvh] overflow-y-auto md:max-w-2xl max-md:max-w-[calc(100vw-1rem)]">
         <DialogHeader>
           <DialogTitle>Hand off to Execute</DialogTitle>
+          {/* ADR-045 Phase 2 — the description must match the action: a gated
+              call (``atGate``) PUSHES and keeps chat underneath (control returns
+              here on merge/close); a proactive promotion re-roots and discards
+              the chat frame one-way. Claiming "chat stays underneath" on the
+              promote path would be a lie. */}
           <DialogDescription>
-            Choose how thorough: <strong>Build it</strong> for the full SDLC
-            pass, or <strong>Quick fix</strong> for a mechanical change. The
-            worktree and the full audit log stay, and this chat stays underneath:
-            when the PR merges or closes, control returns here so you can keep
-            talking. The running task stays steerable throughout.
+            {atGate ? (
+              <>
+                Choose how thorough: <strong>Build it</strong> for the full SDLC
+                pass, or <strong>Quick fix</strong> for a mechanical change. The
+                worktree and the full audit log stay, and this chat stays
+                underneath: when the PR merges or closes, control returns here so
+                you can keep talking. The running task stays steerable throughout.
+              </>
+            ) : (
+              <>
+                Choose how thorough: <strong>Build it</strong> for the full SDLC
+                pass, or <strong>Quick fix</strong> for a mechanical change. The
+                worktree and the full audit log stay, and the chat transcript is
+                carried forward as context — but this chat is closed out: the task
+                re-roots into the Execute workflow and won&rsquo;t return here.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
 

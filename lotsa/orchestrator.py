@@ -2402,31 +2402,18 @@ class OrchestratorService:
                 f"Step {step.name!r} is parked at a gate but routes no call/handoff target to accept."
             )
 
-        # Persist an operator-edited spec before the push (latest-wins). The
-        # caller frame stays on the stack, so the artifact is already task-scoped
-        # and visible to the callee's ``{artifact:draft_spec}`` injection.
-        if draft_spec:
-            await self.source.save_artifact(
-                task_id,
-                step.job_type,
-                draft_spec,
-                metadata={"artifact_name": "draft_spec", "source": "gate"},
-            )
-            await self.db.add_message(
-                task_id,
-                "system",
-                step.name,
-                "Seeded artifact 'draft_spec' from the accept-call gate",
-                "artifact_seeded",
-                metadata={"artifact_name": "draft_spec", "source": "gate"},
-            )
-
         # Push the callee frame via the Phase-1 path. ``_dispatch_call`` CASes
         # from ``row.status`` (= ``awaiting_operator``), so concurrent accepts /
         # accept-vs-decline resolve to a single winner (ADR-020); it records
         # ``called_from=row.current_step`` (the gate step) so a later unwind
-        # lands on the caller's ``terminate`` catch.
-        await self._dispatch_call(row, destination)
+        # lands on the caller's ``terminate`` catch. An operator-edited
+        # ``draft_spec`` is seeded *inside* ``_dispatch_call`` — only on a won CAS,
+        # before the callee's first dispatch — so a lost race writes NOTHING (no
+        # orphaned artifact, no misleading ``artifact_seeded`` audit row), yet the
+        # winner's ``build`` planning step still sees it via ``{artifact:draft_spec}``.
+        # The caller (chat) frame stays on the stack, so the artifact is task-scoped.
+        seed = {"draft_spec": draft_spec} if draft_spec else None
+        await self._dispatch_call(row, destination, seed_artifacts=seed)
 
     def _render_available_processes(self) -> str:
         """Render the loaded process catalog as an *available processes* block
@@ -4186,6 +4173,7 @@ class OrchestratorService:
         *,
         target_job: str | None = None,
         feedback: str = "",
+        seed_artifacts: dict[str, str] | None = None,
     ) -> bool:
         """Push a call frame and transition the task into ``workflow``'s entry
         (ADR-045). A workflow call is a DELIBERATE cross-workflow jump (like a
@@ -4196,6 +4184,13 @@ class OrchestratorService:
         else its first step. A monitor entry parks the task at
         ``status="waiting_for_pr"`` so the engine picks it up; any other entry is
         dispatched through the normal step path.
+
+        Returns ``True`` when the push CAS won (and the callee was dispatched),
+        ``False`` otherwise — the CAS-loser (concurrent decline / duplicate
+        accept) is a no-op. *seed_artifacts* names artifacts to persist **only on
+        a won CAS**, before the callee's first dispatch, so the callee's
+        ``{artifact:NAME}`` injection sees them (ADR-045 Phase 2 — the operator's
+        edited ``draft_spec``). Nothing is written when the CAS loses.
         """
         callee = self._processes.get(workflow) or self._project_process_catalog(row).get(workflow)
         if callee is None:
@@ -4230,6 +4225,25 @@ class OrchestratorService:
         )
         if not result.won:
             return False
+        # Side effects are strictly post-CAS-win (Constitution §3.1 / ADR-020):
+        # seed the operator-edited artifacts before dispatch so the callee's
+        # ``{artifact:NAME}`` injection sees them, but never on a lost race. Each
+        # lands as an ``artifact`` row plus an ``artifact_seeded`` audit row.
+        for name, content in (seed_artifacts or {}).items():
+            await self.source.save_artifact(
+                row.id,
+                entry.job_type,
+                content,
+                metadata={"artifact_name": name, "source": "gate"},
+            )
+            await self.db.add_message(
+                row.id,
+                "system",
+                entry.name,
+                f"Seeded artifact {name!r} from the accept-call gate",
+                "artifact_seeded",
+                metadata={"artifact_name": name, "source": "gate"},
+            )
         if entry.type == "monitor":
             # The engine drives the monitor from here (it now resolves against the
             # active workflow's plumbing — the pushed frame makes ``workflow`` active).

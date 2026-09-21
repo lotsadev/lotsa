@@ -424,6 +424,64 @@ def test_accept_call_writes_edited_draft_spec(tmp_path, run):
         run(svc.db.close())
 
 
+def test_accept_call_lost_cas_writes_nothing(tmp_path, run):
+    """A lost push CAS (concurrent decline / duplicate accept) must leave NO side
+    effect: the ``draft_spec`` artifact is not persisted and no ``artifact_seeded``
+    audit row is written — the Constitution §3.1 / ADR-020 "CAS-loser writes
+    nothing" rule (``draft_spec`` seeding is threaded through ``_dispatch_call`` so
+    it only fires after a won CAS, mirroring ``promote_task``'s save-after-CAS).
+
+    The race is exercised from *inside* the code under test: a one-shot wrapper on
+    ``atomic_transition`` flips the row out of ``awaiting_operator`` the instant
+    the push CAS is attempted, so the real CAS (``from_status='awaiting_operator'``)
+    loses for real — not a pre-flipped post-bug state.
+
+    Fails pre-fix: the pre-fix ``accept_call`` saved ``draft_spec`` + the audit row
+    *before* calling ``_dispatch_call``, so the orphaned artifact ("THE EDITED
+    SPEC") and message persist even though the call never pushed.
+    """
+    svc = _bundled_service(tmp_path, run, flow="build")
+    run(svc.start())
+    try:
+        task = _seed(
+            svc,
+            run,
+            state=_chat_active_state(svc),
+            current_step="chat",
+            status="awaiting_operator",
+            stack=[dict(CHAT_ROOT)],
+        )
+        svc.runner = _HangRunner()
+
+        orig_transition = svc.db.atomic_transition
+        flipped = {"done": False}
+
+        async def _flip_then_transition(*args, **kwargs):
+            # On the push CAS (guarded on the gate status), simulate a concurrent
+            # decline landing first so the real CAS loses.
+            if not flipped["done"] and kwargs.get("from_status") == "awaiting_operator":
+                flipped["done"] = True
+                await svc.db.update_task(task.id, status="working")
+            return await orig_transition(*args, **kwargs)
+
+        svc.db.atomic_transition = _flip_then_transition
+        try:
+            run(svc.accept_call(task.id, to_workflow="build", draft_spec="THE EDITED SPEC"))
+        finally:
+            svc.db.atomic_transition = orig_transition
+
+        row = run(svc.db.get_task(task.id))
+        assert _wf_names(row) == ["chat"], f"a lost CAS must not push a frame; stack={_wf_names(row)!r}"
+        assert run(svc.get_named_artifact(task.id, "draft_spec")) is None, (
+            "a lost CAS must not persist the operator-edited draft_spec artifact"
+        )
+        seeded = [m for m in run(svc.get_messages(task.id)) if m.msg_type == "artifact_seeded"]
+        assert not seeded, f"a lost CAS must not write an artifact_seeded audit row; got {seeded!r}"
+    finally:
+        run(svc.shutdown())
+        run(svc.db.close())
+
+
 def test_accept_call_requires_awaiting_operator(tmp_path, run):
     """``accept_call`` is CAS-guarded on ``from_status="awaiting_operator"`` — a
     task that is not parked at a gate is rejected.
