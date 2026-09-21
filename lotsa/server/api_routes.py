@@ -23,6 +23,7 @@ from lotsa.attachments import (
     write_attachment,
 )
 from lotsa.orchestrator import (
+    AcceptCallNotAllowed,
     AcknowledgeOverrideNotAllowed,
     AnswerNotAllowed,
     ApproveNotAllowed,
@@ -131,6 +132,15 @@ class FeedbackRequest(BaseModel):
 class PromoteRequest(BaseModel):
     to_process: str
     initial_artifacts: dict[str, str] | None = None
+
+
+class AcceptCallRequest(BaseModel):
+    # ADR-045 Phase 2 — accept an operator gate: PUSH the chosen Execute workflow
+    # onto the stack (not a re-root). ``to_workflow`` is the operator's choice at
+    # a hand-off gate (fixed/ignored for a static ``call X`` gate); ``draft_spec``
+    # carries an operator-edited spec forward to the callee's planning injection.
+    to_workflow: str | None = None
+    draft_spec: str | None = None
 
 
 class AnswerRequest(BaseModel):
@@ -642,6 +652,19 @@ async def promote_task(request: Request, task_id: str, body: PromoteRequest) -> 
         await service.promote_task(task_id, body.to_process, body.initial_artifacts)
     except PromoteNotAllowed as exc:
         raise _bad_request(exc, "PROMOTE_NOT_ALLOWED") from None
+    return await _build_task_detail(service, task_id)
+
+
+@router.post("/tasks/{task_id}/accept-call")
+async def accept_call(request: Request, task_id: str, body: AcceptCallRequest) -> TaskDetailFullResponse:
+    """Accept an operator gate (ADR-045 Phase 2) — PUSH the chosen Execute
+    workflow onto the stack atop the persisting caller (chat) frame. Distinct
+    from ``/promote`` (which re-roots)."""
+    service = _get_service(request)
+    try:
+        await service.accept_call(task_id, body.to_workflow, body.draft_spec)
+    except AcceptCallNotAllowed as exc:
+        raise _bad_request(exc, "ACCEPT_CALL_NOT_ALLOWED") from None
     return await _build_task_detail(service, task_id)
 
 

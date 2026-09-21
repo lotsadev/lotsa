@@ -243,6 +243,18 @@ class PromoteNotAllowed(Exception):
     """
 
 
+class AcceptCallNotAllowed(Exception):
+    """Raised when ``accept_call`` cannot run (ADR-045 Phase 2): the task is
+    missing, not parked at an operator gate (``awaiting_operator``), the chosen
+    destination isn't an offered ``hand-off`` target, or the task's Execute work
+    has already terminated (a caught ``terminate`` — the chat frame may talk but
+    may not call).
+
+    Follows the ``PromoteNotAllowed`` pattern — the route maps it to a 400
+    ``ACCEPT_CALL_NOT_ALLOWED``.
+    """
+
+
 class MarkCompleteNotAllowed(Exception):
     """Raised when ``mark_complete`` is called for a missing or already-terminal
     task (ADR-043).
@@ -2306,6 +2318,103 @@ class OrchestratorService:
             if "hand-off" in process.invocable and process.description
         ]
 
+    async def accept_call(
+        self,
+        task_id: str,
+        to_workflow: str | None = None,
+        draft_spec: str | None = None,
+    ) -> None:
+        """Accept an operator gate — perform the ADR-045 Phase-2 **push** (NOT a
+        re-root).
+
+        The gated step is parked at ``awaiting_operator`` (the hand-off gate or a
+        static ``gate: operator`` + ``call`` step). Accepting pushes the chosen
+        Execute workflow onto the stack **on top of** the persisting caller frame
+        (e.g. ``chat``) via the Phase-1 :meth:`_dispatch_call` — so a later
+        ``terminate`` can unwind back into the caller's ``terminate`` catch. This
+        is the substantive difference from :meth:`promote_task`, which re-roots
+        the stack to a fresh single frame and rewrites ``metadata.process_name``.
+
+        Destination binding:
+
+        * **Static gate** — the parked step routes a fixed ``call <workflow>``;
+          that is the destination. A supplied *to_workflow* must match it.
+        * **Hand-off gate** — the parked step routes ``handoff`` (the ``chat``
+          case); *to_workflow* is the operator's choice and must be a loaded
+          ``hand-off``-invocable destination (:meth:`_handoff_destinations`) — the
+          same "never accept a destination the operator wasn't shown" rule the
+          drainer enforces.
+
+        An operator-edited *draft_spec* is persisted (latest-wins) **before** the
+        push; because the caller (chat) frame stays on the stack, its artifacts
+        are already task-scoped, so ``build``'s ``{artifact:draft_spec}`` injection
+        sees it with no re-seeding.
+
+        Raises :class:`AcceptCallNotAllowed` (→ 400) when the task is missing, not
+        parked at a gate, its Execute work already terminated, or the destination
+        is not a valid gate target. A lost CAS (concurrent accept / decline) is a
+        silent no-op — same convention as ``promote_task``.
+        """
+        if self.flow is None:
+            raise RuntimeError("OrchestratorService not started")
+
+        row = await self.db.get_task(task_id)
+        if row is None:
+            raise AcceptCallNotAllowed(f"Task {task_id} not found")
+        # The gate is the ``awaiting_operator`` park; anything else is not a gate.
+        if row.status != "awaiting_operator":
+            raise AcceptCallNotAllowed(
+                f"accept_call requires status 'awaiting_operator' (a live gate), got {row.status!r}"
+            )
+        # ADR-045 Phase 2 — a chat frame whose called work already terminated
+        # (a caught ``terminate``) may talk but may not call again: a fresh build
+        # is a new task, not a re-entrant call onto a closed-out worktree/PR.
+        if row.metadata.get("execute_terminated"):
+            raise AcceptCallNotAllowed(
+                "This chat's Execute work has already shipped (PR merged/closed) — "
+                "create a new task to build again rather than re-running it."
+            )
+
+        step = self._resolve_step_for_row(row)
+        if step is None:
+            raise AcceptCallNotAllowed(f"Cannot resolve the parked gate step {row.current_step!r}")
+
+        # Determine the destination from the parked step's own route.
+        static_call = next((parse_call_target(r.target)[0] for r in step.rules if is_call_target(r.target)), None)
+        has_handoff = any(r.target == "handoff" for r in step.rules)
+        if static_call is not None:
+            # Static gate — destination fixed in YAML. A supplied to_workflow must agree.
+            if to_workflow is not None and to_workflow != static_call:
+                raise AcceptCallNotAllowed(
+                    f"This gate calls {static_call!r}; it cannot be redirected to {to_workflow!r}."
+                )
+            destination = static_call
+        elif has_handoff:
+            # Hand-off gate — operator picks among the offered destinations.
+            offered = {name for name, _desc in self._handoff_destinations()}
+            if to_workflow not in offered:
+                raise AcceptCallNotAllowed(
+                    f"{to_workflow!r} is not an offered hand-off destination. Available: {sorted(offered)}."
+                )
+            destination = to_workflow
+        else:
+            raise AcceptCallNotAllowed(
+                f"Step {step.name!r} is parked at a gate but routes no call/handoff target to accept."
+            )
+
+        # Push the callee frame via the Phase-1 path. ``_dispatch_call`` CASes
+        # from ``row.status`` (= ``awaiting_operator``), so concurrent accepts /
+        # accept-vs-decline resolve to a single winner (ADR-020); it records
+        # ``called_from=row.current_step`` (the gate step) so a later unwind
+        # lands on the caller's ``terminate`` catch. An operator-edited
+        # ``draft_spec`` is seeded *inside* ``_dispatch_call`` — only on a won CAS,
+        # before the callee's first dispatch — so a lost race writes NOTHING (no
+        # orphaned artifact, no misleading ``artifact_seeded`` audit row), yet the
+        # winner's ``build`` planning step still sees it via ``{artifact:draft_spec}``.
+        # The caller (chat) frame stays on the stack, so the artifact is task-scoped.
+        seed = {"draft_spec": draft_spec} if draft_spec else None
+        await self._dispatch_call(row, destination, seed_artifacts=seed)
+
     def _render_available_processes(self) -> str:
         """Render the loaded process catalog as an *available processes* block
         for the chat agent's triage prompt (ADR-027 §3).
@@ -2873,9 +2982,17 @@ class OrchestratorService:
         row = await self.db.get_task(task_id)
         if row is None:
             raise ReviseNotAllowed(f"Task {task_id} not found")
-        if row.status not in ("waiting", "needs_input", "blocked"):
+        # ADR-045 Phase 2 — ``awaiting_operator`` is accepted so an operator can
+        # *decline* a gate by simply continuing the conversation: a message
+        # re-dispatches the (chat) REPL back to ``working``, leaving any
+        # ``handoff_suggestion`` untouched. The CAS below reads ``from_status``
+        # dynamically, and a gated task sits on its (conversational) active state,
+        # which carries the revision self-loop — same shape as the ``blocked``
+        # stop→amend→resume case above.
+        if row.status not in ("waiting", "needs_input", "blocked", "awaiting_operator"):
             raise ReviseNotAllowed(
-                f"send_message() requires status in (waiting, needs_input, blocked), got {row.status!r}"
+                f"send_message() requires status in (waiting, needs_input, blocked, awaiting_operator), "
+                f"got {row.status!r}"
             )
         # Resolve against the task's ACTIVE flow first (see
         # ``_resolve_step_for_row``) so a pr_fix step's own ``success_state`` is
@@ -3797,6 +3914,18 @@ class OrchestratorService:
                 task.state,
             )
             return
+        # ADR-045 Phase 2 — a terminal PR outcome (merge/close) on a task with a
+        # CALLER frame beneath the active one is a *stack unwind*, not a flat
+        # completion: route it through ``_unwind_terminate`` so a caller's
+        # ``routes: { terminate: <catch> }`` is honoured (e.g. ``chat`` catches
+        # its build's PR merge and stays live). With no catch anywhere the unwind
+        # empties the stack and completes the task — behaviour-identical to the
+        # flat CAS below for a directly-selected build/fix (whose ``push_pr`` call
+        # site declares no catch). Depth <= 1 keeps the flat terminal CAS.
+        if target_state in ("complete", "abandoned") and len(get_stack(task.metadata)) > 1:
+            unwind_item = Item(id=task.id, state=task.state, title=task.title, body=task.body, metadata=task.metadata)
+            await self._unwind_terminate(unwind_item, from_status=task.status, terminal=target_state)
+            return
         # Atomic CAS — the previous two-write sequence (source.save then
         # _set_status) had a crash window: a server crash between the writes
         # left state=complete/abandoned/blocked while status stayed
@@ -4044,6 +4173,7 @@ class OrchestratorService:
         *,
         target_job: str | None = None,
         feedback: str = "",
+        seed_artifacts: dict[str, str] | None = None,
     ) -> bool:
         """Push a call frame and transition the task into ``workflow``'s entry
         (ADR-045). A workflow call is a DELIBERATE cross-workflow jump (like a
@@ -4054,6 +4184,13 @@ class OrchestratorService:
         else its first step. A monitor entry parks the task at
         ``status="waiting_for_pr"`` so the engine picks it up; any other entry is
         dispatched through the normal step path.
+
+        Returns ``True`` when the push CAS won (and the callee was dispatched),
+        ``False`` otherwise — the CAS-loser (concurrent decline / duplicate
+        accept) is a no-op. *seed_artifacts* names artifacts to persist **only on
+        a won CAS**, before the callee's first dispatch, so the callee's
+        ``{artifact:NAME}`` injection sees them (ADR-045 Phase 2 — the operator's
+        edited ``draft_spec``). Nothing is written when the CAS loses.
         """
         callee = self._processes.get(workflow) or self._project_process_catalog(row).get(workflow)
         if callee is None:
@@ -4088,6 +4225,25 @@ class OrchestratorService:
         )
         if not result.won:
             return False
+        # Side effects are strictly post-CAS-win (Constitution §3.1 / ADR-020):
+        # seed the operator-edited artifacts before dispatch so the callee's
+        # ``{artifact:NAME}`` injection sees them, but never on a lost race. Each
+        # lands as an ``artifact`` row plus an ``artifact_seeded`` audit row.
+        for name, content in (seed_artifacts or {}).items():
+            await self.source.save_artifact(
+                row.id,
+                entry.job_type,
+                content,
+                metadata={"artifact_name": name, "source": "gate"},
+            )
+            await self.db.add_message(
+                row.id,
+                "system",
+                entry.name,
+                f"Seeded artifact {name!r} from the accept-call gate",
+                "artifact_seeded",
+                metadata={"artifact_name": name, "source": "gate"},
+            )
         if entry.type == "monitor":
             # The engine drives the monitor from here (it now resolves against the
             # active workflow's plumbing — the pushed frame makes ``workflow`` active).
@@ -4120,6 +4276,7 @@ class OrchestratorService:
         target: str,
         *,
         from_status: TaskStatusLiteral,
+        step: Any = None,
     ) -> bool:
         """Handle a stack-crossing routing target (ADR-045). Returns ``True`` when
         *target* was one of ``call``/``terminate``/``complete`` and this method
@@ -4134,8 +4291,18 @@ class OrchestratorService:
         These targets cross the call stack, not a single flow edge, so — like a
         promotion (``jump_to_step``) or ``_dispatch_call`` — their CAS is not
         gated on a state-machine transition of the current flow.
+
+        ADR-045 Phase 2 — when *step* declares ``gate: operator`` and *target* is
+        a ``call``, the call is *not* dispatched here: the task parks at
+        ``awaiting_operator`` and waits for the operator's ``accept_call``. The
+        gate only gates ``call`` routes; ``terminate``/``complete`` are unaffected.
         """
         if is_call_target(target):
+            if step is not None and getattr(step, "gate", None) == "operator":
+                # Operator gate — park instead of pushing. The pending call
+                # destination is re-derived from the step's own route at accept
+                # time (``accept_call``), so nothing extra is persisted here.
+                return await self._park_at_gate(item, step, from_status=from_status)
             # A call is forward progress (into the callee's entry) — clear any
             # ADR-040 interruption markers so a completed step doesn't carry a
             # stale resume_count into the pushed frame (matches every other
@@ -4155,6 +4322,30 @@ class OrchestratorService:
             await self._return_to_caller(item, from_status=from_status)
             return True
         return False
+
+    async def _park_at_gate(self, item: Item, step: Any, *, from_status: TaskStatusLiteral) -> bool:
+        """ADR-045 Phase 2 — park a ``gate: operator`` step at ``awaiting_operator``.
+
+        A same-state CAS (no SM edge, no dispatch, no push): the frame is *not*
+        pushed yet — the operator's ``accept_call`` performs the Phase-1
+        ``_dispatch_call`` push. Mirrors the conversational-handoff park. Returns
+        ``True`` so the caller stops routing (the gate is handled).
+        """
+        await self.db.atomic_transition(
+            item.id,
+            from_status=from_status,
+            from_state=item.state,
+            to_state=item.state,
+            to_status="awaiting_operator",
+            to_current_step=step.name,
+            audit_on_win=AuditRow(
+                role="system",
+                step_name=step.name,
+                content="Awaiting operator — gated call requires approval.",
+                msg_type="status_change",
+            ),
+        )
+        return True
 
     async def _return_to_caller(self, item: Item, *, from_status: TaskStatusLiteral) -> None:
         """ADR-045 ``complete``: pop the active frame and return to the caller.
@@ -4260,7 +4451,9 @@ class OrchestratorService:
             )
             await self._dispatch_next_step(resumed)
 
-    async def _unwind_terminate(self, item: Item, *, from_status: TaskStatusLiteral) -> None:
+    async def _unwind_terminate(
+        self, item: Item, *, from_status: TaskStatusLiteral, terminal: str = "complete"
+    ) -> None:
         """ADR-045 ``terminate``: unwind the stack, subject to per-frame catches.
 
         The emitting frame is popped, then ``terminate`` propagates toward the
@@ -4272,6 +4465,16 @@ class OrchestratorService:
         (ADR-030's terminal status is global truth; this is the graph-driven route
         into it — it sits beside ADR-043 ``mark_complete`` and ADR-030 terminal PR
         signals, replacing neither).
+
+        *terminal* is the terminal state an uncaught unwind lands on —
+        ``"complete"`` for a normal ``terminate`` route, or ``"abandoned"`` when a
+        PR-close drives the unwind through :meth:`transition_task` (ADR-045
+        Phase 2). A catch may still override it (``routes: { terminate: complete }``).
+
+        ADR-045 Phase 2 — a catch that lands on a CONVERSATIONAL step (the
+        ``chat`` return-path catch) parks the REPL at ``awaiting_operator`` WITHOUT
+        re-dispatching an agent turn, and marks the frame ``execute_terminated`` so
+        it may keep answering questions but may not launch another gated call.
 
         Computed in one pass, applied with a single CAS (see ``_return_to_caller``
         for the restart-safety argument).
@@ -4322,23 +4525,24 @@ class OrchestratorService:
         metadata[CALL_STACK_KEY] = new_stack
 
         if catch is None:
+            terminal_status: TaskStatusLiteral = "abandoned" if terminal == "abandoned" else "complete"
             cas = await self.db.atomic_transition(
                 item.id,
                 from_status=from_status,
                 from_state=item.state,
-                to_state="complete",
-                to_status="complete",
+                to_state=terminal,
+                to_status=terminal_status,
                 to_current_step=None,
                 to_metadata=metadata,
                 audit_on_win=AuditRow(
                     role="system",
                     step_name=item.state,
-                    content="Terminate — call stack unwound to root; task complete.",
+                    content=f"Terminate — call stack unwound to root; task {terminal}.",
                     msg_type="status_change",
                 ),
             )
             if cas.won:
-                item.state = "complete"
+                item.state = terminal
                 await self._cleanup_worktree_if_done(item)
             return
 
@@ -4372,6 +4576,19 @@ class OrchestratorService:
             else:
                 to_state, to_status, to_step = dest, "working", catch_step
             dest_queue = dest
+        elif getattr(dest, "conversational", False):
+            # ADR-045 Phase 2 — the return-path catch on a CONVERSATIONAL step
+            # (the ``chat`` catch). Park the REPL live at ``awaiting_operator`` in
+            # its own active state WITHOUT re-dispatching a fresh agent turn (a
+            # REPL responds to operator messages, not to an empty resume), and
+            # mark the frame ``execute_terminated`` so ``accept_call`` and the
+            # handoff gate reject a *new* call from it (a fresh build is a new
+            # task). ``send_message`` re-enters the REPL from here (§ decline).
+            to_state = dest.active_state
+            to_status = "awaiting_operator"
+            to_step = dest.name
+            dest_queue = dest.active_state
+            metadata["execute_terminated"] = True
         else:
             # Catch resolved to an actual step. Land it at ``working`` and let the
             # ``to_status == "working"`` post-CAS branch below re-dispatch through
@@ -5679,7 +5896,7 @@ class OrchestratorService:
         # stack (subject to catches), or pop one frame and return to the caller.
         # ``_route_stack_target`` owns the CAS + dispatch for all three; on any
         # other target we fall through to the ordinary in-flow advance below.
-        if await self._route_stack_target(item, success_state, from_status="working"):
+        if await self._route_stack_target(item, success_state, from_status="working", step=step):
             await self.source.append_event(item.id, {"type": "dispatch", "job_type": step.job_type, "success": True})
             return
         to_status: TaskStatusLiteral
@@ -6385,16 +6602,28 @@ class OrchestratorService:
                                     item.id,
                                     suggestion,
                                 )
-                            # Park at ``waiting`` in the SAME state (non-
-                            # terminating). Mirrors the conversational default
-                            # park below — a same-state CAS, no SM edge needed,
-                            # no _dispatch_next_step, no promotion.
+                            # Park in the SAME state (non-terminating). Mirrors
+                            # the conversational default park below — a same-state
+                            # CAS, no SM edge needed, no _dispatch_next_step, no
+                            # promotion.
+                            #
+                            # ADR-045 Phase 2 — when the handoff step is
+                            # ``gate: operator`` (the bundled ``chat`` case), park
+                            # at ``awaiting_operator``: the operator *accepts* the
+                            # gate (``accept_call`` pushes the chosen Execute
+                            # workflow onto the stack) rather than promoting. A
+                            # chat frame whose called work has already terminated
+                            # (``execute_terminated``) may keep talking but must
+                            # not re-open the gate — it parks at plain ``waiting``
+                            # (a fresh build is a new task).
+                            gated = info.step.gate == "operator" and not item.metadata.get("execute_terminated")
+                            park_status: TaskStatusLiteral = "awaiting_operator" if gated else "waiting"
                             cas = await self.db.atomic_transition(
                                 item.id,
                                 from_status="working",
                                 from_state=item.state,
                                 to_state=item.state,
-                                to_status="waiting",
+                                to_status=park_status,
                                 to_current_step=info.step.name,
                                 audit_on_win=None,
                             )
@@ -6784,7 +7013,7 @@ class OrchestratorService:
                         # otherwise fall through to the "no edge" strand-warning
                         # and stall at status=working — the exact gap the review
                         # flagged). ``_route_stack_target`` owns the CAS + dispatch.
-                        if await self._route_stack_target(item, target, from_status="working"):
+                        if await self._route_stack_target(item, target, from_status="working", step=info.step):
                             continue
                         # Validate the rule-target transition against the *active*
                         # flow's SM, not main's. Sub-flow bindings (e.g.

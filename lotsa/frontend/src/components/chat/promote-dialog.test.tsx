@@ -15,9 +15,11 @@ import type { Process, TaskDetailFull } from '@/api/types'
 // recommended destination.
 
 const promoteTask = vi.fn()
+const acceptCall = vi.fn()
 vi.mock('@/api/tasks', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/tasks')>()),
   promoteTask: (...args: unknown[]) => promoteTask(...args),
+  acceptCall: (...args: unknown[]) => acceptCall(...args),
 }))
 
 // The dialog reads the loaded process catalog (destinations) and the task
@@ -48,8 +50,17 @@ vi.mock('@/hooks/use-processes', () => ({
 }))
 
 let artifactsData: Record<string, string> = {}
+// ADR-045 Phase 2 — the dialog branches on the task status: a task parked at
+// the gate (``awaiting_operator``) accepts via a *push* (acceptCall); otherwise
+// it promotes. ``undefined`` (the default here) exercises the promote path.
+let taskStatus: string | undefined = undefined
 vi.mock('@/hooks/use-task', () => ({
-  useTask: () => ({ data: { artifacts: artifactsData } as Partial<TaskDetailFull> }),
+  useTask: () => ({
+    data: {
+      artifacts: artifactsData,
+      ...(taskStatus ? { task: { status: taskStatus } } : {}),
+    } as Partial<TaskDetailFull>,
+  }),
 }))
 
 function renderDialog() {
@@ -65,8 +76,11 @@ describe('PromoteDialog handoff-suggestion pre-selection', () => {
   beforeEach(() => {
     promoteTask.mockReset()
     promoteTask.mockResolvedValue({})
+    acceptCall.mockReset()
+    acceptCall.mockResolvedValue({})
     processesData = [BUILD, FIX]
     artifactsData = {}
+    taskStatus = undefined
   })
 
   it('pre-selects the recommended destination and offers an Accept action', () => {
@@ -100,5 +114,18 @@ describe('PromoteDialog handoff-suggestion pre-selection', () => {
     artifactsData = { handoff_suggestion: 'chat' }
     const { queryByRole } = renderDialog()
     expect(queryByRole('button', { name: /Accept/i })).toBeNull()
+  })
+
+  it('accepts the gate via a push (acceptCall) when parked at awaiting_operator', async () => {
+    // ADR-045 Phase 2 — a task at the operator gate PUSHES the chosen workflow
+    // (acceptCall), keeping the chat frame underneath, rather than re-rooting
+    // via promoteTask.
+    taskStatus = 'awaiting_operator'
+    artifactsData = { handoff_suggestion: 'build' }
+    const { getByRole } = renderDialog()
+    fireEvent.click(getByRole('button', { name: /Accept/i }))
+    await waitFor(() => expect(acceptCall).toHaveBeenCalledTimes(1))
+    expect(acceptCall).toHaveBeenCalledWith('task-1', 'build', undefined)
+    expect(promoteTask).not.toHaveBeenCalled()
   })
 })

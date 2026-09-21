@@ -456,11 +456,17 @@ def test_chat_process_loads_as_single_conversational_step():
     assert len(main.bindings) == 1
     step = main.steps[0]
     assert step.conversational is True
-    # ADR-044 Phase 4c — the only rule is the ``COMPLETED → handoff`` edge, which
-    # records an operator-gated hand-off suggestion and parks (non-terminating).
-    # It does NOT self-complete: the REPL still runs until the operator promotes
-    # or abandons it.
-    assert [(r.target, r.pattern) for r in step.rules] == [("handoff", "^AGENT_RESULT: COMPLETED")]
+    # ADR-044 Phase 4c — the ``COMPLETED → handoff`` edge records an
+    # operator-gated hand-off suggestion and parks (non-terminating). It does NOT
+    # self-complete: the REPL runs until the operator accepts or abandons it.
+    # ADR-045 Phase 2 adds the ``terminate: chat`` return-path catch (a callee's
+    # PR merge/close unwinds back into this live chat frame) and makes the
+    # handoff an operator gate (``gate: operator``).
+    assert step.gate == "operator"
+    assert [(r.target, r.pattern) for r in step.rules] == [
+        ("handoff", "^AGENT_RESULT: COMPLETED"),
+        ("chat", "terminate"),
+    ]
 
 
 def test_chat_process_has_description():

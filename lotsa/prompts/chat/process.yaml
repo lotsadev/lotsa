@@ -21,12 +21,21 @@ jobs:
     # park) and NEVER advances or promotes. The chat step still self-completes
     # nothing — it runs as a REPL until the operator promotes (ADR-027) or
     # abandons it; ``handoff`` is a non-terminating park, not a transition.
-    routes: { COMPLETED: handoff }
+    #
+    # ADR-045 Phase 2 — ``gate: operator`` makes the ``handoff`` a *gated call*:
+    # the operator accepts (pushing the chosen Execute workflow onto the stack
+    # atop this persisting ``chat`` frame) rather than a promotion that re-roots.
+    # The ``terminate`` catch is what makes that persistence pay off: when the
+    # called Execute work terminates (PR merged/closed), the unwind lands back
+    # on this ``chat`` step (a live REPL) instead of ending the task.
+    gate: operator
+    routes: { COMPLETED: handoff, terminate: chat }
 flows:
   # The ``main`` flow runs the single ``chat`` step with no per-flow routing
-  # override, so it inherits the job-level ``routes: { COMPLETED: handoff }``
-  # above (``_resolve_jobs`` falls back to ``job.rules`` when a binding declares
-  # none). Don't re-declare the identical routes here — a binding-level override
-  # only earns its place when it *diverges* from the job default.
+  # override, so it inherits the job-level ``routes`` (``COMPLETED: handoff`` +
+  # the ``terminate: chat`` return-path catch) and the ``gate: operator`` above
+  # (``_resolve_jobs`` falls back to ``job.rules``/``job.gate`` when a binding
+  # declares none). Don't re-declare the identical routes here — a binding-level
+  # override only earns its place when it *diverges* from the job default.
   main:
     steps: [chat]

@@ -186,3 +186,20 @@ export const promoteTask = (
       initial_artifacts: initialArtifacts ?? null,
     }),
   })
+
+// ADR-045 Phase 2 — accept an operator gate: PUSH the chosen Execute workflow
+// onto the stack atop the persisting chat frame (distinct from promoteTask,
+// which re-roots). Used for the chat hand-off gate (task parked at
+// ``awaiting_operator``).
+export const acceptCall = (
+  taskId: string,
+  toWorkflow: string,
+  draftSpec?: string
+) =>
+  apiFetch<TaskDetailFull>(`/api/tasks/${taskId}/accept-call`, {
+    method: 'POST',
+    body: JSON.stringify({
+      to_workflow: toWorkflow,
+      draft_spec: draftSpec ?? null,
+    }),
+  })

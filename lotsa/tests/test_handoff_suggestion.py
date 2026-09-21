@@ -89,12 +89,18 @@ def chat_service(tmp_path, _loop, run):
     run(db.close())
 
 
-def _create_chat_task(svc, run, stdout: str):
-    """Set the runner to emit *stdout*, create a chat task, and drain."""
+def _create_chat_task(svc, run, stdout: str, park_status: str = "awaiting_operator"):
+    """Set the runner to emit *stdout*, create a chat task, and drain.
+
+    ADR-045 Phase 2 — chat's ``COMPLETED → handoff`` is now an operator gate
+    (``gate: operator``), so a handoff turn parks at ``awaiting_operator`` (the
+    gate). A turn with NO marker takes the plain conversational park (``waiting``)
+    — pass ``park_status="waiting"`` for that case.
+    """
     svc.runner = FakeRunner(_chat_result(stdout))
     task = run(svc.create_task(message="Let's talk about a change", process_name="chat"))
     run(wait_for_completion(svc, task.id))
-    run(wait_for_status(svc, task.id, "waiting"))
+    run(wait_for_status(svc, task.id, park_status))
     return task
 
 
@@ -299,8 +305,10 @@ class TestHandoffDrainer:
         assert suggestion == "build"
 
         row = run(svc.db.get_task(task.id))
-        # Parked, NOT advanced/promoted: still on the chat step, still the chat process.
-        assert row.status == "waiting"
+        # Parked at the gate, NOT advanced/promoted: still on the chat step, still
+        # the chat process (ADR-045 Phase 2 — ``gate: operator`` parks at
+        # ``awaiting_operator`` awaiting the operator's accept).
+        assert row.status == "awaiting_operator"
         assert row.state == "chat"
         assert row.metadata.get("process_name", "chat") == "chat"
 
@@ -310,7 +318,9 @@ class TestHandoffDrainer:
 
         assert run(svc.get_named_artifact(task.id, "handoff_suggestion")) is None
         row = run(svc.db.get_task(task.id))
-        assert row.status == "waiting"  # still parked as an ordinary chat turn
+        # The step still routed handoff (a COMPLETED marker), so the gate opens
+        # even though the named destination was invalid (no suggestion recorded).
+        assert row.status == "awaiting_operator"
 
     def test_non_invocable_destination_saves_no_artifact(self, chat_service, run):
         # ``chat`` is loaded but is not hand-off-invocable — a suggestion naming
@@ -325,12 +335,14 @@ class TestHandoffDrainer:
         task = _create_chat_task(svc, run, "Still thinking it through.\n\nAGENT_RESULT: COMPLETED")
 
         assert run(svc.get_named_artifact(task.id, "handoff_suggestion")) is None
-        assert run(svc.db.get_task(task.id)).status == "waiting"
+        # A bare COMPLETED still matches the handoff edge → the gate opens.
+        assert run(svc.db.get_task(task.id)).status == "awaiting_operator"
 
     def test_no_marker_parks_with_no_artifact(self, chat_service, run):
-        # An ordinary chat turn (no marker) parks exactly as today.
+        # An ordinary chat turn (no marker) parks exactly as today — the plain
+        # conversational ``waiting`` park, NOT the gate (no handoff edge fired).
         svc = chat_service
-        task = _create_chat_task(svc, run, "Here's a thought, no decision yet.")
+        task = _create_chat_task(svc, run, "Here's a thought, no decision yet.", park_status="waiting")
 
         assert run(svc.get_named_artifact(task.id, "handoff_suggestion")) is None
         assert run(svc.db.get_task(task.id)).status == "waiting"
@@ -346,13 +358,14 @@ class TestHandoffDrainer:
         )
         task = run(svc.create_task(message="Let's talk", process_name="chat"))
         run(wait_for_completion(svc, task.id))
-        run(wait_for_status(svc, task.id, "waiting"))
+        run(wait_for_status(svc, task.id, "awaiting_operator"))
         assert run(svc.get_named_artifact(task.id, "handoff_suggestion")) == "fix"
 
-        # Keep chatting — the REPL is resumable after a suggestion.
+        # Keep chatting — the REPL is resumable from the gate (ADR-045 Phase 2:
+        # send_message accepts ``awaiting_operator`` as a decline/continue).
         run(svc.send_message(task.id, "actually let's do the whole thing"))
         run(wait_for_completion(svc, task.id))
-        run(wait_for_status(svc, task.id, "waiting"))
+        run(wait_for_status(svc, task.id, "awaiting_operator"))
         assert run(svc.get_named_artifact(task.id, "handoff_suggestion")) == "build"
 
     def test_chat_message_stored_with_marker_stripped(self, chat_service, run):
